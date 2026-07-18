@@ -116,10 +116,30 @@ public struct SystemProcessScanner: ProcessScanning {
             if let program = terminalProgram(ofProcess: ancestorProcessID) {
                 return program
             }
-            guard let info = bsdInfo(processID: ancestorProcessID) else { return nil }
-            ancestorProcessID = pid_t(info.pbi_ppid)
+            guard let parent = parentProcessID(of: ancestorProcessID) else { return nil }
+            ancestorProcessID = parent
         }
         return nil
+    }
+
+    /// Parent resolution that survives root-owned intermediaries: Ghostty and
+    /// Terminal spawn shells through /usr/bin/login (root), where
+    /// proc_pidinfo returns EPERM for unprivileged callers and would abort
+    /// the ancestor walk one hop before the terminal app. The kinfo_proc
+    /// sysctl — the same interface ps uses — remains readable there.
+    public static func parentProcessID(of processID: pid_t) -> pid_t? {
+        if let info = bsdInfo(processID: processID) {
+            return pid_t(info.pbi_ppid)
+        }
+        var name: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, processID]
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.size
+        guard sysctl(&name, UInt32(name.count), &info, &size, nil, 0) == 0,
+              size >= MemoryLayout<kinfo_proc>.size,
+              info.kp_proc.p_pid == processID else {
+            return nil
+        }
+        return info.kp_eproc.e_ppid
     }
 
     private static func terminalProgram(ofProcess processID: pid_t) -> String? {

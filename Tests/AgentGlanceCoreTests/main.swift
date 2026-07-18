@@ -1097,6 +1097,23 @@ func testProcessScannerIgnoresLookalikeProcessNames() throws {
     )
 }
 
+func testProcessScannerResolvesParentOfRootOwnedProcesses() throws {
+    // Ghostty spawns shells through /usr/bin/login, which runs as root:
+    // proc_pidinfo denies PROC_PIDTBSDINFO on other users' processes, so the
+    // ancestor walk must fall back to the kinfo_proc sysctl (what ps uses).
+    // launchd (pid 1, root-owned) exercises that path and has parent 0.
+    try expect(
+        SystemProcessScanner.parentProcessID(of: 1),
+        equals: 0,
+        "parent of root-owned launchd"
+    )
+    try expect(
+        SystemProcessScanner.parentProcessID(of: getpid()),
+        equals: getppid(),
+        "parent of this process"
+    )
+}
+
 func testProcessScannerIdentifiesHostTerminalFromAncestors() throws {
     let agent = try spawnFakeAgent(named: "codex", underFakeTerminalApp: "Ghostty.app")
     defer { agent.tearDown() }
@@ -1302,6 +1319,7 @@ let tests: [(String, () throws -> Void)] = [
     ("Ghostty matcher excludes orphaned processes and assigns exact terminals", testGhosttyMatcherExcludesOrphanedProcessesAndAssignsExactTerminals),
     ("process scanner detects spawned agent process within budget", testProcessScannerDetectsSpawnedAgentProcessWithinBudget),
     ("process scanner ignores lookalike process names", testProcessScannerIgnoresLookalikeProcessNames),
+    ("process scanner resolves parent of root-owned processes", testProcessScannerResolvesParentOfRootOwnedProcesses),
     ("process scanner identifies host terminal from ancestors", testProcessScannerIdentifiesHostTerminalFromAncestors),
     ("Claude settings merge preserves hooks and is idempotent", testClaudeSettingsMergePreservesHooksAndIsIdempotent),
     ("Claude settings removal preserves user hooks", testClaudeSettingsRemovalPreservesUserHooks),
