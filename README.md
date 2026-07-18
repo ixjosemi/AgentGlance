@@ -1,18 +1,22 @@
-# AgentGlance
+<p align="center">
+  <img src="assets/header.svg" alt="AgentGlance — coding agent sessions at a glance, from the MacBook notch" width="760"/>
+</p>
 
 **Know when your coding agents need you—without leaving the notch.**
 
-AgentGlance is a quiet, native macOS indicator for Claude Code, OpenCode, and Codex CLI sessions. It shows active-session counts and attention state beside the MacBook notch, then returns you to the exact terminal tab or tmux pane with one click.
+AgentGlance is a quiet, native macOS indicator for Claude Code, OpenCode, and Codex CLI sessions. It lives around the MacBook notch — Codex and OpenCode on the left wing, Claude on the right — and returns you to the exact terminal tab or tmux pane with one click.
 
 > **Preview status:** AgentGlance is pre-1.0 and currently distributed as source. The local build is ad-hoc signed; signed and notarized downloads will follow once the release pipeline is ready.
 
 ## Why AgentGlance?
 
-- See only tools that currently have visible sessions.
-- Notice permission requests, idle prompts, and completed turns.
-- Focus the recorded Ghostty, iTerm2, Terminal, or tmux session.
+- See only tools that currently have visible sessions, with official tool marks and session counts.
+- A traffic-light dot per tool that only lights up for waiting states: yellow when a session idles at a prompt, pulsing red when one needs an answer or a permission. Working is silence.
+- Click a tool and its session menu grows out of the notch itself: status light (with a radar ping while working), project name, git branch (worktrees included), terminal tab title, and host terminal.
+- Focus the recorded Ghostty, iTerm2, Terminal, or tmux session with one click.
+- Closed terminals disappear immediately — kernel exit notifications, not polling.
 - Keep all observation and state on your Mac.
-- Run without telemetry, accounts, servers, or third-party Swift dependencies.
+- Run without telemetry, accounts, servers, or third-party Swift dependencies, at well under 1% CPU and ~80 MB of memory.
 
 ## Requirements
 
@@ -39,21 +43,21 @@ The script creates `.build/AgentGlance.app` with an ad-hoc signature for local d
 
 ## Install integrations
 
-Build the CLI and explicitly install the local integrations:
+Without integrations the app still detects running agents (via a fast libproc process scan), but every session shows as permanently working — the hooks are what feed real status changes. Install them explicitly:
 
 ```bash
-swift build -c release
-.build/release/agentglance install
+.build/AgentGlance.app/Contents/Resources/bin/agentglance install
+# or, from a plain build: swift build -c release && .build/release/agentglance install
 ```
 
 The installer:
 
-- installs the CLI and hooks under `~/.agentglance/bin`;
-- merges AgentGlance-owned Claude Code hooks into `~/.claude/settings.json`;
+- installs the CLI and hook scripts under `~/.agentglance/bin`;
+- merges AgentGlance-owned Claude Code hooks into `~/.claude/settings.json`, preserving every existing setting and hook (the merge is idempotent);
 - installs `~/.config/opencode/plugins/agentglance.js` only when it can do so safely;
 - adds a Codex `notify` entry only when no notification command exists.
 
-Installation fails instead of replacing an unknown AgentGlance-named plugin or following symlinked managed directories.
+Installation fails instead of replacing an unknown AgentGlance-named plugin. Integration directories may be symlinks — common in dotfile setups — as long as they resolve to a directory you own inside your home; `~/.agentglance` itself must be symlink-free because hooks execute binaries from it. Agents started before installing need a restart to pick up the hooks.
 
 To remove integrations and local state:
 
@@ -77,6 +81,8 @@ macOS asks for Automation access the first time AgentGlance controls a terminal.
 ## How it works
 
 Claude hooks, an OpenCode plugin, the Codex rollout watcher, and a process fallback produce versioned session documents under `~/.agentglance/state`. The app observes that directory and renders active sessions. State is written atomically with user-only permissions.
+
+Everything is event-driven and off the main thread: a libproc-based scanner (no subprocesses, ~2 ms per full sweep) runs on a 5-second heartbeat, kernel `EVFILT_PROC` exit watchers reap closed sessions instantly, and directory observation with debounce delivers state changes to the UI. Agent matching accepts either the kernel-resolved executable path or `argv[0]`, so versioned symlink installs like `~/.local/bin/claude → …/versions/x.y.z` are detected correctly.
 
 See [Architecture](docs/ARCHITECTURE.md) for the full data flow and trust boundaries.
 

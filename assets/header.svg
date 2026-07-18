@@ -1,0 +1,61 @@
+<svg width="880" height="248" viewBox="0 0 880 248" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="AgentGlance — coding agent sessions at a glance, from the MacBook notch">
+  <defs>
+    <linearGradient id="card" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#101014"/>
+      <stop offset="1" stop-color="#0a0a0d"/>
+    </linearGradient>
+    <linearGradient id="screenGlow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1c1c22"/>
+      <stop offset="1" stop-color="#131317"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Card -->
+  <rect x="1" y="1" width="878" height="246" rx="22" fill="url(#card)" stroke="#26262e"/>
+
+  <!-- Screen top edge with menubar -->
+  <path d="M40 40 a12 12 0 0 1 12 -12 h776 a12 12 0 0 1 12 12 v36 h-800 z" fill="url(#screenGlow)"/>
+  <!-- Menubar hints -->
+  <circle cx="72" cy="58" r="4" fill="#3a3a44"/>
+  <rect x="88" y="54" width="46" height="8" rx="4" fill="#2c2c34"/>
+  <rect x="142" y="54" width="30" height="8" rx="4" fill="#2c2c34"/>
+  <rect x="726" y="54" width="22" height="8" rx="4" fill="#2c2c34"/>
+  <rect x="756" y="54" width="22" height="8" rx="4" fill="#2c2c34"/>
+  <rect x="786" y="54" width="22" height="8" rx="4" fill="#2c2c34"/>
+
+  <!-- Notch silhouette with wings -->
+  <path d="M310 28 h260 v34 a10 10 0 0 1 -10 10 h-240 a10 10 0 0 1 -10 -10 z" fill="#000000"/>
+
+  <!-- Left wing: two agents, one waiting on a prompt (yellow) -->
+  <text x="333" y="55" font-family="-apple-system,'SF Pro Text','Segoe UI',sans-serif" font-size="15" font-weight="600" fill="#e8e8ec">2</text>
+  <circle cx="352" cy="50" r="4" fill="#f5c542"/>
+
+  <!-- Center: hardware notch camera -->
+  <circle cx="440" cy="45" r="4" fill="#17171c"/>
+
+  <!-- Right wing: one agent waiting on an answer (red, pulsing) -->
+  <text x="518" y="55" font-family="-apple-system,'SF Pro Text','Segoe UI',sans-serif" font-size="15" font-weight="600" fill="#e8e8ec">1</text>
+  <circle cx="537" cy="50" r="4" fill="#ff5f57">
+    <animate attributeName="opacity" values="1;0.35;1" dur="2s" repeatCount="indefinite"/>
+  </circle>
+  <circle cx="537" cy="50" r="4" fill="none" stroke="#ff5f57" stroke-width="1.4">
+    <animate attributeName="r" values="4;11" dur="2s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0.7;0" dur="2s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- Wordmark -->
+  <text x="440" y="150" text-anchor="middle" font-family="-apple-system,'SF Pro Display','Segoe UI',sans-serif" font-size="46" font-weight="700" letter-spacing="-1" fill="#f5f5f7">AgentGlance</text>
+
+  <!-- Tagline -->
+  <text x="440" y="184" text-anchor="middle" font-family="-apple-system,'SF Pro Text','Segoe UI',sans-serif" font-size="16" fill="#9a9aa3">Claude Code, OpenCode &amp; Codex sessions — at a glance, from your Mac's notch.</text>
+
+  <!-- Semaphore legend -->
+  <g font-family="-apple-system,'SF Pro Text','Segoe UI',sans-serif" font-size="12" fill="#6f6f7a">
+    <circle cx="308" cy="212" r="4" fill="#32d74b"/>
+    <text x="318" y="216">working</text>
+    <circle cx="398" cy="212" r="4" fill="#f5c542"/>
+    <text x="408" y="216">waiting for a prompt</text>
+    <circle cx="548" cy="212" r="4" fill="#ff5f57"/>
+    <text x="558" y="216">needs you now</text>
+  </g>
+</svg>
