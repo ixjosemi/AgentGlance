@@ -793,6 +793,143 @@ func detectedProcess(id: Int32, cwd: String, elapsed: TimeInterval) -> DetectedA
     )
 }
 
+struct SpawnedFakeAgent {
+    let rootDirectory: URL
+    let process: Process
+    let expectedWorkingDirectory: String
+
+    func tearDown() {
+        process.terminate()
+        process.waitUntilExit()
+        try? FileManager.default.removeItem(at: rootDirectory)
+    }
+}
+
+/// Launches a real long-running process whose executable basename matches an
+/// agent tool, inside a working directory we control, so scanner tests observe
+/// genuine system behavior instead of fixtures. When `underFakeTerminalApp`
+/// is set (for example "Ghostty.app"), the agent runs as the child of a shell
+/// whose argv[0] lives inside that bundle path, emulating a terminal host.
+func spawnFakeAgent(
+    named executableName: String,
+    underFakeTerminalApp terminalAppName: String? = nil
+) throws -> SpawnedFakeAgent {
+    let fileManager = FileManager.default
+    let rootDirectory = fileManager.temporaryDirectory
+        .appendingPathComponent("agentglance-scanner-\(UUID().uuidString)", isDirectory: true)
+    let binDirectory = rootDirectory.appendingPathComponent("bin", isDirectory: true)
+    let projectDirectory = rootDirectory.appendingPathComponent("project dir", isDirectory: true)
+    try fileManager.createDirectory(at: binDirectory, withIntermediateDirectories: true)
+    try fileManager.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
+
+    // A symlink keeps /bin/sleep valid as a platform binary (copies get
+    // SIGKILLed on Apple Silicon) and mirrors real versioned installs such as
+    // ~/.local/bin/claude -> .../versions/2.1.214: the kernel-resolved
+    // executable path is "sleep" while argv[0] carries the agent name.
+    let executable = binDirectory.appendingPathComponent(executableName)
+    try fileManager.createSymbolicLink(
+        at: executable,
+        withDestinationURL: URL(fileURLWithPath: "/bin/sleep")
+    )
+
+    let process = Process()
+    if let terminalAppName {
+        let hostDirectory = rootDirectory.appendingPathComponent(
+            "\(terminalAppName)/Contents/MacOS",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(at: hostDirectory, withIntermediateDirectories: true)
+        let hostShell = hostDirectory.appendingPathComponent("host-shell")
+        try fileManager.createSymbolicLink(
+            at: hostShell,
+            withDestinationURL: URL(fileURLWithPath: "/bin/zsh")
+        )
+        process.executableURL = hostShell
+        // The trailing builtin keeps zsh alive as the parent instead of
+        // exec-replacing itself with the agent.
+        process.arguments = ["-c", #""$0" 300; :"#, executable.path]
+    } else {
+        process.executableURL = executable
+        process.arguments = ["300"]
+    }
+    process.currentDirectoryURL = projectDirectory
+    try process.run()
+
+    // realpath(3) instead of URL.resolvingSymlinksInPath(), which strips the
+    // /private prefix the kernel reports for temporary directories.
+    guard let resolvedPath = realpath(projectDirectory.path, nil) else {
+        throw TestFailure.expectation("could not canonicalize fake project directory")
+    }
+    defer { free(resolvedPath) }
+    return SpawnedFakeAgent(
+        rootDirectory: rootDirectory,
+        process: process,
+        expectedWorkingDirectory: String(cString: resolvedPath)
+    )
+}
+
+func testProcessScannerDetectsSpawnedAgentProcessWithinBudget() throws {
+    let agent = try spawnFakeAgent(named: "codex")
+    defer { agent.tearDown() }
+
+    let scanner = SystemProcessScanner(ghosttyTerminalSource: { nil })
+    let scanStart = Date()
+    let detected = try scanner.activeProcesses()
+    let scanDuration = Date().timeIntervalSince(scanStart)
+
+    guard let match = detected.first(where: { $0.processID == agent.process.processIdentifier }) else {
+        throw TestFailure.expectation("spawned codex process was not detected")
+    }
+    try expect(match.tool, equals: .codex, "detected tool")
+    try expect(match.cwd, equals: agent.expectedWorkingDirectory, "detected cwd")
+    try expect(
+        match.elapsedSeconds >= 0 && match.elapsedSeconds < 60,
+        equals: true,
+        "elapsed seconds should be a plausible age, got \(match.elapsedSeconds)"
+    )
+    try expect(
+        scanDuration < 0.25,
+        equals: true,
+        "scan must stay within the 250ms budget, took \(scanDuration)s"
+    )
+}
+
+func testProcessScannerIgnoresLookalikeProcessNames() throws {
+    let agent = try spawnFakeAgent(named: "codexx")
+    defer { agent.tearDown() }
+
+    let detected = try SystemProcessScanner(ghosttyTerminalSource: { nil }).activeProcesses()
+
+    try expect(
+        detected.contains { $0.processID == agent.process.processIdentifier },
+        equals: false,
+        "a lookalike executable name must not be detected as an agent"
+    )
+}
+
+func testProcessScannerIdentifiesHostTerminalFromAncestors() throws {
+    let agent = try spawnFakeAgent(named: "codex", underFakeTerminalApp: "Ghostty.app")
+    defer { agent.tearDown() }
+
+    let scanner = SystemProcessScanner(ghosttyTerminalSource: { nil })
+    var match: DetectedAgentProcess?
+    let deadline = Date().addingTimeInterval(2)
+    repeat {
+        match = try scanner.activeProcesses().first {
+            $0.tool == .codex && $0.cwd == agent.expectedWorkingDirectory
+        }
+        if match == nil { usleep(50_000) }
+    } while match == nil && Date() < deadline
+    guard let match else {
+        throw TestFailure.expectation("agent under the fake terminal was not detected")
+    }
+    // The detected agent is the shell's child, not `agent.process`, so it
+    // must be reaped explicitly or it would outlive the test.
+    defer { kill(match.processID, SIGTERM) }
+
+    try expect(match.terminal.termProgram, equals: "ghostty", "host terminal program")
+}
+
 func testClaudeSettingsMergePreservesHooksAndIsIdempotent() throws {
     let existing = Data(
         #"{"theme":"dark","hooks":{"Stop":[{"hooks":[{"type":"command","command":"existing-hook"}]}]}}"#.utf8
@@ -968,6 +1105,9 @@ let tests: [(String, () throws -> Void)] = [
     ("Codex sessions watcher processes appended lines incrementally", testCodexSessionsWatcherProcessesAppendedLinesIncrementally),
     ("focus planner prioritizes tmux then terminal", testFocusPlannerPrioritizesTmuxThenTerminal),
     ("Ghostty matcher excludes orphaned processes and assigns exact terminals", testGhosttyMatcherExcludesOrphanedProcessesAndAssignsExactTerminals),
+    ("process scanner detects spawned agent process within budget", testProcessScannerDetectsSpawnedAgentProcessWithinBudget),
+    ("process scanner ignores lookalike process names", testProcessScannerIgnoresLookalikeProcessNames),
+    ("process scanner identifies host terminal from ancestors", testProcessScannerIdentifiesHostTerminalFromAncestors),
     ("Claude settings merge preserves hooks and is idempotent", testClaudeSettingsMergePreservesHooksAndIsIdempotent),
     ("Claude settings removal preserves user hooks", testClaudeSettingsRemovalPreservesUserHooks),
     ("Claude settings quotes hook paths for the shell", testClaudeSettingsQuotesHookPathsForTheShell),

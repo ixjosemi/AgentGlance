@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public struct DetectedAgentProcess: Equatable, Sendable {
@@ -27,27 +28,25 @@ public protocol ProcessScanning: Sendable {
 }
 
 public struct SystemProcessScanner: ProcessScanning {
-    public init() {}
+    /// Returns the currently visible Ghostty terminals, or nil when Ghostty
+    /// cannot be queried. Injectable so behavioral tests stay deterministic.
+    public typealias GhosttyTerminalSource = @Sendable () -> [GhosttyTerminal]?
+
+    private let ghosttyTerminalSource: GhosttyTerminalSource
+
+    public init() {
+        self.init(ghosttyTerminalSource: { try? SystemProcessScanner.queryGhosttyTerminals() })
+    }
+
+    public init(ghosttyTerminalSource: @escaping GhosttyTerminalSource) {
+        self.ghosttyTerminalSource = ghosttyTerminalSource
+    }
 
     public func activeProcesses() throws -> [DetectedAgentProcess] {
-        var detected: [DetectedAgentProcess] = []
-        for tool in AgentTool.allCases {
-            for processID in try processIDs(named: tool.rawValue) {
-                guard let cwd = try workingDirectory(processID: processID) else { continue }
-                let tty = try terminalTTY(processID: processID)
-                let termProgram = try terminalProgram(processID: processID)
-                detected.append(DetectedAgentProcess(
-                    tool: tool,
-                    processID: processID,
-                    cwd: cwd,
-                    terminal: TerminalContext(termProgram: termProgram, tty: tty),
-                    elapsedSeconds: try elapsedSeconds(processID: processID)
-                ))
-            }
-        }
+        let detected = try Self.allProcessIDs().compactMap(Self.detectAgentProcess)
         let ghosttyProcesses = detected.filter { $0.terminal.termProgram == "ghostty" }
         guard !ghosttyProcesses.isEmpty,
-              let terminals = try? ghosttyTerminals() else {
+              let terminals = ghosttyTerminalSource() else {
             return detected
         }
         let nonGhosttyProcesses = detected.filter { $0.terminal.termProgram != "ghostty" }
@@ -58,86 +57,172 @@ public struct SystemProcessScanner: ProcessScanning {
         return nonGhosttyProcesses + matched
     }
 
-    private func processIDs(named name: String) throws -> [Int32] {
-        let exact = try run("/usr/bin/pgrep", arguments: ["-x", name])
-        let pathBased = try run("/usr/bin/pgrep", arguments: ["-f", "/\(name)"])
-        let candidates = Set(
-            (exact.output + "\n" + pathBased.output)
-                .split(whereSeparator: \.isNewline)
-                .compactMap { Int32($0) }
-        )
-        return try candidates.filter { processID in
-            let command = try run(
-                "/bin/ps",
-                arguments: ["-o", "comm=", "-p", String(processID)]
-            ).output.trimmingCharacters(in: .whitespacesAndNewlines)
-            return URL(fileURLWithPath: command).lastPathComponent == name
+    /// Lists every process ID visible to this user via libproc, without
+    /// spawning helper processes. Retries with headroom because the process
+    /// table can grow between the sizing call and the fetch.
+    private static func allProcessIDs() throws -> [pid_t] {
+        for _ in 0..<3 {
+            let sizeInBytes = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
+            guard sizeInBytes > 0 else { throw POSIXError(.EIO) }
+            let capacity = Int(sizeInBytes) / MemoryLayout<pid_t>.stride + 64
+            var buffer = [pid_t](repeating: 0, count: capacity)
+            let filledBytes = buffer.withUnsafeMutableBytes { raw in
+                proc_listpids(UInt32(PROC_ALL_PIDS), 0, raw.baseAddress, Int32(raw.count))
+            }
+            guard filledBytes > 0 else { throw POSIXError(.EIO) }
+            let filledCount = Int(filledBytes) / MemoryLayout<pid_t>.stride
+            guard filledCount < capacity else { continue }
+            return buffer.prefix(filledCount).filter { $0 > 0 }
         }
+        throw POSIXError(.EAGAIN)
     }
 
-    private func workingDirectory(processID: Int32) throws -> String? {
-        let result = try run(
-            "/usr/sbin/lsof",
-            arguments: ["-a", "-p", String(processID), "-d", "cwd", "-Fn"]
+    /// Classifies one process, returning nil unless it is a running agent
+    /// whose metadata is fully readable. Processes that exit mid-scan simply
+    /// disappear from the result instead of failing the whole scan.
+    private static func detectAgentProcess(_ processID: pid_t) -> DetectedAgentProcess? {
+        guard let tool = agentTool(processID: processID),
+              let cwd = workingDirectory(processID: processID),
+              let bsdInfo = bsdInfo(processID: processID) else {
+            return nil
+        }
+        let startedAt = TimeInterval(bsdInfo.pbi_start_tvsec)
+        return DetectedAgentProcess(
+            tool: tool,
+            processID: processID,
+            cwd: cwd,
+            terminal: TerminalContext(
+                termProgram: hostTerminalProgram(descendant: bsdInfo),
+                tty: controllingTTY(bsdInfo)
+            ),
+            elapsedSeconds: max(0, Date().timeIntervalSince1970 - startedAt)
         )
-        return result.output.split(whereSeparator: \.isNewline)
-            .first(where: { $0.first == "n" })
-            .map { String($0.dropFirst()) }
     }
 
-    private func terminalTTY(processID: Int32) throws -> String? {
-        let result = try run("/bin/ps", arguments: ["-o", "tty=", "-p", String(processID)])
-        let tty = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !tty.isEmpty, tty != "??" else { return nil }
-        return tty.hasPrefix("/dev/") ? tty : "/dev/\(tty)"
-    }
+    private static let terminalAppMarkers: [(pathMarker: String, termProgram: String)] = [
+        ("/Ghostty.app/", "ghostty"),
+        ("/iTerm.app/", "iTerm.app"),
+        ("/Terminal.app/", "Apple_Terminal"),
+    ]
 
-    private func terminalProgram(processID: Int32) throws -> String? {
-        var currentProcessID = processID
+    /// Walks up the parent chain looking for a known terminal application.
+    /// Both the kernel-resolved executable path and argv[0] are checked, for
+    /// the same reason as agent matching: either side may hide behind a
+    /// symlink. The walk is bounded and stops at launchd.
+    private static func hostTerminalProgram(descendant: proc_bsdinfo) -> String? {
+        var ancestorProcessID = pid_t(descendant.pbi_ppid)
         for _ in 0..<8 {
-            let result = try run(
-                "/bin/ps",
-                arguments: ["-o", "ppid=,command=", "-p", String(currentProcessID)]
-            )
-            let fields = result.output
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .split(maxSplits: 1, whereSeparator: \.isWhitespace)
-            guard fields.count == 2, let parentProcessID = Int32(fields[0]) else { return nil }
-            let command = String(fields[1])
-            if command.contains("/Ghostty.app/") { return "ghostty" }
-            if command.contains("/iTerm.app/") { return "iTerm.app" }
-            if command.contains("/Terminal.app/") { return "Apple_Terminal" }
-            guard parentProcessID > 1 else { return nil }
-            currentProcessID = parentProcessID
+            guard ancestorProcessID > 1 else { return nil }
+            if let program = terminalProgram(ofProcess: ancestorProcessID) {
+                return program
+            }
+            guard let info = bsdInfo(processID: ancestorProcessID) else { return nil }
+            ancestorProcessID = pid_t(info.pbi_ppid)
         }
         return nil
     }
 
-    private func elapsedSeconds(processID: Int32) throws -> TimeInterval {
-        let result = try run("/bin/ps", arguments: ["-o", "etime=", "-p", String(processID)])
-        let value = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
-        let dayParts = value.split(separator: "-", maxSplits: 1).map(String.init)
-        let days = dayParts.count == 2 ? (Double(dayParts[0]) ?? 0) : 0
-        let time = dayParts.last?.split(separator: ":").compactMap { Double($0) } ?? []
-        let seconds = time.reversed().enumerated().reduce(0.0) { total, component in
-            total + component.element * pow(60, Double(component.offset))
+    private static func terminalProgram(ofProcess processID: pid_t) -> String? {
+        classifyByCommandIdentifier(processID: processID) { identifier in
+            terminalAppMarkers.first { identifier.contains($0.pathMarker) }?.termProgram
         }
-        return days * 86_400 + seconds
     }
 
-    private func ghosttyTerminals() throws -> [GhosttyTerminal] {
+    /// A process is an agent when the basename of its kernel-resolved
+    /// executable path or of its argv[0] names a supported tool. The argv[0]
+    /// fallback covers versioned installs behind symlinks, such as
+    /// ~/.local/bin/claude -> .../claude/versions/2.1.214.
+    private static func agentTool(processID: pid_t) -> AgentTool? {
+        classifyByCommandIdentifier(processID: processID) { identifier in
+            AgentTool(rawValue: URL(fileURLWithPath: identifier).lastPathComponent)
+        }
+    }
+
+    /// Applies a classifier to the kernel-resolved executable path first and
+    /// argv[0] second, reading argv only when the path was not conclusive.
+    /// Either side may hide behind a symlink, so both must be considered.
+    private static func classifyByCommandIdentifier<Classification>(
+        processID: pid_t,
+        _ classify: (String) -> Classification?
+    ) -> Classification? {
+        if let path = executablePath(processID: processID), let match = classify(path) {
+            return match
+        }
+        guard let argumentZero = argumentZero(processID: processID) else { return nil }
+        return classify(argumentZero)
+    }
+
+    private static func executablePath(processID: pid_t) -> String? {
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        let length = proc_pidpath(processID, &buffer, UInt32(buffer.count))
+        guard length > 0 else { return nil }
+        return String(cString: buffer)
+    }
+
+    private static func workingDirectory(processID: pid_t) -> String? {
+        var vnodeInfo = proc_vnodepathinfo()
+        let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+        guard proc_pidinfo(processID, PROC_PIDVNODEPATHINFO, 0, &vnodeInfo, size) == size else {
+            return nil
+        }
+        return withUnsafeBytes(of: vnodeInfo.pvi_cdir.vip_path) { raw in
+            String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
+        }
+    }
+
+    /// Maps the controlling terminal device to its /dev path. NODEV
+    /// (all bits set) means the process has no controlling terminal.
+    private static func controllingTTY(_ info: proc_bsdinfo) -> String? {
+        guard info.e_tdev != UInt32.max,
+              let deviceName = devname(dev_t(bitPattern: info.e_tdev), mode_t(S_IFCHR)) else {
+            return nil
+        }
+        return "/dev/" + String(cString: deviceName)
+    }
+
+    private static func bsdInfo(processID: pid_t) -> proc_bsdinfo? {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(processID, PROC_PIDTBSDINFO, 0, &info, size) == size else {
+            return nil
+        }
+        return info
+    }
+
+    /// Reads argv[0] through KERN_PROCARGS2. The buffer layout is: argc,
+    /// then the executable path, NUL padding, then the argv strings. Only
+    /// readable for the current user's processes; anything else returns nil.
+    private static func argumentZero(processID: pid_t) -> String? {
+        var name: [Int32] = [CTL_KERN, KERN_PROCARGS2, processID]
+        var size = 0
+        guard sysctl(&name, UInt32(name.count), nil, &size, nil, 0) == 0, size > 0 else {
+            return nil
+        }
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&name, UInt32(name.count), &buffer, &size, nil, 0) == 0 else { return nil }
+        let argumentCountWidth = MemoryLayout<Int32>.size
+        guard size > argumentCountWidth else { return nil }
+        let content = buffer[argumentCountWidth..<size]
+        guard let executablePathEnd = content.firstIndex(of: 0) else { return nil }
+        let padding = content[executablePathEnd...].prefix(while: { $0 == 0 })
+        let argumentBytes = content[padding.endIndex...].prefix(while: { $0 != 0 })
+        guard !argumentBytes.isEmpty else { return nil }
+        return String(decoding: argumentBytes, as: UTF8.self)
+    }
+
+    static func queryGhosttyTerminals() throws -> [GhosttyTerminal] {
         let script = """
         const app = Application("Ghostty");
         JSON.stringify(app.terminals().map(t => ({
           id: t.id(), name: t.name(), cwd: t.workingDirectory()
         })))
         """
-        let result = try run("/usr/bin/osascript", arguments: ["-l", "JavaScript", "-e", script])
+        let result = try Self.run("/usr/bin/osascript", arguments: ["-l", "JavaScript", "-e", script])
         guard result.status == 0, let data = result.output.data(using: .utf8) else { return [] }
         return try JSONDecoder().decode([GhosttyTerminal].self, from: data)
     }
 
-    private func run(_ executable: String, arguments: [String]) throws -> (status: Int32, output: String) {
+    private static func run(_ executable: String, arguments: [String]) throws -> (status: Int32, output: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
