@@ -9,8 +9,12 @@ const stateDirectory = join(
 );
 const sessions = new Map();
 
+function timestamp() {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
 function createState(session, directory) {
-  const now = new Date().toISOString();
+  const now = timestamp();
   return {
     schema_version: 1,
     tool: "opencode",
@@ -80,7 +84,7 @@ async function updateState(event, directory) {
   if (!transition) return;
   state.status = transition[0];
   state.attention_reason = transition[1];
-  state.updated_at = new Date().toISOString();
+  state.updated_at = timestamp();
   sessions.set(sessionID, state);
   await writeState(state);
 }

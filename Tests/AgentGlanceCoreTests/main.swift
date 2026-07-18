@@ -612,19 +612,8 @@ func testOpenCodePluginWritesSessionState() throws {
     try expect(process.terminationStatus, equals: 0, "plugin process: \(errorOutput)")
     let stateDirectory = directory.appendingPathComponent("state")
     let stateFiles = (try? FileManager.default.contentsOfDirectory(atPath: stateDirectory.path)) ?? []
-    let stateFile = stateDirectory.appendingPathComponent(stateFiles.first ?? "missing")
-    let directReadDiagnostic: String
-    do {
-        _ = try AgentSession.decode(from: Data(contentsOf: stateFile))
-        let attributes = try FileManager.default.attributesOfItem(atPath: stateFile.path)
-        directReadDiagnostic = "direct decode passed; attributes: \(attributes)"
-    } catch {
-        directReadDiagnostic = "direct decode failed: \(error)"
-    }
     let session = try StateRepository(directoryURL: stateDirectory)
-        .loadSessions().first.unwrap(
-            or: "opencode state was not saved; files: \(stateFiles); \(directReadDiagnostic)"
-        )
+        .loadSessions().first.unwrap(or: "opencode state was not saved; files: \(stateFiles)")
     try expect(session.tool, equals: .opencode, "tool")
     try expect(session.status, equals: .working, "status")
     try expect(session.terminal.termProgram, equals: "ghostty", "terminal program")
