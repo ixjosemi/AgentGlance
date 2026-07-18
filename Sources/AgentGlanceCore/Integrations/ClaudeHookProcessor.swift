@@ -1,0 +1,87 @@
+import Foundation
+
+public enum ClaudeHookError: Error, Equatable, Sendable {
+    case unsupportedEvent(String)
+    case unsupportedNotification(String?)
+}
+
+public struct ClaudeHookProcessor: Sendable {
+    private struct Payload: Decodable {
+        let sessionID: String
+        let cwd: String
+        let notificationType: String?
+
+        enum CodingKeys: String, CodingKey {
+            case sessionID = "session_id"
+            case cwd
+            case notificationType = "notification_type"
+        }
+    }
+
+    private let repository: StateRepository
+
+    public init(repository: StateRepository) {
+        self.repository = repository
+    }
+
+    public func process(
+        event: String,
+        payload: Data,
+        environment: [String: String],
+        processID: Int32,
+        now: Date = Date()
+    ) throws {
+        let input = try JSONDecoder().decode(Payload.self, from: payload)
+        let state = try state(for: event, notificationType: input.notificationType)
+        let existing = try repository.loadSessions().first { $0.sessionID == input.sessionID }
+        let session = AgentSession(
+            tool: .claude,
+            sessionID: input.sessionID,
+            pid: processID,
+            status: state.status,
+            attentionReason: state.reason,
+            cwd: input.cwd,
+            startedAt: existing?.startedAt ?? now,
+            updatedAt: now,
+            terminal: existing?.terminal ?? terminalContext(for: input.cwd, environment: environment)
+        )
+        try repository.save(session)
+    }
+
+    private func state(
+        for event: String,
+        notificationType: String?
+    ) throws -> (status: SessionStatus, reason: AttentionReason?) {
+        switch event {
+        case "SessionStart":
+            return (.working, nil)
+        case "Notification" where notificationType == "permission_prompt":
+            return (.needsAttention, .permission)
+        case "Notification" where notificationType == "idle_prompt":
+            return (.needsAttention, .idlePrompt)
+        case "Notification":
+            throw ClaudeHookError.unsupportedNotification(notificationType)
+        case "UserPromptSubmit":
+            return (.working, nil)
+        case "Stop":
+            return (.idle, nil)
+        case "SessionEnd":
+            return (.ended, nil)
+        default:
+            throw ClaudeHookError.unsupportedEvent(event)
+        }
+    }
+
+    private func terminalContext(
+        for cwd: String,
+        environment: [String: String]
+    ) -> TerminalContext {
+        TerminalContext(
+            termProgram: environment["TERM_PROGRAM"],
+            itermSessionID: environment["ITERM_SESSION_ID"],
+            tmuxPane: environment["TMUX_PANE"],
+            tty: environment["AGENTGLANCE_TTY"],
+            windowTitleHint: "\(URL(fileURLWithPath: cwd).lastPathComponent) — claude"
+        )
+    }
+}

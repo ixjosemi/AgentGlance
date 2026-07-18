@@ -1,0 +1,145 @@
+import Foundation
+
+public enum AgentSessionError: Error, Equatable, Sendable {
+    case unsupportedSchemaVersion(Int)
+}
+
+public enum AgentTool: String, Codable, CaseIterable, Sendable {
+    case claude
+    case codex
+    case opencode
+}
+
+public enum SessionStatus: String, Codable, Sendable {
+    case working
+    case needsAttention = "needs_attention"
+    case idle
+    case ended
+}
+
+public enum AttentionReason: String, Codable, Sendable {
+    case permission
+    case idlePrompt = "idle_prompt"
+    case turnComplete = "turn_complete"
+}
+
+public enum SessionSource: String, Codable, Sendable {
+    case reaper
+}
+
+public struct TerminalContext: Codable, Equatable, Sendable {
+    public let termProgram: String?
+    public let ghosttyTerminalID: String?
+    public let itermSessionID: String?
+    public let tmuxPane: String?
+    public let tty: String?
+    public let windowTitleHint: String?
+
+    public init(
+        termProgram: String? = nil,
+        ghosttyTerminalID: String? = nil,
+        itermSessionID: String? = nil,
+        tmuxPane: String? = nil,
+        tty: String? = nil,
+        windowTitleHint: String? = nil
+    ) {
+        self.termProgram = termProgram
+        self.ghosttyTerminalID = ghosttyTerminalID
+        self.itermSessionID = itermSessionID
+        self.tmuxPane = tmuxPane
+        self.tty = tty
+        self.windowTitleHint = windowTitleHint
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case termProgram = "term_program"
+        case ghosttyTerminalID = "ghostty_terminal_id"
+        case itermSessionID = "iterm_session_id"
+        case tmuxPane = "tmux_pane"
+        case tty
+        case windowTitleHint = "window_title_hint"
+    }
+}
+
+public struct AgentSession: Codable, Identifiable, Equatable, Sendable {
+    public let schemaVersion: Int
+    public let tool: AgentTool
+    public let sessionID: String
+    public let pid: Int32
+    public let status: SessionStatus
+    public let attentionReason: AttentionReason?
+    public let cwd: String
+    public let startedAt: Date
+    public let updatedAt: Date
+    public let terminal: TerminalContext
+    public let source: SessionSource?
+
+    public var id: String { "\(tool.rawValue)-\(sessionID)" }
+    public var projectName: String { URL(fileURLWithPath: cwd).lastPathComponent }
+
+    public func replacingProcessID(_ processID: Int32) -> AgentSession {
+        AgentSession(
+            schemaVersion: schemaVersion,
+            tool: tool,
+            sessionID: sessionID,
+            pid: processID,
+            status: status,
+            attentionReason: attentionReason,
+            cwd: cwd,
+            startedAt: startedAt,
+            updatedAt: updatedAt,
+            terminal: terminal,
+            source: source
+        )
+    }
+
+    public init(
+        schemaVersion: Int = 1,
+        tool: AgentTool,
+        sessionID: String,
+        pid: Int32,
+        status: SessionStatus,
+        attentionReason: AttentionReason? = nil,
+        cwd: String,
+        startedAt: Date,
+        updatedAt: Date,
+        terminal: TerminalContext = TerminalContext(),
+        source: SessionSource? = nil
+    ) {
+        self.schemaVersion = schemaVersion
+        self.tool = tool
+        self.sessionID = sessionID
+        self.pid = pid
+        self.status = status
+        self.attentionReason = attentionReason
+        self.cwd = cwd
+        self.startedAt = startedAt
+        self.updatedAt = updatedAt
+        self.terminal = terminal
+        self.source = source
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case tool
+        case sessionID = "session_id"
+        case pid
+        case status
+        case attentionReason = "attention_reason"
+        case cwd
+        case startedAt = "started_at"
+        case updatedAt = "updated_at"
+        case terminal
+        case source
+    }
+
+    public static func decode(from data: Data) throws -> AgentSession {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let session = try decoder.decode(AgentSession.self, from: data)
+        guard session.schemaVersion == 1 else {
+            throw AgentSessionError.unsupportedSchemaVersion(session.schemaVersion)
+        }
+        return session
+    }
+}
