@@ -585,7 +585,7 @@ func testOpenCodePluginWritesSessionState() throws {
         import { AgentGlancePlugin } from "\(pluginURL.absoluteString)";
         const plugin = await AgentGlancePlugin({
           directory: "/tmp/open-project",
-          client: { app: { log: async () => {} } }
+          client: { app: { log: async ({ body }) => console.error(body.message) } }
         });
         await plugin.event({ event: {
           type: "session.created",
@@ -630,7 +630,8 @@ func testOpenCodePluginMapsLifecycleEvents() throws {
         import { readFile } from "node:fs/promises";
         import { AgentGlancePlugin } from "\(pluginURL.absoluteString)";
         const plugin = await AgentGlancePlugin({
-          directory: "/tmp/project", client: { app: { log: async () => {} } }
+          directory: "/tmp/project",
+          client: { app: { log: async ({ body }) => console.error(body.message) } }
         });
         const event = async (type, properties) => plugin.event({ event: { type, properties } });
         const statuses = [];
