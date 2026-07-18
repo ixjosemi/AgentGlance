@@ -215,6 +215,35 @@ private struct ToolIndicator: View {
 
 private let sessionRowHeight: CGFloat = 46
 
+/// The green light of an actively working session emits a radar-style ping:
+/// continuous activity, in the semaphore's own visual language — a spinner
+/// would wrongly suggest a bounded loading task.
+private struct WorkingIndicator: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isPinging = false
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(.green)
+                .frame(width: 8, height: 8)
+            if !reduceMotion {
+                Circle()
+                    .stroke(.green.opacity(0.7), lineWidth: 1.5)
+                    .frame(width: 8, height: 8)
+                    .scaleEffect(isPinging ? 2.4 : 1)
+                    .opacity(isPinging ? 0 : 0.7)
+                    .onAppear {
+                        withAnimation(.easeOut(duration: 1.5).repeatForever(autoreverses: false)) {
+                            isPinging = true
+                        }
+                    }
+            }
+        }
+        .frame(width: 8, height: 8)
+    }
+}
+
 /// Traffic-light mapping shared by the bar semaphores and the menu rows:
 /// green = working, yellow = idle, red = waiting on the user.
 private func semaphoreColor(for status: SessionStatus) -> Color {
@@ -357,9 +386,13 @@ private struct SessionRow: View {
             focus(session)
         } label: {
             HStack(spacing: 10) {
-                Circle()
-                    .fill(semaphoreColor(for: session.status))
-                    .frame(width: 8, height: 8)
+                if session.status == .working {
+                    WorkingIndicator()
+                } else {
+                    Circle()
+                        .fill(semaphoreColor(for: session.status))
+                        .frame(width: 8, height: 8)
+                }
                 VStack(alignment: .leading, spacing: 3) {
                     Text(session.projectName)
                         .font(.system(size: 13, weight: .semibold, design: .rounded))
