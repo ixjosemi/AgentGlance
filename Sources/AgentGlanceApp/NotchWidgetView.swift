@@ -23,22 +23,40 @@ struct NotchWidgetView: View {
         let leftWidth = wingWidth(placement.leftWing, idleDot: isEmpty)
         let rightWidth = wingWidth(placement.rightWing, idleDot: false)
 
-        VStack(spacing: -8) {
+        let barWidth = leftWidth + notchWidth + rightWidth
+        let isExpanded = expandedTool != nil
+
+        // Bar and menu share one background silhouette so the expanded menu
+        // grows out of the notch as a single continuous shape — no seam, no
+        // overlap tricks.
+        ZStack(alignment: .top) {
             if !shouldHide {
-                notchBar(placement: placement, isEmpty: isEmpty, leftWidth: leftWidth, rightWidth: rightWidth)
-                if let expandedTool {
-                    SessionMenuCard(
-                        tool: expandedTool,
-                        sessions: store.sessions(for: expandedTool),
-                        dismiss: collapseMenu
-                    )
-                    // The card matches the visible bar (wings + notch), not
-                    // the fixed panel, and shares its horizontal position.
-                    .frame(width: leftWidth + notchWidth + rightWidth)
-                    .padding(.leading, leftContentWidth - leftWidth)
-                    .padding(.trailing, rightContentWidth - rightWidth)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                VStack(spacing: 0) {
+                    barRow(placement: placement, isEmpty: isEmpty, leftWidth: leftWidth, rightWidth: rightWidth)
+                        .frame(width: barWidth, height: barHeight, alignment: .top)
+                    if let expandedTool {
+                        SessionMenuCard(
+                            tool: expandedTool,
+                            sessions: store.sessions(for: expandedTool),
+                            dismiss: collapseMenu
+                        )
+                        .frame(width: barWidth)
+                        .transition(.opacity)
+                    }
                 }
+                .background(
+                    UnevenRoundedRectangle(
+                        topLeadingRadius: 0,
+                        bottomLeadingRadius: isExpanded ? 20 : 12,
+                        bottomTrailingRadius: isExpanded ? 20 : 12,
+                        topTrailingRadius: 0,
+                        style: .continuous
+                    )
+                    .fill(.black)
+                    .shadow(color: .black.opacity(isExpanded ? 0.45 : 0), radius: 18, y: 8)
+                )
+                .padding(.leading, leftContentWidth - leftWidth)
+                .padding(.trailing, rightContentWidth - rightWidth)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -62,35 +80,21 @@ struct NotchWidgetView: View {
 
     // MARK: Bar
 
-    private func notchBar(
+    private func barRow(
         placement: NotchWingPlacement,
         isEmpty: Bool,
         leftWidth: CGFloat,
         rightWidth: CGFloat
     ) -> some View {
-        ZStack(alignment: .top) {
-            UnevenRoundedRectangle(
-                topLeadingRadius: 0,
-                bottomLeadingRadius: 12,
-                bottomTrailingRadius: 12,
-                topTrailingRadius: 0,
-                style: .continuous
-            )
-            .fill(.black)
-
-            HStack(spacing: 0) {
-                wingContent(placement.leftWing, idleDot: isEmpty)
-                    .frame(width: leftWidth, height: 24)
-                Color.clear
-                    .frame(width: notchWidth, height: 24)
-                wingContent(placement.rightWing, idleDot: false)
-                    .frame(width: rightWidth, height: 24)
-            }
-            .padding(.top, contentTopPadding)
+        HStack(spacing: 0) {
+            wingContent(placement.leftWing, idleDot: isEmpty)
+                .frame(width: leftWidth, height: 24)
+            Color.clear
+                .frame(width: notchWidth, height: 24)
+            wingContent(placement.rightWing, idleDot: false)
+                .frame(width: rightWidth, height: 24)
         }
-        .frame(width: leftWidth + notchWidth + rightWidth, height: barHeight)
-        .padding(.leading, leftContentWidth - leftWidth)
-        .padding(.trailing, rightContentWidth - rightWidth)
+        .padding(.top, contentTopPadding)
     }
 
     private func wingWidth(_ wing: [ToolSummary], idleDot: Bool) -> CGFloat {
@@ -275,11 +279,7 @@ private struct SessionMenuCard: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .fill(.black)
-                .shadow(color: .black.opacity(0.45), radius: 18, y: 8)
-        )
+        .padding(.bottom, 6)
     }
 
     private var displayName: String {
