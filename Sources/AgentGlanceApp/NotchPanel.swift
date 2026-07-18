@@ -8,11 +8,26 @@ final class NotchPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+/// Hosting view that only accepts events inside the visible notch
+/// silhouette. The panel itself always spans the expanded height — resizing
+/// the window while SwiftUI animates the shape caused a visible glitch — so
+/// pass-through for the transparent strip below the notch is handled here.
+final class NotchHostingView<Content: View>: NSHostingView<Content> {
+    var interactiveHeight: CGFloat = 0
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = superview.map { convert(point, from: $0) } ?? point
+        let distanceFromTop = isFlipped ? local.y : bounds.height - local.y
+        guard distanceFromTop <= interactiveHeight else { return nil }
+        return super.hitTest(point)
+    }
+}
+
 @MainActor
 final class NotchPanelController {
     private let panel: NotchPanel
     private let layout: NotchLayout
-    private var shrinkWorkItem: DispatchWorkItem?
+    private var hostingView: NotchHostingView<NotchWidgetView>?
 
     init(store: StateStore) {
         let screen = NSScreen.main ?? NSScreen.screens.first
@@ -25,7 +40,7 @@ final class NotchPanelController {
             rightNotchEdgeX: screen?.auxiliaryTopRightArea?.minX
         )
         panel = NotchPanel(
-            contentRect: NSRect(x: 0, y: 0, width: layout.width, height: layout.height),
+            contentRect: NSRect(x: 0, y: 0, width: layout.width, height: layout.expandedHeight),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -38,7 +53,7 @@ final class NotchPanelController {
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = false
         let controller = self
-        panel.contentView = NSHostingView(rootView: NotchWidgetView(
+        let hostingView = NotchHostingView(rootView: NotchWidgetView(
             store: store,
             contentTopPadding: layout.contentTopPadding,
             notchWidth: layout.notchWidth,
@@ -47,37 +62,25 @@ final class NotchPanelController {
             barHeight: layout.height,
             onMenuVisibilityChange: { controller.setMenuVisible($0) }
         ))
-        panel.setFrame(frame(expanded: false), display: false)
+        hostingView.interactiveHeight = layout.height
+        self.hostingView = hostingView
+        panel.contentView = hostingView
+        panel.setFrame(
+            NSRect(
+                x: layout.originX,
+                y: layout.originY + layout.height - layout.expandedHeight,
+                width: layout.width,
+                height: layout.expandedHeight
+            ),
+            display: false
+        )
     }
 
     func show() {
         panel.orderFrontRegardless()
     }
 
-    /// The panel only occupies the notch bar while collapsed so that clicks
-    /// below the notch reach whatever window is behind it. It grows before
-    /// the menu animates in and shrinks after the menu animates out.
     private func setMenuVisible(_ isVisible: Bool) {
-        shrinkWorkItem?.cancel()
-        shrinkWorkItem = nil
-        if isVisible {
-            panel.setFrame(frame(expanded: true), display: true)
-            return
-        }
-        let workItem = DispatchWorkItem { [panel, collapsedFrame = frame(expanded: false)] in
-            panel.setFrame(collapsedFrame, display: true)
-        }
-        shrinkWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: workItem)
-    }
-
-    private func frame(expanded: Bool) -> NSRect {
-        let height = expanded ? layout.expandedHeight : layout.height
-        return NSRect(
-            x: layout.originX,
-            y: layout.originY + layout.height - height,
-            width: layout.width,
-            height: height
-        )
+        hostingView?.interactiveHeight = isVisible ? layout.expandedHeight : layout.height
     }
 }

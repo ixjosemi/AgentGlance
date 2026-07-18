@@ -55,24 +55,27 @@ struct NotchWidgetView: View {
                     .fill(.black)
                     .shadow(color: .black.opacity(isExpanded ? 0.45 : 0), radius: 18, y: 8)
                 )
+                // Hover and the context menu belong to the silhouette, not
+                // the outer frame: the panel is always expanded-height, so
+                // the outer frame covers transparent dead space below.
+                .contextMenu {
+                    SettingsLink {
+                        Label("AgentGlance Settings", systemImage: "gearshape")
+                    }
+                    Divider()
+                    Button {
+                        NSApp.terminate(nil)
+                    } label: {
+                        Label("Quit AgentGlance", systemImage: "power")
+                    }
+                }
+                .onHover(perform: scheduleCollapseOnHoverExit)
                 .padding(.leading, leftContentWidth - leftWidth)
                 .padding(.trailing, rightContentWidth - rightWidth)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: expandedTool)
-        .contextMenu {
-            SettingsLink {
-                Label("AgentGlance Settings", systemImage: "gearshape")
-            }
-            Divider()
-            Button {
-                NSApp.terminate(nil)
-            } label: {
-                Label("Quit AgentGlance", systemImage: "power")
-            }
-        }
-        .onHover(perform: scheduleCollapseOnHoverExit)
         .onChange(of: expandedTool != nil) { _, isVisible in
             onMenuVisibilityChange(isVisible)
         }
@@ -258,7 +261,15 @@ private struct SessionMenuCard: View {
                     .foregroundStyle(.white.opacity(0.45))
                     .padding(.horizontal, 14)
                     .padding(.bottom, 12)
+            } else if sessions.count <= 5 {
+                VStack(spacing: 0) {
+                    ForEach(sessions) { session in
+                        SessionRow(session: session, focus: focusSession)
+                    }
+                }
+                .padding(.bottom, 8)
             } else {
+                // Half a row peeks out at the cutoff to hint at the scroll.
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 0) {
                         ForEach(sessions) { session in
@@ -266,7 +277,7 @@ private struct SessionMenuCard: View {
                         }
                     }
                 }
-                .frame(maxHeight: 280)
+                .frame(height: 5.5 * 44)
                 .padding(.bottom, 8)
             }
 
