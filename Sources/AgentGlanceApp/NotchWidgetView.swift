@@ -20,16 +20,23 @@ struct NotchWidgetView: View {
         let placement = NotchWingPlacement.place(ToolSummary.active(in: store.sessions))
         let isEmpty = placement.leftWing.isEmpty && placement.rightWing.isEmpty
         let shouldHide = isEmpty && hideWhenEmpty
+        let leftWidth = wingWidth(placement.leftWing, idleDot: isEmpty)
+        let rightWidth = wingWidth(placement.rightWing, idleDot: false)
 
         VStack(spacing: -8) {
             if !shouldHide {
-                notchBar(placement: placement, isEmpty: isEmpty)
+                notchBar(placement: placement, isEmpty: isEmpty, leftWidth: leftWidth, rightWidth: rightWidth)
                 if let expandedTool {
                     SessionMenuCard(
                         tool: expandedTool,
                         sessions: store.sessions(for: expandedTool),
                         dismiss: collapseMenu
                     )
+                    // The card matches the visible bar (wings + notch), not
+                    // the fixed panel, and shares its horizontal position.
+                    .frame(width: leftWidth + notchWidth + rightWidth)
+                    .padding(.leading, leftContentWidth - leftWidth)
+                    .padding(.trailing, rightContentWidth - rightWidth)
                     .transition(.opacity.combined(with: .move(edge: .top)))
                 }
             }
@@ -55,11 +62,13 @@ struct NotchWidgetView: View {
 
     // MARK: Bar
 
-    private func notchBar(placement: NotchWingPlacement, isEmpty: Bool) -> some View {
-        let leftWidth = wingWidth(placement.leftWing, idleDot: isEmpty)
-        let rightWidth = wingWidth(placement.rightWing, idleDot: false)
-
-        return ZStack(alignment: .top) {
+    private func notchBar(
+        placement: NotchWingPlacement,
+        isEmpty: Bool,
+        leftWidth: CGFloat,
+        rightWidth: CGFloat
+    ) -> some View {
+        ZStack(alignment: .top) {
             UnevenRoundedRectangle(
                 topLeadingRadius: 0,
                 bottomLeadingRadius: 12,
@@ -271,7 +280,6 @@ private struct SessionMenuCard: View {
                 .fill(.black)
                 .shadow(color: .black.opacity(0.45), radius: 18, y: 8)
         )
-        .padding(.horizontal, 4)
     }
 
     private var displayName: String {
