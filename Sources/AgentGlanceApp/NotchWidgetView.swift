@@ -111,9 +111,11 @@ struct NotchWidgetView: View {
     private func wingContent(_ wing: [ToolSummary], idleDot: Bool) -> some View {
         if wing.isEmpty {
             if idleDot {
-                Circle()
-                    .fill(.white.opacity(0.5))
-                    .frame(width: 7, height: 7)
+                // Quiet empty state: the app is awake but no agent is running.
+                Image(systemName: "moon.zzz.fill")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.32))
+                    .accessibilityLabel("No active agents")
             }
         } else {
             HStack(spacing: 6) {
@@ -170,7 +172,10 @@ private struct ToolIndicator: View {
                         .font(.system(size: 12, weight: .medium, design: .rounded))
                         .monospacedDigit()
                 }
-                if let worstStatus = summary.worstStatus {
+                // Working is the default hum of the app — no light. The bar
+                // only signals waiting states: yellow (idle, waiting for a
+                // prompt) and red (waiting on an answer or a permission).
+                if let worstStatus = summary.worstStatus, worstStatus != .working {
                     Circle()
                         .fill(semaphoreColor(for: worstStatus))
                         .frame(width: 6, height: 6)
@@ -207,6 +212,8 @@ private struct ToolIndicator: View {
         return "\(summary.tool.rawValue), \(summary.sessionCount) sessions\(attention)"
     }
 }
+
+private let sessionRowHeight: CGFloat = 46
 
 /// Traffic-light mapping shared by the bar semaphores and the menu rows:
 /// green = working, yellow = idle, red = waiting on the user.
@@ -268,6 +275,10 @@ private struct SessionMenuCard: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.55))
                 Spacer()
+                Text(sessions.count, format: .number)
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.white.opacity(0.35))
             }
             .padding(.horizontal, 14)
             .padding(.top, 12)
@@ -295,7 +306,7 @@ private struct SessionMenuCard: View {
                         }
                     }
                 }
-                .frame(height: 5.5 * 44)
+                .frame(height: 5.5 * sessionRowHeight)
                 .padding(.bottom, 8)
             }
 
@@ -349,42 +360,53 @@ private struct SessionRow: View {
                 Circle()
                     .fill(semaphoreColor(for: session.status))
                     .frame(width: 8, height: 8)
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 3) {
                     Text(session.projectName)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.92))
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.94))
                         .lineLimit(1)
-                    HStack(spacing: 6) {
+                    HStack(spacing: 5) {
                         if let branch = branchName {
-                            Label(branch, systemImage: "arrow.triangle.branch")
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundStyle(.white.opacity(0.5))
-                                .lineLimit(1)
+                            HStack(spacing: 3) {
+                                Image(systemName: "arrow.triangle.branch")
+                                    .font(.system(size: 8, weight: .semibold))
+                                Text(branch)
+                                    .font(.system(size: 10, design: .monospaced))
+                            }
+                            .foregroundStyle(.white.opacity(0.55))
+                            .lineLimit(1)
                         }
-                        if let tabTitle = session.terminal.windowTitleHint, !tabTitle.isEmpty {
+                        if branchName != nil, tabTitle != nil {
+                            Text("·")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(.white.opacity(0.25))
+                        }
+                        if let tabTitle {
                             Text(tabTitle)
                                 .font(.system(size: 10))
-                                .foregroundStyle(.white.opacity(0.4))
+                                .foregroundStyle(.white.opacity(0.38))
                                 .lineLimit(1)
                         }
                     }
                 }
                 Spacer(minLength: 8)
-                if let terminalName {
-                    Text(terminalName)
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.65))
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(Capsule().fill(.white.opacity(0.1)))
+                VStack(alignment: .trailing, spacing: 3) {
+                    if let terminalName {
+                        Text(terminalName)
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.6))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Capsule().fill(.white.opacity(0.1)))
+                    }
+                    Text(session.updatedAt, style: .relative)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.white.opacity(0.32))
+                        .monospacedDigit()
                 }
-                Text(session.updatedAt, style: .relative)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.white.opacity(0.35))
-                    .monospacedDigit()
             }
             .padding(.horizontal, 14)
-            .frame(height: 44)
+            .frame(height: sessionRowHeight)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .fill(.white.opacity(isHovered ? 0.08 : 0))
@@ -399,6 +421,11 @@ private struct SessionRow: View {
 
     private var branchName: String? {
         GitWorkspaceInspector.branchName(forWorkingDirectory: session.cwd)
+    }
+
+    private var tabTitle: String? {
+        guard let hint = session.terminal.windowTitleHint, !hint.isEmpty else { return nil }
+        return hint
     }
 
     private var terminalName: String? {
