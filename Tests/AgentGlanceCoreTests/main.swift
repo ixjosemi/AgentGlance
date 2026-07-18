@@ -654,6 +654,35 @@ func testToolSummaryCountsSessionsAndAttention() throws {
     )
 }
 
+func testToolSummaryReportsWorstStatusForSemaphore() throws {
+    let working = try AgentSession.decode(from: validStateJSON(sessionID: "w", status: "working"))
+    let idle = try AgentSession.decode(from: validStateJSON(sessionID: "i", status: "idle"))
+    let attention = try AgentSession.decode(
+        from: validStateJSON(sessionID: "a", status: "needs_attention")
+    )
+
+    try expect(
+        ToolSummary(tool: .claude, sessions: [working]).worstStatus,
+        equals: .working,
+        "all working stays green"
+    )
+    try expect(
+        ToolSummary(tool: .claude, sessions: [working, idle]).worstStatus,
+        equals: .idle,
+        "one idle turns yellow"
+    )
+    try expect(
+        ToolSummary(tool: .claude, sessions: [working, idle, attention]).worstStatus,
+        equals: .needsAttention,
+        "one attention turns red"
+    )
+    try expect(
+        ToolSummary(tool: .claude, sessions: []).worstStatus,
+        equals: nil,
+        "no sessions, no semaphore"
+    )
+}
+
 func testNotchWingPlacementSplitsToolsAroundNotch() throws {
     let sessions = [
         try AgentSession.decode(from: validStateJSON(sessionID: "c1", status: "working")),
@@ -1307,6 +1336,7 @@ let tests: [(String, () throws -> Void)] = [
     ("state store file events observe new state files without polling", testStateStoreFileEventsObserveNewStateFilesWithoutPolling),
     ("state store Darwin notification observes new state files", testStateStoreDarwinNotificationObservesNewStateFiles),
     ("tool summary counts sessions and attention", testToolSummaryCountsSessionsAndAttention),
+    ("tool summary reports worst status for semaphore", testToolSummaryReportsWorstStatusForSemaphore),
     ("notch wing placement splits tools around notch", testNotchWingPlacementSplitsToolsAroundNotch),
     ("git workspace inspector resolves branch names", testGitWorkspaceInspectorResolvesBranchNames),
     ("notch layout extends from left side of hardware notch", testNotchLayoutExtendsFromLeftSideOfHardwareNotch),

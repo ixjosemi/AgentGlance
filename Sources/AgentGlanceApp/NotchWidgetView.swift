@@ -170,11 +170,11 @@ private struct ToolIndicator: View {
                         .font(.system(size: 12, weight: .medium, design: .rounded))
                         .monospacedDigit()
                 }
-                if summary.needsAttention {
+                if let worstStatus = summary.worstStatus {
                     Circle()
-                        .fill(.red)
+                        .fill(semaphoreColor(for: worstStatus))
                         .frame(width: 6, height: 6)
-                        .opacity(reduceMotion ? 1 : (attentionIsBright ? 1 : 0.35))
+                        .opacity(pulseOpacity(for: worstStatus))
                         .onAppear {
                             guard !reduceMotion else { return }
                             withAnimation(.easeInOut(duration: 1).repeatForever(autoreverses: true)) {
@@ -195,9 +195,27 @@ private struct ToolIndicator: View {
         .accessibilityLabel(accessibilityLabel)
     }
 
+    /// Only the red light pulses; green and yellow stay steady so the bar
+    /// never draws attention when nothing needs it.
+    private func pulseOpacity(for status: SessionStatus) -> Double {
+        guard status == .needsAttention, !reduceMotion else { return 1 }
+        return attentionIsBright ? 1 : 0.35
+    }
+
     private var accessibilityLabel: String {
         let attention = summary.needsAttention ? ", needs attention" : ""
         return "\(summary.tool.rawValue), \(summary.sessionCount) sessions\(attention)"
+    }
+}
+
+/// Traffic-light mapping shared by the bar semaphores and the menu rows:
+/// green = working, yellow = idle, red = waiting on the user.
+private func semaphoreColor(for status: SessionStatus) -> Color {
+    switch status {
+    case .working: .green
+    case .idle: .yellow
+    case .needsAttention: .red
+    case .ended: .gray
     }
 }
 
@@ -329,7 +347,7 @@ private struct SessionRow: View {
         } label: {
             HStack(spacing: 10) {
                 Circle()
-                    .fill(semaphoreColor)
+                    .fill(semaphoreColor(for: session.status))
                     .frame(width: 8, height: 8)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(session.projectName)
@@ -377,17 +395,6 @@ private struct SessionRow: View {
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
         .accessibilityLabel("\(session.projectName), \(session.status.rawValue)")
-    }
-
-    /// Traffic-light mapping: green = working, yellow = idle,
-    /// red = waiting on the user.
-    private var semaphoreColor: Color {
-        switch session.status {
-        case .working: .green
-        case .idle: .yellow
-        case .needsAttention: .red
-        case .ended: .gray
-        }
     }
 
     private var branchName: String? {
