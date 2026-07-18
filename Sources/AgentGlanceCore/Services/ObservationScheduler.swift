@@ -25,13 +25,14 @@ public final class ObservationScheduler {
     private var codexWatcher: CodexSessionsWatcher?
     private var codexProcessMap: [String: Int32] = [:]
     private var codexDirectorySource: DispatchSourceFileSystemObject?
+    private var exitWatchers: [pid_t: DispatchSourceProcess] = [:]
     private var tickScheduled = false
 
     public init(
         repository: StateRepository,
         processScanner: any ProcessScanning = SystemProcessScanner(),
         codexSessionsDirectoryURL: URL? = nil,
-        heartbeatInterval: TimeInterval = 10,
+        heartbeatInterval: TimeInterval = 5,
         debounceInterval: TimeInterval = 0.3
     ) {
         self.repository = repository
@@ -59,8 +60,11 @@ public final class ObservationScheduler {
         heartbeatTimer?.invalidate()
         heartbeatTimer = nil
         workQueue.async { [weak self] in
-            self?.codexDirectorySource?.cancel()
-            self?.codexDirectorySource = nil
+            guard let self else { return }
+            self.codexDirectorySource?.cancel()
+            self.codexDirectorySource = nil
+            self.exitWatchers.values.forEach { $0.cancel() }
+            self.exitWatchers.removeAll()
         }
     }
 
@@ -97,6 +101,30 @@ public final class ObservationScheduler {
             NSLog("AgentGlance reaper failed: %@", String(describing: error))
         }
         refreshCodexWatcher(detected: detected)
+        refreshExitWatchers(detected: detected)
+    }
+
+    /// Registers a kernel exit notification (EVFILT_PROC) per tracked agent
+    /// so a closed terminal disappears on the next debounce window instead of
+    /// waiting for the heartbeat. Costs nothing between events. A process
+    /// that dies before registration is caught by the heartbeat backstop.
+    private func refreshExitWatchers(detected: [DetectedAgentProcess]) {
+        dispatchPrecondition(condition: .onQueue(workQueue))
+        let activeProcessIDs = Set(detected.map(\.processID))
+        for (processID, watcher) in exitWatchers where !activeProcessIDs.contains(processID) {
+            watcher.cancel()
+            exitWatchers[processID] = nil
+        }
+        for processID in activeProcessIDs where exitWatchers[processID] == nil {
+            let watcher = DispatchSource.makeProcessSource(
+                identifier: processID,
+                eventMask: .exit,
+                queue: workQueue
+            )
+            watcher.setEventHandler { [weak self] in self?.scheduleCoalescedTick() }
+            watcher.resume()
+            exitWatchers[processID] = watcher
+        }
     }
 
     /// Rebuilds the Codex watcher whenever the set of visible Codex processes

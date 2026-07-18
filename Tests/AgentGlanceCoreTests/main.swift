@@ -418,6 +418,59 @@ final class CountingProcessScanner: ProcessScanning, @unchecked Sendable {
     }
 }
 
+/// Reports the process only while it is actually alive, mimicking a real
+/// scan across a process death.
+struct LivenessProcessScanner: ProcessScanning {
+    let process: DetectedAgentProcess
+
+    func activeProcesses() throws -> [DetectedAgentProcess] {
+        Darwin.kill(process.processID, 0) == 0 ? [process] : []
+    }
+}
+
+func testObservationSchedulerReapsImmediatelyWhenProcessExits() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let child = Process()
+    child.executableURL = URL(fileURLWithPath: "/bin/sleep")
+    child.arguments = ["300"]
+    try child.run()
+    defer { child.terminate() }
+    let scheduler = ObservationScheduler(
+        repository: repository,
+        processScanner: LivenessProcessScanner(process: DetectedAgentProcess(
+            tool: .claude,
+            processID: child.processIdentifier,
+            cwd: "/tmp/exit-watch",
+            terminal: TerminalContext(tty: nil)
+        )),
+        codexSessionsDirectoryURL: directory.appendingPathComponent("codex", isDirectory: true),
+        debounceInterval: 0.05
+    )
+
+    scheduler.requestTick()
+    var deadline = Date().addingTimeInterval(2)
+    while (try repository.loadSessions()).isEmpty, Date() < deadline {
+        usleep(20_000)
+    }
+    try expect((try repository.loadSessions()).count, equals: 1, "session tracked while alive")
+
+    // No heartbeat is running and no further ticks are requested: only the
+    // kernel exit event can trigger the reap.
+    child.terminate()
+    deadline = Date().addingTimeInterval(1.5)
+    while !(try repository.loadSessions()).isEmpty, Date() < deadline {
+        usleep(20_000)
+    }
+    try expect(
+        (try repository.loadSessions()).isEmpty,
+        equals: true,
+        "session reaped on process exit without a heartbeat"
+    )
+}
+
 func testObservationSchedulerCoalescesTickBursts() throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1323,6 +1376,7 @@ let tests: [(String, () throws -> Void)] = [
     ("reaper creates fallback state for untracked process", testReaperCreatesFallbackStateForUntrackedProcess),
     ("reaper reaps against provided scan", testReaperReapsAgainstProvidedScan),
     ("observation scheduler tick persists fallback state", testObservationSchedulerTickPersistsFallbackState),
+    ("observation scheduler reaps immediately when process exits", testObservationSchedulerReapsImmediatelyWhenProcessExits),
     ("observation scheduler coalesces tick bursts", testObservationSchedulerCoalescesTickBursts),
     ("native state replaces reaper fallback for same process", testNativeStateReplacesReaperFallbackForSameProcess),
     ("debug renderer shows tool counts and session state", testDebugRendererShowsToolCountsAndSessionState),

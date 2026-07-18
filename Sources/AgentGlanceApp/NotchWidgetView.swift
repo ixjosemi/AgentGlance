@@ -390,19 +390,13 @@ private struct SessionRow: View {
                     }
                 }
                 Spacer(minLength: 8)
-                VStack(alignment: .trailing, spacing: 3) {
-                    if let terminalName {
-                        Text(terminalName)
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.6))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Capsule().fill(.white.opacity(0.1)))
-                    }
-                    Text(session.updatedAt, style: .relative)
-                        .font(.system(size: 9))
-                        .foregroundStyle(.white.opacity(0.32))
-                        .monospacedDigit()
+                if let terminalName {
+                    Text(terminalName)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.6))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Capsule().fill(.white.opacity(0.1)))
                 }
             }
             .padding(.horizontal, 14)
