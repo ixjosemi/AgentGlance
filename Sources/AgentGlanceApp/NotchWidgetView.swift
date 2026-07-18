@@ -174,11 +174,18 @@ private struct SessionListView: View {
 
     private func sessionButton(_ session: AgentSession) -> some View {
         Button {
-            do {
-                try FocusService.focus(session)
-                dismiss()
-            } catch {
-                errorMessage = "Could not focus this terminal session."
+            // FocusService shells out to osascript/tmux, which can take
+            // hundreds of milliseconds; keep it off the main thread so the
+            // popover stays responsive.
+            Task.detached(priority: .userInitiated) {
+                do {
+                    try FocusService.focus(session)
+                    await MainActor.run { dismiss() }
+                } catch {
+                    await MainActor.run {
+                        errorMessage = "Could not focus this terminal session."
+                    }
+                }
             }
         } label: {
             HStack(spacing: 8) {
