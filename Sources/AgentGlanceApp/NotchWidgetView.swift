@@ -43,6 +43,12 @@ struct NotchWidgetView: View {
             SettingsLink {
                 Label("AgentGlance Settings", systemImage: "gearshape")
             }
+            Divider()
+            Button {
+                NSApp.terminate(nil)
+            } label: {
+                Label("Quit AgentGlance", systemImage: "power")
+            }
         }
     }
 

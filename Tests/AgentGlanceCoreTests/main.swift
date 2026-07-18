@@ -555,7 +555,7 @@ func testClaudeHookWrapperForwardsPayloadAndEvent() throws {
     try expect(payload, equals: #"{"session_id":"abc"}"#, "hook payload")
 }
 
-func testStateStoreReloadsActiveSessionsAndRemovesEndedSessions() throws {
+func testStateStoreReloadFiltersEndedSessionsWithoutWriting() throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -572,7 +572,14 @@ func testStateStoreReloadsActiveSessionsAndRemovesEndedSessions() throws {
     try store.reload()
 
     try expect(store.sessions.map(\.sessionID), equals: ["active"], "active sessions")
-    try expect(try repository.loadSessions().map(\.sessionID), equals: ["active"], "ended state file")
+    // Reloading is a pure read: deleting ended state belongs to the reaper.
+    // A reload that writes re-triggers its own directory observation and can
+    // storm the main thread (observed 2026-07-18 at ~100% CPU).
+    try expect(
+        try repository.loadSessions().map(\.sessionID).sorted(),
+        equals: ["active", "ended"],
+        "state files on disk"
+    )
 }
 
 func testStateStorePollingObservesNewStateFiles() throws {
@@ -1192,7 +1199,7 @@ let tests: [(String, () throws -> Void)] = [
     ("CLI parses Codex notify command", testCLIParsesCodexNotifyCommand),
     ("capture context emits terminal JSON", testCaptureContextEmitsTerminalJSON),
     ("Claude hook wrapper forwards payload and event", testClaudeHookWrapperForwardsPayloadAndEvent),
-    ("state store reloads active sessions and removes ended sessions", testStateStoreReloadsActiveSessionsAndRemovesEndedSessions),
+    ("state store reload filters ended sessions without writing", testStateStoreReloadFiltersEndedSessionsWithoutWriting),
     ("state store polling observes new state files", testStateStorePollingObservesNewStateFiles),
     ("state store file events observe new state files without polling", testStateStoreFileEventsObserveNewStateFilesWithoutPolling),
     ("state store Darwin notification observes new state files", testStateStoreDarwinNotificationObservesNewStateFiles),

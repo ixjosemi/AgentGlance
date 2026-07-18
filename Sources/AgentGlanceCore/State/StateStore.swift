@@ -24,7 +24,7 @@ private let stateStoreNotificationCallback: CFNotificationCallback = {
     _, observer, _, _, _ in
     guard let observer else { return }
     let store = Unmanaged<StateStore>.fromOpaque(observer).takeUnretainedValue()
-    DispatchQueue.main.async { store.reloadRecordingError() }
+    DispatchQueue.main.async { store.scheduleCoalescedReload() }
 }
 
 @Observable
@@ -36,17 +36,18 @@ public final class StateStore {
     private var pollingTimer: Timer?
     private var directorySource: DispatchSourceFileSystemObject?
     private var observesDarwinNotifications = false
+    private var reloadScheduled = false
 
     public init(repository: StateRepository) {
         self.repository = repository
     }
 
+    /// Reloading is strictly a read: ended sessions are filtered from the UI
+    /// but their files stay on disk for the reaper to delete on its own
+    /// queue. A reload that writes would re-trigger this store's directory
+    /// observation and feed back into itself.
     public func reload() throws {
-        let loadedSessions = try repository.loadSessions()
-        for session in loadedSessions where session.status == .ended {
-            try repository.remove(session)
-        }
-        sessions = loadedSessions
+        sessions = try repository.loadSessions()
             .filter { $0.status != .ended }
             .sorted(by: Self.precedes)
     }
@@ -114,10 +115,23 @@ public final class StateStore {
             eventMask: [.write, .extend, .attrib, .rename, .delete],
             queue: .main
         )
-        source.setEventHandler { [weak self] in self?.reloadRecordingError() }
+        source.setEventHandler { [weak self] in self?.scheduleCoalescedReload() }
         source.setCancelHandler { Darwin.close(descriptor) }
         directorySource = source
         source.resume()
+    }
+
+    /// Coalesces bursts of directory events into one reload per 150ms window
+    /// so that an aggressive writer — another process, or a misbehaving
+    /// integration — can never storm the main thread with reloads.
+    fileprivate func scheduleCoalescedReload() {
+        guard !reloadScheduled else { return }
+        reloadScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self else { return }
+            self.reloadScheduled = false
+            self.reloadRecordingError()
+        }
     }
 
     fileprivate func reloadRecordingError() {
