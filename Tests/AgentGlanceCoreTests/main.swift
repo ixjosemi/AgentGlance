@@ -610,8 +610,10 @@ func testOpenCodePluginWritesSessionState() throws {
         encoding: .utf8
     ) ?? ""
     try expect(process.terminationStatus, equals: 0, "plugin process: \(errorOutput)")
-    let session = try StateRepository(directoryURL: directory.appendingPathComponent("state"))
-        .loadSessions().first.unwrap(or: "opencode state was not saved")
+    let stateDirectory = directory.appendingPathComponent("state")
+    let stateFiles = (try? FileManager.default.contentsOfDirectory(atPath: stateDirectory.path)) ?? []
+    let session = try StateRepository(directoryURL: stateDirectory)
+        .loadSessions().first.unwrap(or: "opencode state was not saved; files: \(stateFiles)")
     try expect(session.tool, equals: .opencode, "tool")
     try expect(session.status, equals: .working, "status")
     try expect(session.terminal.termProgram, equals: "ghostty", "terminal program")
