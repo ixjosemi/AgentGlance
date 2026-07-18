@@ -19,8 +19,14 @@ public struct ReaperService: Sendable {
     }
 
     public func reap() throws -> ReaperResult {
+        try reap(detected: try processScanner.activeProcesses())
+    }
+
+    /// Reaps against an already-completed scan, so callers that drive several
+    /// consumers from one scan (for example the observation scheduler) do not
+    /// trigger a rescan per consumer.
+    public func reap(detected activeProcesses: [DetectedAgentProcess]) throws -> ReaperResult {
         let sessions = try repository.loadSessions()
-        let activeProcesses = try processScanner.activeProcesses()
         let activeProcessKeys = Set(activeProcesses.map {
             "\($0.tool.rawValue)-\($0.processID)"
         })

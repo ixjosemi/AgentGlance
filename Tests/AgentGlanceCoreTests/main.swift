@@ -345,6 +345,103 @@ func testReaperCreatesFallbackStateForUntrackedProcess() throws {
     try expect(session.pid, equals: Int32(getpid()), "session PID")
 }
 
+func testReaperReapsAgainstProvidedScan() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    try repository.save(AgentSession.decode(
+        from: validStateJSON(sessionID: "ghost", status: "working", pid: 999_999)
+    ))
+    let liveProcess = DetectedAgentProcess(
+        tool: .opencode,
+        processID: Int32(getpid()),
+        cwd: "/tmp/shared-scan",
+        terminal: TerminalContext(tty: "/dev/ttys001")
+    )
+
+    // A scheduler scans once per tick and hands the result to the reaper,
+    // so reaping must work against a provided scan without rescanning.
+    let result = try ReaperService(repository: repository).reap(detected: [liveProcess])
+
+    try expect(result.removedSessionIDs, equals: ["ghost"], "removed sessions")
+    try expect(result.createdSessionIDs, equals: ["reaper-\(getpid())"], "created sessions")
+    let session = try repository.loadSessions().first.unwrap(or: "fallback state was not saved")
+    try expect(session.cwd, equals: "/tmp/shared-scan", "fallback cwd")
+}
+
+func testObservationSchedulerTickPersistsFallbackState() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let liveProcess = DetectedAgentProcess(
+        tool: .opencode,
+        processID: Int32(getpid()),
+        cwd: "/tmp/scheduler-project",
+        terminal: TerminalContext(tty: nil)
+    )
+    let scheduler = ObservationScheduler(
+        repository: repository,
+        processScanner: TestProcessScanner([liveProcess]),
+        codexSessionsDirectoryURL: directory.appendingPathComponent("codex", isDirectory: true)
+    )
+
+    scheduler.requestTick()
+
+    let deadline = Date().addingTimeInterval(2)
+    var sessions: [AgentSession] = []
+    repeat {
+        sessions = (try? repository.loadSessions()) ?? []
+        if sessions.isEmpty { usleep(20_000) }
+    } while sessions.isEmpty && Date() < deadline
+    try expect(sessions.map(\.sessionID), equals: ["reaper-\(getpid())"], "fallback session")
+    try expect(sessions.first?.cwd, equals: "/tmp/scheduler-project", "fallback cwd")
+}
+
+final class CountingProcessScanner: ProcessScanning, @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func activeProcesses() throws -> [DetectedAgentProcess] {
+        lock.lock()
+        defer { lock.unlock() }
+        count += 1
+        return []
+    }
+
+    var scanCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+}
+
+func testObservationSchedulerCoalescesTickBursts() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let scanner = CountingProcessScanner()
+    let scheduler = ObservationScheduler(
+        repository: StateRepository(directoryURL: directory),
+        processScanner: scanner,
+        codexSessionsDirectoryURL: directory.appendingPathComponent("codex", isDirectory: true),
+        debounceInterval: 0.1
+    )
+
+    for _ in 0..<5 {
+        scheduler.requestTick()
+    }
+    usleep(400_000)
+
+    try expect(
+        scanner.scanCount,
+        equals: 1,
+        "a burst of tick requests must coalesce into a single scan"
+    )
+}
+
 func testNativeStateReplacesReaperFallbackForSameProcess() throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1085,6 +1182,9 @@ let tests: [(String, () throws -> Void)] = [
     ("Claude lifecycle events produce expected states", testClaudeLifecycleEventsProduceExpectedStates),
     ("reaper deletes state for dead process", testReaperDeletesStateForDeadProcess),
     ("reaper creates fallback state for untracked process", testReaperCreatesFallbackStateForUntrackedProcess),
+    ("reaper reaps against provided scan", testReaperReapsAgainstProvidedScan),
+    ("observation scheduler tick persists fallback state", testObservationSchedulerTickPersistsFallbackState),
+    ("observation scheduler coalesces tick bursts", testObservationSchedulerCoalescesTickBursts),
     ("native state replaces reaper fallback for same process", testNativeStateReplacesReaperFallbackForSameProcess),
     ("debug renderer shows tool counts and session state", testDebugRendererShowsToolCountsAndSessionState),
     ("CLI parses debug command", testCLIParsesDebugCommand),
