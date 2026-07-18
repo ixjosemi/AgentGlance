@@ -20,6 +20,9 @@ public struct StateRepository: Sendable {
     }
 
     public func loadSessions() throws -> [AgentSession] {
+        if FileManager.default.fileExists(atPath: directoryURL.path) {
+            try ensurePrivateDirectory()
+        }
         let fileURLs: [URL]
         do {
             fileURLs = try FileManager.default.contentsOfDirectory(
@@ -99,7 +102,8 @@ public struct StateRepository: Sendable {
     private func ensurePrivateDirectory() throws {
         var metadata = stat()
         if Darwin.lstat(directoryURL.path, &metadata) == 0 {
-            guard metadata.st_mode & S_IFMT == S_IFDIR else {
+            guard metadata.st_mode & S_IFMT == S_IFDIR,
+                  metadata.st_uid == getuid() else {
                 throw StateRepositoryError.insecureDirectory
             }
         } else if errno == ENOENT {
@@ -124,7 +128,6 @@ public struct StateRepository: Sendable {
         var metadata = stat()
         guard Darwin.fstat(descriptor, &metadata) == 0,
               metadata.st_mode & S_IFMT == S_IFREG,
-              metadata.st_uid == getuid(),
               metadata.st_size >= 0,
               metadata.st_size <= Self.maximumStateFileSize else {
             throw StateRepositoryError.insecureDirectory
