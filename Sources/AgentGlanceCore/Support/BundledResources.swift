@@ -22,6 +22,12 @@ public enum BundledResources {
         subdirectory: "Resources/opencode"
     )
 
+    /// Official brand marks (Anthropic's Claude spark, sst/opencode's glyph,
+    /// OpenAI's knot for Codex) — see NOTICE for trademark attribution.
+    public static func iconURL(for tool: AgentTool) -> URL {
+        resourceURL(named: tool.rawValue, extension: "svg", subdirectory: "Resources/icons")
+    }
+
     private static func resourceURL(
         named name: String,
         extension fileExtension: String,

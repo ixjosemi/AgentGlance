@@ -11,10 +11,12 @@ final class NotchPanel: NSPanel {
 @MainActor
 final class NotchPanelController {
     private let panel: NotchPanel
+    private let layout: NotchLayout
+    private var shrinkWorkItem: DispatchWorkItem?
 
     init(store: StateStore) {
         let screen = NSScreen.main ?? NSScreen.screens.first
-        let layout = NotchLayout(
+        layout = NotchLayout(
             screenMinX: screen?.frame.minX ?? 0,
             screenWidth: screen?.frame.width ?? 1_512,
             screenMaxY: screen?.frame.maxY ?? 982,
@@ -35,32 +37,47 @@ final class NotchPanelController {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = false
+        let controller = self
         panel.contentView = NSHostingView(rootView: NotchWidgetView(
             store: store,
             contentTopPadding: layout.contentTopPadding,
-            notchWidth: layout.notchWidth
+            notchWidth: layout.notchWidth,
+            leftContentWidth: layout.leftContentWidth,
+            rightContentWidth: layout.rightContentWidth,
+            barHeight: layout.height,
+            onMenuVisibilityChange: { controller.setMenuVisible($0) }
         ))
-        positionPanel()
+        panel.setFrame(frame(expanded: false), display: false)
     }
 
     func show() {
         panel.orderFrontRegardless()
     }
 
-    private func positionPanel() {
-        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
-        let layout = NotchLayout(
-            screenMinX: screen.frame.minX,
-            screenWidth: screen.frame.width,
-            screenMaxY: screen.frame.maxY,
-            safeAreaTop: screen.safeAreaInsets.top,
-            leftNotchEdgeX: screen.auxiliaryTopLeftArea?.maxX,
-            rightNotchEdgeX: screen.auxiliaryTopRightArea?.minX
-        )
-        let origin = NSPoint(
+    /// The panel only occupies the notch bar while collapsed so that clicks
+    /// below the notch reach whatever window is behind it. It grows before
+    /// the menu animates in and shrinks after the menu animates out.
+    private func setMenuVisible(_ isVisible: Bool) {
+        shrinkWorkItem?.cancel()
+        shrinkWorkItem = nil
+        if isVisible {
+            panel.setFrame(frame(expanded: true), display: true)
+            return
+        }
+        let workItem = DispatchWorkItem { [panel, collapsedFrame = frame(expanded: false)] in
+            panel.setFrame(collapsedFrame, display: true)
+        }
+        shrinkWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: workItem)
+    }
+
+    private func frame(expanded: Bool) -> NSRect {
+        let height = expanded ? layout.expandedHeight : layout.height
+        return NSRect(
             x: layout.originX,
-            y: layout.originY
+            y: layout.originY + layout.height - height,
+            width: layout.width,
+            height: height
         )
-        panel.setFrameOrigin(origin)
     }
 }

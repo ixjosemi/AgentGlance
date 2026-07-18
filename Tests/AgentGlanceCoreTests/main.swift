@@ -654,6 +654,90 @@ func testToolSummaryCountsSessionsAndAttention() throws {
     )
 }
 
+func testNotchWingPlacementSplitsToolsAroundNotch() throws {
+    let sessions = [
+        try AgentSession.decode(from: validStateJSON(sessionID: "c1", status: "working")),
+        try AgentSession.decode(
+            from: validStateJSON(sessionID: "o1", status: "idle", tool: "opencode")
+        ),
+        try AgentSession.decode(
+            from: validStateJSON(sessionID: "x1", status: "working", tool: "codex")
+        ),
+    ]
+
+    let placement = NotchWingPlacement.place(ToolSummary.active(in: sessions))
+
+    try expect(placement.leftWing.map(\.tool), equals: [.codex, .opencode], "left wing order")
+    try expect(placement.rightWing.map(\.tool), equals: [.claude], "right wing")
+
+    let opencodeOnly = NotchWingPlacement.place(
+        ToolSummary.active(in: [sessions[1]])
+    )
+    try expect(opencodeOnly.leftWing.map(\.tool), equals: [.opencode], "left wing solo opencode")
+    try expect(opencodeOnly.rightWing.isEmpty, equals: true, "right wing empty")
+}
+
+func testGitWorkspaceInspectorResolvesBranchNames() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let filesystem = FileManager.default
+
+    let repo = root.appendingPathComponent("repo", isDirectory: true)
+    try filesystem.createDirectory(
+        at: repo.appendingPathComponent(".git"), withIntermediateDirectories: true
+    )
+    try Data("ref: refs/heads/feat/notch-menu\n".utf8)
+        .write(to: repo.appendingPathComponent(".git/HEAD"))
+    try expect(
+        GitWorkspaceInspector.branchName(forWorkingDirectory: repo.path),
+        equals: "feat/notch-menu",
+        "branch of a normal repository"
+    )
+
+    let nested = repo.appendingPathComponent("deep/subdir", isDirectory: true)
+    try filesystem.createDirectory(at: nested, withIntermediateDirectories: true)
+    try expect(
+        GitWorkspaceInspector.branchName(forWorkingDirectory: nested.path),
+        equals: "feat/notch-menu",
+        "branch found walking up from a subdirectory"
+    )
+
+    let worktreeMetadata = repo.appendingPathComponent(".git/worktrees/glance", isDirectory: true)
+    try filesystem.createDirectory(at: worktreeMetadata, withIntermediateDirectories: true)
+    try Data("ref: refs/heads/fix/menu\n".utf8)
+        .write(to: worktreeMetadata.appendingPathComponent("HEAD"))
+    let linkedWorktree = root.appendingPathComponent("repo.fix-menu", isDirectory: true)
+    try filesystem.createDirectory(at: linkedWorktree, withIntermediateDirectories: true)
+    try Data("gitdir: \(worktreeMetadata.path)\n".utf8)
+        .write(to: linkedWorktree.appendingPathComponent(".git"))
+    try expect(
+        GitWorkspaceInspector.branchName(forWorkingDirectory: linkedWorktree.path),
+        equals: "fix/menu",
+        "branch of a linked worktree"
+    )
+
+    let detached = root.appendingPathComponent("detached", isDirectory: true)
+    try filesystem.createDirectory(
+        at: detached.appendingPathComponent(".git"), withIntermediateDirectories: true
+    )
+    try Data("0123456789abcdef0123456789abcdef01234567\n".utf8)
+        .write(to: detached.appendingPathComponent(".git/HEAD"))
+    try expect(
+        GitWorkspaceInspector.branchName(forWorkingDirectory: detached.path),
+        equals: "0123456",
+        "short hash for a detached HEAD"
+    )
+
+    let bare = root.appendingPathComponent("not-a-repo", isDirectory: true)
+    try filesystem.createDirectory(at: bare, withIntermediateDirectories: true)
+    try expect(
+        GitWorkspaceInspector.branchName(forWorkingDirectory: bare.path),
+        equals: nil,
+        "nil outside any repository"
+    )
+}
+
 func testNotchLayoutExtendsFromLeftSideOfHardwareNotch() throws {
     let layout = NotchLayout(
         screenMinX: 0,
@@ -664,12 +748,14 @@ func testNotchLayoutExtendsFromLeftSideOfHardwareNotch() throws {
         rightNotchEdgeX: 846
     )
 
-    try expect(layout.width, equals: 362, "maximum panel width")
-    try expect(layout.height, equals: 38, "panel height")
-    try expect(layout.originX, equals: 484, "panel x")
+    try expect(layout.width, equals: 376, "maximum panel width")
+    try expect(layout.height, equals: 38, "collapsed panel height")
+    try expect(layout.expandedHeight, equals: 398, "expanded panel height")
+    try expect(layout.originX, equals: 540, "panel x")
     try expect(layout.originY, equals: 944, "panel y")
     try expect(layout.contentTopPadding, equals: 7, "content top padding")
-    try expect(layout.contentWidth, equals: 182, "maximum left wing width")
+    try expect(layout.leftContentWidth, equals: 126, "maximum left wing width")
+    try expect(layout.rightContentWidth, equals: 70, "maximum right wing width")
     try expect(layout.notchWidth, equals: 180, "hardware notch width")
     try expect(NotchLayout.wingWidth(activeToolCount: 1), equals: 70, "one-tool wing")
     try expect(NotchLayout.wingWidth(activeToolCount: 2), equals: 126, "two-tool wing")
@@ -1204,6 +1290,8 @@ let tests: [(String, () throws -> Void)] = [
     ("state store file events observe new state files without polling", testStateStoreFileEventsObserveNewStateFilesWithoutPolling),
     ("state store Darwin notification observes new state files", testStateStoreDarwinNotificationObservesNewStateFiles),
     ("tool summary counts sessions and attention", testToolSummaryCountsSessionsAndAttention),
+    ("notch wing placement splits tools around notch", testNotchWingPlacementSplitsToolsAroundNotch),
+    ("git workspace inspector resolves branch names", testGitWorkspaceInspectorResolvesBranchNames),
     ("notch layout extends from left side of hardware notch", testNotchLayoutExtendsFromLeftSideOfHardwareNotch),
     ("opencode plugin writes session state", testOpenCodePluginWritesSessionState),
     ("opencode plugin maps lifecycle events", testOpenCodePluginMapsLifecycleEvents),
