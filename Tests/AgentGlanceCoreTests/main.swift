@@ -759,6 +759,47 @@ func testNotchWingPlacementSplitsToolsAroundNotch() throws {
     try expect(opencodeOnly.rightWing.isEmpty, equals: true, "right wing empty")
 }
 
+func testAttentionAcknowledgmentsSilenceVisitedSessionsUntilNewActivity() throws {
+    let waiting = try AgentSession.decode(
+        from: validStateJSON(sessionID: "ack", status: "needs_attention")
+    )
+    var acknowledgments = AttentionAcknowledgments()
+
+    try expect(
+        ToolSummary.active(in: acknowledgments.silenced([waiting])).first?.worstStatus,
+        equals: .needsAttention,
+        "unvisited session keeps its red light"
+    )
+
+    acknowledgments.acknowledge(waiting)
+    try expect(
+        ToolSummary.active(in: acknowledgments.silenced([waiting])).first?.worstStatus,
+        equals: .working,
+        "visited session goes quiet in the bar"
+    )
+    try expect(
+        acknowledgments.silenced([waiting]).first?.sessionID,
+        equals: "ack",
+        "silencing keeps the session listed"
+    )
+
+    let reraised = AgentSession(
+        tool: waiting.tool,
+        sessionID: waiting.sessionID,
+        pid: waiting.pid,
+        status: .needsAttention,
+        cwd: waiting.cwd,
+        startedAt: waiting.startedAt,
+        updatedAt: waiting.updatedAt.addingTimeInterval(60),
+        terminal: waiting.terminal
+    )
+    try expect(
+        ToolSummary.active(in: acknowledgments.silenced([reraised])).first?.worstStatus,
+        equals: .needsAttention,
+        "new activity re-arms the light"
+    )
+}
+
 func testGitWorkspaceInspectorResolvesBranchNames() throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1429,6 +1470,7 @@ let tests: [(String, () throws -> Void)] = [
     ("tool summary counts sessions and attention", testToolSummaryCountsSessionsAndAttention),
     ("tool summary reports worst status for semaphore", testToolSummaryReportsWorstStatusForSemaphore),
     ("notch wing placement splits tools around notch", testNotchWingPlacementSplitsToolsAroundNotch),
+    ("attention acknowledgments silence visited sessions", testAttentionAcknowledgmentsSilenceVisitedSessionsUntilNewActivity),
     ("git workspace inspector resolves branch names", testGitWorkspaceInspectorResolvesBranchNames),
     ("notch layout extends from left side of hardware notch", testNotchLayoutExtendsFromLeftSideOfHardwareNotch),
     ("opencode plugin writes session state", testOpenCodePluginWritesSessionState),

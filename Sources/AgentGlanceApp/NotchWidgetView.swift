@@ -17,7 +17,11 @@ struct NotchWidgetView: View {
     @State private var collapseWorkItem: DispatchWorkItem?
 
     var body: some View {
-        let placement = NotchWingPlacement.place(ToolSummary.active(in: store.sessions))
+        // The bar semaphore ignores waiting sessions the user has already
+        // visited; the menu below keeps showing their real status.
+        let placement = NotchWingPlacement.place(
+            ToolSummary.active(in: store.acknowledgments.silenced(store.sessions))
+        )
         let isEmpty = placement.leftWing.isEmpty && placement.rightWing.isEmpty
         let shouldHide = isEmpty && hideWhenEmpty
         let leftWidth = wingWidth(placement.leftWing, idleDot: isEmpty)
@@ -38,7 +42,8 @@ struct NotchWidgetView: View {
                         SessionMenuCard(
                             tool: expandedTool,
                             sessions: store.sessions(for: expandedTool),
-                            dismiss: collapseMenu
+                            dismiss: collapseMenu,
+                            acknowledge: { store.acknowledge($0) }
                         )
                         .frame(width: barWidth)
                         .transition(.opacity)
@@ -294,6 +299,7 @@ private struct SessionMenuCard: View {
     let tool: AgentTool
     let sessions: [AgentSession]
     let dismiss: () -> Void
+    let acknowledge: (AgentSession) -> Void
     @State private var errorMessage: String?
 
     var body: some View {
@@ -366,7 +372,10 @@ private struct SessionMenuCard: View {
         Task.detached(priority: .userInitiated) {
             do {
                 try FocusService.focus(session)
-                await MainActor.run { dismiss() }
+                await MainActor.run {
+                    acknowledge(session)
+                    dismiss()
+                }
             } catch {
                 await MainActor.run {
                     errorMessage = "Could not focus this terminal session."

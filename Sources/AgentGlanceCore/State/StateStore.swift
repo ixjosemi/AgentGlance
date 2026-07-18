@@ -31,6 +31,7 @@ private let stateStoreNotificationCallback: CFNotificationCallback = {
 public final class StateStore {
     public private(set) var sessions: [AgentSession] = []
     public private(set) var lastErrorDescription: String?
+    public private(set) var acknowledgments = AttentionAcknowledgments()
 
     private let repository: StateRepository
     private var pollingTimer: Timer?
@@ -50,10 +51,17 @@ public final class StateStore {
         sessions = try repository.loadSessions()
             .filter { $0.status != .ended }
             .sorted(by: Self.precedes)
+        acknowledgments.prune(keeping: sessions)
     }
 
     public func sessions(for tool: AgentTool) -> [AgentSession] {
         sessions.filter { $0.tool == tool }
+    }
+
+    /// Marks a waiting session as visited so the bar semaphore goes quiet
+    /// until the session shows new activity.
+    public func acknowledge(_ session: AgentSession) {
+        acknowledgments.acknowledge(session)
     }
 
     public func startObserving(

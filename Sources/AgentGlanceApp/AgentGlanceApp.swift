@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panelController: NotchPanelController?
     private var store: StateStore?
     private var observationScheduler: ObservationScheduler?
+    private var focusAcknowledgmentObserver: FocusAcknowledgmentObserver?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard terminateBecauseAnotherInstanceRuns() == false else { return }
@@ -41,6 +42,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let scheduler = ObservationScheduler(repository: repository)
         observationScheduler = scheduler
         scheduler.start()
+        let focusObserver = FocusAcknowledgmentObserver(store: store)
+        focusAcknowledgmentObserver = focusObserver
+        focusObserver.start()
     }
 
     /// Two live instances fight over `~/.agentglance/state`: each reaper
