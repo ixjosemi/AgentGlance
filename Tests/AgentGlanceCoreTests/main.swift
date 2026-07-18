@@ -1306,6 +1306,43 @@ func testInstallerRejectsSymlinkedPrivateDirectory() throws {
     }
 }
 
+func testInstallerFollowsUserOwnedSymlinkedIntegrationDirectories() throws {
+    // Dotfile setups routinely symlink ~/.config/opencode/plugins (or
+    // ~/.claude) into a config repository inside the home directory. The
+    // installer must follow those links when they resolve to a user-owned
+    // directory under home — only ~/.agentglance is strictly symlink-free.
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let home = root.appendingPathComponent("home")
+    let dotfilesPlugins = home.appendingPathComponent("dotfiles/opencode-plugins")
+    try FileManager.default.createDirectory(at: dotfilesPlugins, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(
+        at: home.appendingPathComponent(".config/opencode"),
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createSymbolicLink(
+        at: home.appendingPathComponent(".config/opencode/plugins"),
+        withDestinationURL: dotfilesPlugins
+    )
+
+    try Installer(homeDirectoryURL: home, executableURL: Bundle.main.executableURL!).install()
+
+    try expect(
+        FileManager.default.fileExists(
+            atPath: dotfilesPlugins.appendingPathComponent("agentglance.js").path
+        ),
+        equals: true,
+        "plugin lands in the symlink's resolved directory"
+    )
+    try expect(
+        FileManager.default.fileExists(
+            atPath: home.appendingPathComponent(".claude/settings.json").path
+        ),
+        equals: true,
+        "claude settings written"
+    )
+}
+
 func testHookInputRejectsOversizedPayloads() throws {
     let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try Data(repeating: 0x61, count: BoundedInput.maximumPayloadSize + 1).write(to: fileURL)
@@ -1409,6 +1446,7 @@ let tests: [(String, () throws -> Void)] = [
     ("Claude settings removal preserves user hooks", testClaudeSettingsRemovalPreservesUserHooks),
     ("Claude settings quotes hook paths for the shell", testClaudeSettingsQuotesHookPathsForTheShell),
     ("installer rejects symlinked private directory", testInstallerRejectsSymlinkedPrivateDirectory),
+    ("installer follows user-owned symlinked integration directories", testInstallerFollowsUserOwnedSymlinkedIntegrationDirectories),
     ("hook input rejects oversized payloads", testHookInputRejectsOversizedPayloads),
     ("Codex notify marks turn complete", testCodexNotifyMarksTurnComplete),
 ]

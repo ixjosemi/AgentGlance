@@ -13,8 +13,8 @@ public struct Installer {
     public func install() throws {
         let agentGlanceDirectory = homeDirectoryURL.appendingPathComponent(".agentglance")
         let binaryDirectory = agentGlanceDirectory.appendingPathComponent("bin")
-        try validateManagedDirectories([
-            agentGlanceDirectory,
+        try validatePrivateDirectory(agentGlanceDirectory)
+        try validateIntegrationDirectories([
             homeDirectoryURL.appendingPathComponent(".claude"),
             homeDirectoryURL.appendingPathComponent(".config/opencode/plugins"),
             homeDirectoryURL.appendingPathComponent(".codex"),
@@ -39,8 +39,8 @@ public struct Installer {
 
     public func uninstall() throws {
         let agentGlanceDirectory = homeDirectoryURL.appendingPathComponent(".agentglance")
-        try validateManagedDirectories([
-            agentGlanceDirectory,
+        try validatePrivateDirectory(agentGlanceDirectory)
+        try validateIntegrationDirectories([
             homeDirectoryURL.appendingPathComponent(".claude"),
             homeDirectoryURL.appendingPathComponent(".config/opencode/plugins"),
             homeDirectoryURL.appendingPathComponent(".codex"),
@@ -154,28 +154,79 @@ public struct Installer {
         try FileManager.default.removeItem(at: url)
     }
 
-    private func validateManagedDirectories(_ directories: [URL]) throws {
-        let homePath = homeDirectoryURL.standardizedFileURL.path
-        for directory in directories {
-            let path = directory.standardizedFileURL.path
-            guard path == homePath || path.hasPrefix(homePath + "/") else {
-                throw InstallationError.unsafeInstallationPath(path)
+    /// The private directory holds executables run by hooks; any symlink in
+    /// its path could redirect them, so every existing component must be a
+    /// real directory.
+    private func validatePrivateDirectory(_ directory: URL) throws {
+        try walkComponents(of: directory) { componentURL, metadata in
+            guard metadata.st_mode & S_IFMT == S_IFDIR else {
+                throw InstallationError.unsafeInstallationPath(componentURL.path)
             }
-            var current = homeDirectoryURL.standardizedFileURL
-            let relativeComponents = directory.standardizedFileURL.pathComponents
-                .dropFirst(homeDirectoryURL.standardizedFileURL.pathComponents.count)
-            for component in relativeComponents {
-                current.appendPathComponent(component)
-                var metadata = stat()
-                if Darwin.lstat(current.path, &metadata) == 0 {
-                    guard metadata.st_mode & S_IFMT == S_IFDIR else {
-                        throw InstallationError.unsafeInstallationPath(current.path)
-                    }
-                } else if errno != ENOENT {
-                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
+
+    /// Integration directories live in tool configs that dotfile setups
+    /// routinely symlink into a config repository. A symlink component is
+    /// acceptable when it resolves to a directory the user owns inside their
+    /// home; anything else is rejected.
+    private func validateIntegrationDirectories(_ directories: [URL]) throws {
+        for directory in directories {
+            try walkComponents(of: directory) { componentURL, metadata in
+                switch metadata.st_mode & S_IFMT {
+                case S_IFDIR:
+                    return
+                case S_IFLNK:
+                    try validateResolvedSymlink(componentURL)
+                default:
+                    throw InstallationError.unsafeInstallationPath(componentURL.path)
                 }
             }
         }
+    }
+
+    private func validateResolvedSymlink(_ componentURL: URL) throws {
+        guard let resolvedPath = realpathString(componentURL.path),
+              let resolvedHome = realpathString(homeDirectoryURL.path),
+              resolvedPath == resolvedHome || resolvedPath.hasPrefix(resolvedHome + "/") else {
+            throw InstallationError.unsafeInstallationPath(componentURL.path)
+        }
+        // realpath already resolved every link, so lstat inspects the target
+        // itself (the C stat() function is shadowed by the struct in Swift).
+        var resolvedMetadata = stat()
+        guard Darwin.lstat(resolvedPath, &resolvedMetadata) == 0,
+              resolvedMetadata.st_mode & S_IFMT == S_IFDIR,
+              resolvedMetadata.st_uid == getuid() else {
+            throw InstallationError.unsafeInstallationPath(componentURL.path)
+        }
+    }
+
+    private func walkComponents(
+        of directory: URL,
+        validateExisting: (URL, stat) throws -> Void
+    ) throws {
+        let homePath = homeDirectoryURL.standardizedFileURL.path
+        let path = directory.standardizedFileURL.path
+        guard path == homePath || path.hasPrefix(homePath + "/") else {
+            throw InstallationError.unsafeInstallationPath(path)
+        }
+        var current = homeDirectoryURL.standardizedFileURL
+        let relativeComponents = directory.standardizedFileURL.pathComponents
+            .dropFirst(homeDirectoryURL.standardizedFileURL.pathComponents.count)
+        for component in relativeComponents {
+            current.appendPathComponent(component)
+            var metadata = stat()
+            if Darwin.lstat(current.path, &metadata) == 0 {
+                try validateExisting(current, metadata)
+            } else if errno != ENOENT {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        }
+    }
+
+    private func realpathString(_ path: String) -> String? {
+        guard let resolved = Darwin.realpath(path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     private func preflightInstallation() throws {
