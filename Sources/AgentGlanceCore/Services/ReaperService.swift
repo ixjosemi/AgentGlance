@@ -41,12 +41,10 @@ public struct ReaperService: Sendable {
             }
         }
         let remaining = try rebindDaemonHostedSessions(survivors, to: activeProcesses)
-        let tracked = remaining.reduce(into: [String: AgentSession]()) { result, session in
-            let key = "\(session.tool.rawValue)-\(session.pid)"
-            if result[key].map({ $0.updatedAt >= session.updatedAt }) != true {
-                result[key] = session
-            }
-        }
+        let tracked = try pruneSupersededSessions(
+            remaining,
+            removedSessionIDs: &removedSessionIDs
+        )
         var createdSessionIDs: [String] = []
         for process in activeProcesses {
             let processKey = "\(process.tool.rawValue)-\(process.processID)"
@@ -72,6 +70,48 @@ public struct ReaperService: Sendable {
             removedSessionIDs: removedSessionIDs.sorted(),
             createdSessionIDs: createdSessionIDs.sorted()
         )
+    }
+
+    /// A terminal shows one session at a time, so several documents pointing
+    /// at the same process describe at most one visible session. OpenCode
+    /// accumulates the rest — child sessions spawned for subagents and chats
+    /// abandoned inside a long-lived TUI — all rebound to the same visible
+    /// process. Keep the winner per process, delete the noise.
+    private func pruneSupersededSessions(
+        _ sessions: [AgentSession],
+        removedSessionIDs: inout [String]
+    ) throws -> [String: AgentSession] {
+        var tracked: [String: AgentSession] = [:]
+        for session in sessions {
+            let key = "\(session.tool.rawValue)-\(session.pid)"
+            guard let incumbent = tracked[key] else {
+                tracked[key] = session
+                continue
+            }
+            let loser: AgentSession
+            if supersedes(session, incumbent) {
+                tracked[key] = session
+                loser = incumbent
+            } else {
+                loser = session
+            }
+            try repository.remove(loser)
+            removedSessionIDs.append(loser.sessionID)
+        }
+        return tracked
+    }
+
+    /// Native documents always beat reaper fallbacks — a fallback carries no
+    /// real status, only "the process exists". Among peers, freshest wins;
+    /// the session identifier breaks exact timestamp ties deterministically.
+    private func supersedes(_ candidate: AgentSession, _ incumbent: AgentSession) -> Bool {
+        if (candidate.source == .reaper) != (incumbent.source == .reaper) {
+            return incumbent.source == .reaper
+        }
+        if candidate.updatedAt != incumbent.updatedAt {
+            return candidate.updatedAt > incumbent.updatedAt
+        }
+        return candidate.sessionID > incumbent.sessionID
     }
 
     private func shouldRemove(

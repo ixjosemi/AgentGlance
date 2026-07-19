@@ -435,6 +435,72 @@ func testReaperRebindsDaemonHostedSessionToVisibleProcess() throws {
     try expect(session.pid, equals: Int32(getpid()), "session adopts the visible PID")
 }
 
+func testReaperPrunesSupersededSessionsForSameProcess() throws {
+    // A terminal shows one session at a time, so several documents pointing
+    // at the same process describe at most one visible session — the most
+    // recently updated one. OpenCode accumulates the rest: child sessions
+    // spawned for subagents and chats abandoned inside a long-lived TUI.
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let pid = Int32(getpid())
+    for (sessionID, updatedAt) in [("abandoned-chat", 100.0), ("subagent-child", 200.0), ("current", 300.0)] {
+        try repository.save(AgentSession(
+            tool: .opencode, sessionID: sessionID, pid: pid, status: .working,
+            cwd: "/tmp/oc-project", startedAt: Date(timeIntervalSince1970: 50),
+            updatedAt: Date(timeIntervalSince1970: updatedAt)
+        ))
+    }
+    let visibleProcess = DetectedAgentProcess(
+        tool: .opencode,
+        processID: pid,
+        cwd: "/tmp/oc-project",
+        terminal: TerminalContext(tty: "/dev/ttys001")
+    )
+
+    let result = try ReaperService(repository: repository).reap(detected: [visibleProcess])
+
+    try expect(result.removedSessionIDs, equals: ["abandoned-chat", "subagent-child"], "pruned sessions")
+    try expect(result.createdSessionIDs, equals: [], "no fallback while a native doc tracks the process")
+    let sessions = try repository.loadSessions()
+    try expect(sessions.map(\.sessionID), equals: ["current"], "surviving session")
+}
+
+func testReaperPrefersNativeSessionOverNewerFallback() throws {
+    // The OpenCode plugin writes documents directly (bypassing save()'s
+    // fallback supersession), so a reaper fallback can coexist with native
+    // documents for the same process. The fallback loses even when its
+    // updated_at is newer — it carries no real status.
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let pid = Int32(getpid())
+    try repository.save(AgentSession(
+        tool: .opencode, sessionID: "reaper-\(pid)", pid: pid, status: .working,
+        cwd: "/tmp/oc-project", startedAt: Date(timeIntervalSince1970: 400),
+        updatedAt: Date(timeIntervalSince1970: 400), source: .reaper
+    ))
+    // Written directly so save() cannot apply its supersession rules.
+    let nativeJSON = validStateJSON(sessionID: "native", status: "idle", pid: pid, tool: "opencode")
+    try nativeJSON.write(to: directory.appendingPathComponent(
+        "opencode-\(Data("native".utf8).base64EncodedString()).json"
+    ))
+    let visibleProcess = DetectedAgentProcess(
+        tool: .opencode,
+        processID: pid,
+        cwd: "/tmp/project",
+        terminal: TerminalContext(tty: "/dev/ttys001")
+    )
+
+    let result = try ReaperService(repository: repository).reap(detected: [visibleProcess])
+
+    try expect(result.removedSessionIDs, equals: ["reaper-\(pid)"], "fallback pruned")
+    let sessions = try repository.loadSessions()
+    try expect(sessions.map(\.sessionID), equals: ["native"], "native session survives")
+}
+
 func testObservationSchedulerTickPersistsFallbackState() throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -2062,6 +2128,8 @@ let tests: [(String, () throws -> Void)] = [
     ("reaper creates fallback state for untracked process", testReaperCreatesFallbackStateForUntrackedProcess),
     ("reaper reaps against provided scan", testReaperReapsAgainstProvidedScan),
     ("reaper rebinds daemon-hosted session to visible process", testReaperRebindsDaemonHostedSessionToVisibleProcess),
+    ("reaper prunes superseded sessions for same process", testReaperPrunesSupersededSessionsForSameProcess),
+    ("reaper prefers native session over newer fallback", testReaperPrefersNativeSessionOverNewerFallback),
     ("observation scheduler tick persists fallback state", testObservationSchedulerTickPersistsFallbackState),
     ("observation scheduler reaps immediately when process exits", testObservationSchedulerReapsImmediatelyWhenProcessExits),
     ("observation scheduler coalesces tick bursts", testObservationSchedulerCoalescesTickBursts),
