@@ -644,6 +644,28 @@ func testNativeStateReplacesReaperFallbackForSameProcess() throws {
     try expect(sessions.map(\.sessionID), equals: ["native"], "sessions")
 }
 
+func testSessionDurationFormatterRendersCompactDurations() throws {
+    let start = Date(timeIntervalSince1970: 0)
+    let cases: [(elapsed: TimeInterval, expected: String)] = [
+        (30, "<1m"),
+        (59, "<1m"),
+        (60, "1m"),
+        (47 * 60, "47m"),
+        (3_600, "1h"),
+        (3_600 + 12 * 60, "1h 12m"),
+        (26 * 3_600, "1d 2h"),
+        (3 * 86_400, "3d"),
+        (-5, "<1m"),
+    ]
+    for (elapsed, expected) in cases {
+        try expect(
+            SessionDurationFormatter.string(from: start, to: start.addingTimeInterval(elapsed)),
+            equals: expected,
+            "duration for \(elapsed)s"
+        )
+    }
+}
+
 func testDebugRendererShowsToolCountsAndSessionState() throws {
     let claude = try AgentSession.decode(from: validStateJSON(sessionID: "c1", status: "working"))
     let output = DebugRenderer.render(sessions: [claude])
@@ -2122,6 +2144,7 @@ let tests: [(String, () throws -> Void)] = [
     ("state repository ignores symbolic links", testStateRepositoryIgnoresSymbolicLinks),
     ("Claude session start creates idle state", testClaudeSessionStartCreatesIdleState),
     ("Claude session start preserves existing status", testClaudeSessionStartPreservesExistingStatus),
+    ("session duration formatter renders compact durations", testSessionDurationFormatterRendersCompactDurations),
     ("Claude permission notification requests attention", testClaudePermissionNotificationRequestsAttention),
     ("Claude lifecycle events produce expected states", testClaudeLifecycleEventsProduceExpectedStates),
     ("reaper deletes state for dead process", testReaperDeletesStateForDeadProcess),

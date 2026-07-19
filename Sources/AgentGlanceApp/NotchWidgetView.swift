@@ -409,38 +409,25 @@ private struct SessionRow: View {
                         .font(.system(size: 13, weight: .semibold, design: .rounded))
                         .foregroundStyle(.white.opacity(0.94))
                         .lineLimit(1)
-                    HStack(spacing: 5) {
-                        if let branch = branchName {
-                            HStack(spacing: 3) {
-                                Image(systemName: "arrow.triangle.branch")
-                                    .font(.system(size: 8, weight: .semibold))
-                                Text(branch)
-                                    .font(.system(size: 10, design: .monospaced))
-                            }
-                            .foregroundStyle(.white.opacity(0.55))
-                            .lineLimit(1)
+                    if let branch = branchName {
+                        HStack(spacing: 3) {
+                            Image(systemName: "arrow.triangle.branch")
+                                .font(.system(size: 8, weight: .semibold))
+                            Text(branch)
+                                .font(.system(size: 10, design: .monospaced))
                         }
-                        if branchName != nil, tabTitle != nil {
-                            Text("·")
-                                .font(.system(size: 10, weight: .bold))
-                                .foregroundStyle(.white.opacity(0.25))
-                        }
-                        if let tabTitle {
-                            Text(tabTitle)
-                                .font(.system(size: 10))
-                                .foregroundStyle(.white.opacity(0.38))
-                                .lineLimit(1)
-                        }
+                        .foregroundStyle(.white.opacity(0.55))
+                        .lineLimit(1)
                     }
                 }
                 Spacer(minLength: 8)
-                if let terminalName {
-                    Text(terminalName)
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.6))
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(Capsule().fill(.white.opacity(0.1)))
+                // The system wakes this view on minute boundaries while the
+                // row is on screen — no timers, no polling while collapsed.
+                TimelineView(.everyMinute) { context in
+                    Text(SessionDurationFormatter.string(from: session.startedAt, to: context.date))
+                        .font(.system(size: 10, weight: .medium, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(.white.opacity(0.45))
                 }
             }
             .padding(.horizontal, 14)
@@ -464,20 +451,5 @@ private struct SessionRow: View {
             }.value
         }
         .accessibilityLabel("\(session.projectName), \(session.status.rawValue)")
-    }
-
-    private var tabTitle: String? {
-        guard let hint = session.terminal.windowTitleHint, !hint.isEmpty else { return nil }
-        return hint
-    }
-
-    private var terminalName: String? {
-        switch session.terminal.termProgram {
-        case "ghostty": "Ghostty"
-        case "iTerm.app": "iTerm"
-        case "Apple_Terminal": "Terminal"
-        case let other?: other
-        case nil: nil
-        }
     }
 }
