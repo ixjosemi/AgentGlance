@@ -14,6 +14,12 @@ public struct CodexRolloutParser: Sendable {
         let type: String?
     }
 
+    // Both are expensive to construct and get called once per rollout line;
+    // ISO8601DateFormatter is documented thread-safe and JSONDecoder keeps
+    // no state between decode calls.
+    private static let decoder = JSONDecoder()
+    private static let dateFormatter = ISO8601DateFormatter()
+
     private let processID: Int32
     private var sessionID: String?
     private var cwd: String?
@@ -24,7 +30,7 @@ public struct CodexRolloutParser: Sendable {
     }
 
     public mutating func consume(line: Data) -> AgentSession? {
-        guard let envelope = try? JSONDecoder().decode(Envelope.self, from: line) else {
+        guard let envelope = try? Self.decoder.decode(Envelope.self, from: line) else {
             return nil
         }
         let updatedAt = Self.parseDate(envelope.timestamp) ?? Date()
@@ -83,6 +89,6 @@ public struct CodexRolloutParser: Sendable {
     }
 
     private static func parseDate(_ value: String) -> Date? {
-        ISO8601DateFormatter().date(from: value)
+        dateFormatter.date(from: value)
     }
 }
