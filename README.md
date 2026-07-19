@@ -28,29 +28,48 @@ AgentGlance is a quiet, native macOS indicator for Claude Code, OpenCode, and Co
 
 Apple Silicon is the tested development platform. Intel builds have not yet been validated.
 
-## Build from source
+## Install
+
+One command builds the app, installs it into `/Applications`, wires the agent hooks, launches it, and verifies everything:
 
 ```bash
 git clone https://github.com/ixjosemi/AgentGlance.git
 cd AgentGlance
+./scripts/install.sh
+```
+
+The same command reinstalls: it stops the running instance, replaces the app, relaunches, and re-verifies. The bundle is ad-hoc signed for local use — do not redistribute it as an official release.
+
+Verify an existing installation at any time:
+
+```bash
+/Applications/AgentGlance.app/Contents/Resources/bin/agentglance doctor
+```
+
+```
+✓ hook binaries: all executables present in ~/.agentglance/bin
+✓ state directory: ~/.agentglance/state exists
+✓ Claude Code hooks: all lifecycle hooks registered in ~/.claude/settings.json
+✓ OpenCode plugin: ~/.config/opencode/plugins/agentglance.js matches the bundled plugin
+✓ Codex notify: notify hook registered in ~/.codex/config.toml
+```
+
+`doctor` is read-only and exits non-zero when something is broken, so it is also usable from scripts.
+
+### Manual build
+
+For development without touching `/Applications`:
+
+```bash
 swift build
 swift run agentglance-tests
 ./scripts/build-app.sh
 open .build/AgentGlance.app
 ```
 
-The script creates `.build/AgentGlance.app` with an ad-hoc signature for local development. Do not redistribute that bundle as an official release.
+### What the hook installer does
 
-## Install integrations
-
-Without integrations the app still detects running agents (via a fast libproc process scan), but every session shows as permanently working — the hooks are what feed real status changes. Install them explicitly:
-
-```bash
-.build/AgentGlance.app/Contents/Resources/bin/agentglance install
-# or, from a plain build: swift build -c release && .build/release/agentglance install
-```
-
-The installer:
+Without integrations the app still detects running agents (via a fast libproc process scan), but every session shows as permanently working — the hooks are what feed real status changes. `install.sh` runs `agentglance install`, which:
 
 - installs the CLI and hook scripts under `~/.agentglance/bin`;
 - merges AgentGlance-owned Claude Code hooks into `~/.claude/settings.json`, preserving every existing setting and hook (the merge is idempotent);
@@ -62,7 +81,7 @@ Installation fails instead of replacing an unknown AgentGlance-named plugin. Int
 To remove integrations and local state:
 
 ```bash
-.build/release/agentglance uninstall
+/Applications/AgentGlance.app/Contents/Resources/bin/agentglance uninstall
 ```
 
 Then quit AgentGlance and delete the app bundle. Review your Claude or Codex configuration if you manually modified AgentGlance entries after installation.
@@ -93,7 +112,7 @@ AgentGlance has no networking or telemetry. It stores local session metadata—i
 Treat `agentglance debug` output as private because it includes session and project metadata:
 
 ```bash
-.build/release/agentglance debug
+/Applications/AgentGlance.app/Contents/Resources/bin/agentglance debug
 ```
 
 ## Known limitations

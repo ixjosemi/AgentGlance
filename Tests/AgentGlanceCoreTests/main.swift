@@ -1384,6 +1384,63 @@ func testInstallerFollowsUserOwnedSymlinkedIntegrationDirectories() throws {
     )
 }
 
+func testInstallationDoctorReportsHealthyInstall() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let home = root.appendingPathComponent("home")
+    try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try Installer(homeDirectoryURL: home, executableURL: Bundle.main.executableURL!).install()
+
+    let checks = InstallationDoctor(homeDirectoryURL: home).diagnose()
+
+    try expect(checks.count, equals: 5, "doctor check count")
+    for check in checks {
+        try expect(check.passed, equals: true, "check '\(check.title)': \(check.detail)")
+    }
+}
+
+func testInstallationDoctorPinpointsBrokenPieces() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let home = root.appendingPathComponent("home")
+    try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try Installer(homeDirectoryURL: home, executableURL: Bundle.main.executableURL!).install()
+    try FileManager.default.removeItem(
+        at: home.appendingPathComponent(".agentglance/bin/claude-hook.sh")
+    )
+    try Data("tampered".utf8).write(
+        to: home.appendingPathComponent(".config/opencode/plugins/agentglance.js")
+    )
+    try Data("model = \"gpt-5\"\n".utf8).write(
+        to: home.appendingPathComponent(".codex/config.toml")
+    )
+
+    let checks = InstallationDoctor(homeDirectoryURL: home).diagnose()
+    let byTitle = Dictionary(uniqueKeysWithValues: checks.map { ($0.title, $0) })
+    let binaries = try byTitle["hook binaries"].unwrap(or: "missing binaries check")
+    let openCode = try byTitle["OpenCode plugin"].unwrap(or: "missing OpenCode check")
+    let codex = try byTitle["Codex notify"].unwrap(or: "missing Codex check")
+
+    try expect(binaries.passed, equals: false, "binaries check must fail")
+    try expect(binaries.detail.contains("claude-hook.sh"), equals: true, "binaries detail names the missing script")
+    try expect(openCode.passed, equals: false, "OpenCode check must fail")
+    try expect(codex.passed, equals: false, "Codex check must fail")
+    try expect(
+        try byTitle["Claude Code hooks"].unwrap(or: "missing Claude check").passed,
+        equals: true,
+        "Claude hooks stay healthy"
+    )
+    try expect(
+        try byTitle["state directory"].unwrap(or: "missing state check").passed,
+        equals: true,
+        "state directory stays healthy"
+    )
+}
+
+func testCLIParsesDoctorCommand() throws {
+    try expect(try CLICommand.parse(arguments: ["doctor"]), equals: .doctor, "CLI command")
+}
+
 func testHookInputRejectsOversizedPayloads() throws {
     let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try Data(repeating: 0x61, count: BoundedInput.maximumPayloadSize + 1).write(to: fileURL)
@@ -1489,6 +1546,9 @@ let tests: [(String, () throws -> Void)] = [
     ("Claude settings quotes hook paths for the shell", testClaudeSettingsQuotesHookPathsForTheShell),
     ("installer rejects symlinked private directory", testInstallerRejectsSymlinkedPrivateDirectory),
     ("installer follows user-owned symlinked integration directories", testInstallerFollowsUserOwnedSymlinkedIntegrationDirectories),
+    ("installation doctor reports healthy install", testInstallationDoctorReportsHealthyInstall),
+    ("installation doctor pinpoints broken pieces", testInstallationDoctorPinpointsBrokenPieces),
+    ("CLI parses doctor command", testCLIParsesDoctorCommand),
     ("hook input rejects oversized payloads", testHookInputRejectsOversizedPayloads),
     ("Codex notify marks turn complete", testCodexNotifyMarksTurnComplete),
 ]

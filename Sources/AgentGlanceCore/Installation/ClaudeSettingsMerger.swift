@@ -7,18 +7,19 @@ public enum InstallationError: Error, Equatable, Sendable {
 }
 
 public enum ClaudeSettingsMerger {
+    private static let events: [(name: String, matcher: String?)] = [
+        ("SessionStart", nil),
+        ("Notification", "permission_prompt|idle_prompt"),
+        ("UserPromptSubmit", nil),
+        ("Stop", nil),
+        ("SessionEnd", nil),
+    ]
+
     public static func merge(settingsData: Data, hookCommand: String) throws -> Data {
         guard var root = try JSONSerialization.jsonObject(with: settingsData) as? [String: Any] else {
             throw InstallationError.invalidClaudeSettings
         }
         var allHooks = root["hooks"] as? [String: Any] ?? [:]
-        let events: [(name: String, matcher: String?)] = [
-            ("SessionStart", nil),
-            ("Notification", "permission_prompt|idle_prompt"),
-            ("UserPromptSubmit", nil),
-            ("Stop", nil),
-            ("SessionEnd", nil),
-        ]
         for event in events {
             var groups = allHooks[event.name] as? [[String: Any]] ?? []
             let command = command(hookCommand: hookCommand, eventName: event.name)
@@ -36,13 +37,28 @@ public enum ClaudeSettingsMerger {
             throw InstallationError.invalidClaudeSettings
         }
         var allHooks = root["hooks"] as? [String: Any] ?? [:]
-        for eventName in ["SessionStart", "Notification", "UserPromptSubmit", "Stop", "SessionEnd"] {
-            let command = command(hookCommand: hookCommand, eventName: eventName)
-            let groups = allHooks[eventName] as? [[String: Any]] ?? []
-            allHooks[eventName] = groups.filter { !contains(command: command, in: [$0]) }
+        for event in events {
+            let command = command(hookCommand: hookCommand, eventName: event.name)
+            let groups = allHooks[event.name] as? [[String: Any]] ?? []
+            allHooks[event.name] = groups.filter { !contains(command: command, in: [$0]) }
         }
         root["hooks"] = allHooks
         return try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    /// True when every lifecycle event already carries the AgentGlance hook —
+    /// the read-only counterpart of `merge` used by the installation doctor.
+    public static func isInstalled(settingsData: Data, hookCommand: String) -> Bool {
+        guard let root = try? JSONSerialization.jsonObject(with: settingsData) as? [String: Any],
+              let allHooks = root["hooks"] as? [String: Any] else {
+            return false
+        }
+        return events.allSatisfy { event in
+            contains(
+                command: command(hookCommand: hookCommand, eventName: event.name),
+                in: allHooks[event.name] as? [[String: Any]] ?? []
+            )
+        }
     }
 
     private static func contains(command: String, in groups: [[String: Any]]) -> Bool {

@@ -34,6 +34,16 @@ do {
             executableURL: URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
         ).uninstall()
         print("AgentGlance files removed.")
+    case .doctor:
+        let checks = InstallationDoctor(
+            homeDirectoryURL: FileManager.default.homeDirectoryForCurrentUser
+        ).diagnose()
+        for check in checks {
+            print("\(check.passed ? "✓" : "✗") \(check.title): \(check.detail)")
+        }
+        if checks.contains(where: { !$0.passed }) {
+            exit(1)
+        }
     case let .claudeHook(event, processID):
         let payload = try BoundedInput.read(from: .standardInput)
         try ClaudeHookProcessor(repository: repository).process(

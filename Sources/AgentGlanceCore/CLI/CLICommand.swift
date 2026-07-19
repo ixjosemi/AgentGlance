@@ -8,6 +8,7 @@ public enum CLICommand: Equatable, Sendable {
     case debug
     case install
     case uninstall
+    case doctor
     case claudeHook(event: String, processID: Int32)
     case codexNotify(processID: Int32)
 
@@ -20,6 +21,9 @@ public enum CLICommand: Equatable, Sendable {
         }
         if arguments == ["uninstall"] {
             return .uninstall
+        }
+        if arguments == ["doctor"] {
+            return .doctor
         }
         if arguments.count == 5,
            arguments[0] == "hook",
