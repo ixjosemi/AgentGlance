@@ -9,7 +9,7 @@ struct AgentGlanceApplication: App {
 
     var body: some Scene {
         Settings {
-            AgentGlanceSettingsView()
+            AgentGlanceSettingsView(store: appDelegate.store)
         }
     }
 }
@@ -17,7 +17,7 @@ struct AgentGlanceApplication: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panelController: NotchPanelController?
-    private var store: StateStore?
+    private(set) var store: StateStore?
     private var observationScheduler: ObservationScheduler?
     private var focusAcknowledgmentObserver: FocusAcknowledgmentObserver?
 

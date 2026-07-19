@@ -2565,6 +2565,32 @@ func testStateStoreRenamePersistsAcrossRestartsAndPrunesWithSessions() throws {
     )
 }
 
+func testStateStoreClearsAllSessionNames() throws {
+    let rootDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let stateDirectory = rootDirectory.appendingPathComponent("state", isDirectory: true)
+    try FileManager.default.createDirectory(at: stateDirectory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: rootDirectory) }
+    let namesFileURL = rootDirectory.appendingPathComponent("session-names.json")
+    let repository = StateRepository(directoryURL: stateDirectory)
+    let session = try AgentSession.decode(
+        from: validStateJSON(sessionID: "ses_reset", status: "working", pid: Int32(getpid()))
+    )
+    try repository.save(session)
+    let store = StateStore(repository: repository, nameOverridesFileURL: namesFileURL)
+    store.rename(session, to: "Custom name")
+
+    store.clearAllSessionNames()
+
+    try expect(store.nameOverrides.displayName(for: session), equals: nil, "override cleared in memory")
+    let restartedStore = StateStore(repository: repository, nameOverridesFileURL: namesFileURL)
+    try expect(
+        restartedStore.nameOverrides.displayName(for: session),
+        equals: nil,
+        "cleared state persisted"
+    )
+}
+
 func testTerminationPlannerClosesOnlyExactContainers() throws {
     // A tmux session closes its pane and nothing else: the surrounding
     // Ghostty tab may host other panes, so the tab must stay open.
@@ -2799,6 +2825,7 @@ let tests: [(String, () throws -> Void)] = [
     ("termination service kills politely and escalates to SIGKILL", testTerminationServiceKillsPolitelyAndEscalatesToSigkill),
     ("session title formatter cleans tab titles", testSessionTitleFormatterCleansTabTitles),
     ("state store display name prefers override then tab title", testStateStoreDisplayNamePrefersOverrideThenTabTitle),
+    ("state store clears all session names", testStateStoreClearsAllSessionNames),
 ]
 
 do {

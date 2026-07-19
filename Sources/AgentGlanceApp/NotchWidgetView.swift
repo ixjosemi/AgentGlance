@@ -378,6 +378,7 @@ private struct SessionMenuCard: View {
     @State private var errorMessage: String?
     // At most one row shows its inline actions; opening another closes it.
     @State private var actionsSessionID: String?
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -391,6 +392,14 @@ private struct SessionMenuCard: View {
                     .font(.system(size: 10, weight: .medium, design: .rounded))
                     .monospacedDigit()
                     .foregroundStyle(.white.opacity(0.35))
+                SettingsGearButton {
+                    // The settings window is a normal app window: activate
+                    // first so it opens frontmost and key — the notch panel
+                    // itself never takes that role.
+                    NSApp.activate(ignoringOtherApps: true)
+                    openSettings()
+                    dismiss()
+                }
             }
             .padding(.horizontal, 14)
             .padding(.top, 12)
@@ -750,6 +759,27 @@ private struct SessionRow: View {
         guard mode == .renaming else { return }
         renameFieldIsFocused = false
         setKeyboardFocus(false)
+    }
+}
+
+/// The visible route into the native Settings window, living in the menu
+/// header; the silhouette's right-click menu stays as the fallback for when
+/// no sessions exist and no menu can open.
+private struct SettingsGearButton: View {
+    let action: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "gearshape")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.white.opacity(isHovered ? 0.75 : 0.35))
+                .frame(width: 18, height: 18)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .accessibilityLabel("AgentGlance settings")
     }
 }
 

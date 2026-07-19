@@ -93,6 +93,13 @@ public final class StateStore {
     /// Row title precedence: a manual rename always wins, then the cleaned
     /// live tab title (the reaper refreshes `windowTitleHint` from the
     /// Ghostty scan each tick), then the directory name.
+    /// Drops every custom session name, in memory and on disk — the reset
+    /// offered from Settings.
+    public func clearAllSessionNames() {
+        nameOverrides = SessionNameOverrides()
+        persistNameOverrides()
+    }
+
     public func displayName(for session: AgentSession) -> String {
         nameOverrides.displayName(for: session)
             ?? SessionTitleFormatter.rowTitle(
