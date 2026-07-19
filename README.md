@@ -4,19 +4,30 @@
 
 **Know when your coding agents need you—without leaving the notch.**
 
-AgentGlance is a quiet, native macOS indicator for Claude Code, OpenCode, Codex CLI, and [Pi](https://github.com/badlogic/pi-mono) sessions. It lives around the MacBook notch — Pi, Codex, and OpenCode on the left wing, Claude on the right — and returns you to the exact terminal tab or tmux pane with one click.
+AgentGlance is a quiet, native macOS indicator for Claude Code, OpenCode, Codex CLI, [Pi](https://github.com/badlogic/pi-mono), and Convoy pipeline sessions. It lives around the MacBook notch — Convoy, Pi, Codex, and OpenCode on the left wing, Claude on the right — and returns you to the exact terminal tab or tmux pane with one click.
 
 > **Preview status:** AgentGlance is pre-1.0 and currently distributed as source. The local build is ad-hoc signed; signed and notarized downloads will follow once the release pipeline is ready.
 
 ## Why AgentGlance?
 
 - See only tools that currently have visible sessions, with official tool marks and session counts.
-- A traffic-light dot per tool that only lights up for waiting states: yellow when a session idles at a prompt, pulsing red when one needs an answer or a permission. Working is silence.
-- Click a tool and its session menu grows out of the notch itself: status light (with a radar ping while working), project name, git branch (worktrees included), terminal tab title, and host terminal.
+- Click a tool and its session menu grows out of the notch itself: status light, session title taken from the live terminal tab, project directory, git branch (worktrees included) or Convoy pipeline step, and elapsed time.
 - Focus the recorded Ghostty, iTerm2, Terminal, or tmux session with one click.
+- Expand any row (chevron or right click) for inline actions: rename the session, copy the project path, reveal it in Finder, or kill the process — SIGTERM with SIGKILL escalation — and close its exact tmux pane or Ghostty tab.
+- Watch Convoy pipeline runs as first-class sessions: the current step in the row, red light on human gates, and no duplicate rows for the OpenCode sessions a pipeline owns.
 - Closed terminals disappear immediately — kernel exit notifications, not polling.
 - Keep all observation and state on your Mac.
-- Run without telemetry, accounts, servers, or third-party Swift dependencies, at well under 1% CPU and ~80 MB of memory.
+- Run without telemetry, accounts, servers, or third-party Swift dependencies, at ~1% CPU and ~16 MB of memory.
+
+## The traffic light
+
+| Light | Meaning |
+| --- | --- |
+| 🟢 Green (menu only, radar ping) | Working — the agent is processing. The bar stays silent: working is the default hum, not an alert. |
+| 🟡 Yellow, steady | Idle — the session waits at the prompt for your next input. |
+| 🔴 Red, pulsing | Needs you — a question, a permission ask, or a failed pipeline step is waiting. |
+
+The bar shows a dot only for waiting states; the menu always shows the real status per session. Visiting a waiting session — from the menu or by switching to its tab yourself — quiets its bar light until the session shows new activity.
 
 ## Requirements
 
@@ -92,7 +103,7 @@ Then quit AgentGlance and delete the app bundle. Review your Claude or Codex con
 
 | Host | Focus strategy | Notes |
 | --- | --- | --- |
-| Ghostty | exact terminal ID, then project/title fallback | Requires Ghostty 1.3+ |
+| Ghostty | exact surface ID resolved by the process scan, then project/title fallback | Requires Ghostty 1.3+ |
 | iTerm2 | native session ID | Uses iTerm2 AppleScript |
 | Terminal | TTY | Uses Terminal AppleScript |
 | tmux | validated pane ID, then host activation | `tmux` must be in a trusted standard install location |
@@ -101,9 +112,9 @@ macOS asks for Automation access the first time AgentGlance controls a terminal.
 
 ## How it works
 
-Claude hooks, an OpenCode plugin, a Pi extension, the Codex rollout watcher, and a process fallback produce versioned session documents under `~/.agentglance/state`. The app observes that directory and renders active sessions. State is written atomically with user-only permissions.
+Claude hooks, an OpenCode plugin, a Pi extension, the Codex rollout watcher, the Convoy runs watcher, and a process fallback produce versioned session documents under `~/.agentglance/state`. The app observes that directory and renders active sessions. State is written atomically with user-only permissions. Convoy needs no hook at all: its run metadata under `~/.convoy/runs` is read directly, and a run is only shown while its recorded server process is verifiably alive.
 
-Everything is event-driven and off the main thread: a libproc-based scanner (no subprocesses, ~2 ms per full sweep) runs on a 5-second heartbeat, kernel `EVFILT_PROC` exit watchers reap closed sessions instantly, and directory observation with debounce delivers state changes to the UI. Agent matching accepts either the kernel-resolved executable path or `argv[0]`, so versioned symlink installs like `~/.local/bin/claude → …/versions/x.y.z` are detected correctly.
+Everything is event-driven and off the main thread: a libproc-based scanner (no subprocesses, ~2 ms per full sweep) runs on a 5-second heartbeat, kernel `EVFILT_PROC` exit watchers reap closed sessions instantly, and directory observation with debounce delivers state changes to the UI. Claude and OpenCode status changes land in well under a second; Codex and Convoy ride the heartbeat. Session titles follow the live Ghostty tab title — cleaned of status decorations and capped at 20 characters — and a manual rename (persisted in `~/.agentglance/session-names.json`) always wins. Agent matching accepts either the kernel-resolved executable path or `argv[0]`, so versioned symlink installs like `~/.local/bin/claude → …/versions/x.y.z` are detected correctly.
 
 See [Architecture](docs/ARCHITECTURE.md) for the full data flow and trust boundaries.
 
