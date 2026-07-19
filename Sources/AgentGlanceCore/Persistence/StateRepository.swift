@@ -37,11 +37,33 @@ public struct StateRepository: Sendable {
             do {
                 sessions.append(try AgentSession.decode(from: secureData(at: fileURL)))
             } catch {
+                Self.decodeFailureLog.reportOnce(fileURL.lastPathComponent, error: error)
                 continue
             }
         }
         return sessions
     }
+
+    /// Unreadable documents are skipped so one bad integration cannot blank
+    /// the whole UI, but each is reported once per process so the failure
+    /// stays diagnosable — reloads run too often to log unconditionally.
+    private final class DecodeFailureLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var reportedFileNames: Set<String> = []
+
+        func reportOnce(_ fileName: String, error: Error) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard reportedFileNames.insert(fileName).inserted else { return }
+            NSLog(
+                "AgentGlance skipped unreadable state document %@: %@",
+                fileName,
+                String(describing: error)
+            )
+        }
+    }
+
+    private static let decodeFailureLog = DecodeFailureLog()
 
     public func save(_ session: AgentSession) throws {
         try prepareDirectory()
