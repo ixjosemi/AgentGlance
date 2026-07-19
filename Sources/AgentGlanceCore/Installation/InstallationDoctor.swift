@@ -38,6 +38,7 @@ public struct InstallationDoctor {
             claudeHooksCheck(),
             openCodePluginCheck(),
             codexNotifyCheck(),
+            piExtensionCheck(),
         ]
     }
 
@@ -97,24 +98,41 @@ public struct InstallationDoctor {
     }
 
     private func openCodePluginCheck() -> DoctorCheck {
-        let plugin = homeDirectoryURL.appendingPathComponent(
-            ".config/opencode/plugins/agentglance.js"
+        integrationFileCheck(
+            title: "OpenCode plugin",
+            relativePath: ".config/opencode/plugins/agentglance.js",
+            bundled: BundledResources.opencodePluginURL
         )
-        guard let installedPlugin = try? Data(contentsOf: plugin) else {
+    }
+
+    private func piExtensionCheck() -> DoctorCheck {
+        integrationFileCheck(
+            title: "Pi extension",
+            relativePath: ".pi/agent/extensions/agentglance.ts",
+            bundled: BundledResources.piExtensionURL
+        )
+    }
+
+    private func integrationFileCheck(
+        title: String,
+        relativePath: String,
+        bundled: URL
+    ) -> DoctorCheck {
+        let destination = homeDirectoryURL.appendingPathComponent(relativePath)
+        guard let installed = try? Data(contentsOf: destination) else {
             return DoctorCheck(
-                title: "OpenCode plugin",
+                title: title,
                 passed: false,
-                detail: "\(display(plugin)) is missing — run: agentglance install"
+                detail: "\(display(destination)) is missing — run: agentglance install"
             )
         }
-        let matchesBundled = (try? Data(contentsOf: BundledResources.opencodePluginURL))
-            == installedPlugin
+        let matchesBundled = (try? Data(contentsOf: bundled)) == installed
         return DoctorCheck(
-            title: "OpenCode plugin",
+            title: title,
             passed: matchesBundled,
             detail: matchesBundled
-                ? "\(display(plugin)) matches the bundled plugin"
-                : "\(display(plugin)) differs from the bundled plugin — reinstall to update"
+                ? "\(display(destination)) matches the bundled file"
+                : "\(display(destination)) differs from the bundled file — reinstall to update"
         )
     }
 

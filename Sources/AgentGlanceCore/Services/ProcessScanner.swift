@@ -151,11 +151,33 @@ public struct SystemProcessScanner: ProcessScanning {
     /// A process is an agent when the basename of its kernel-resolved
     /// executable path or of its argv[0] names a supported tool. The argv[0]
     /// fallback covers versioned installs behind symlinks, such as
-    /// ~/.local/bin/claude -> .../claude/versions/2.1.214.
+    /// ~/.local/bin/claude -> .../claude/versions/2.1.214. Script-runtime
+    /// CLIs (Pi installs via npm) name only the runtime in both places, so
+    /// when the command is a known runtime the script path in the leading
+    /// arguments is classified instead.
     private static func agentTool(processID: pid_t) -> AgentTool? {
-        classifyByCommandIdentifier(processID: processID) { identifier in
-            AgentTool(rawValue: URL(fileURLWithPath: identifier).lastPathComponent)
+        if let tool = classifyByCommandIdentifier(processID: processID, classifyToolName) {
+            return tool
         }
+        guard classifyByCommandIdentifier(processID: processID, isScriptRuntime) == true else {
+            return nil
+        }
+        return firstArguments(processID: processID, count: 4)
+            .dropFirst()
+            .first { !$0.hasPrefix("-") }
+            .flatMap(classifyToolName)
+    }
+
+    private static let scriptRuntimeNames: Set<String> = ["node", "bun", "deno"]
+
+    private static func classifyToolName(_ identifier: String) -> AgentTool? {
+        AgentTool(rawValue: URL(fileURLWithPath: identifier).lastPathComponent)
+    }
+
+    private static func isScriptRuntime(_ identifier: String) -> Bool? {
+        scriptRuntimeNames.contains(URL(fileURLWithPath: identifier).lastPathComponent)
+            ? true
+            : nil
     }
 
     /// Applies a classifier to the kernel-resolved executable path first and
@@ -209,25 +231,37 @@ public struct SystemProcessScanner: ProcessScanning {
         return info
     }
 
-    /// Reads argv[0] through KERN_PROCARGS2. The buffer layout is: argc,
-    /// then the executable path, NUL padding, then the argv strings. Only
-    /// readable for the current user's processes; anything else returns nil.
     private static func argumentZero(processID: pid_t) -> String? {
+        firstArguments(processID: processID, count: 1).first.flatMap {
+            $0.isEmpty ? nil : $0
+        }
+    }
+
+    /// Reads the leading argv strings through KERN_PROCARGS2. The buffer
+    /// layout is: argc, then the executable path, NUL padding, then the argv
+    /// strings separated by NULs. Only readable for the current user's
+    /// processes; anything else yields an empty array.
+    private static func firstArguments(processID: pid_t, count: Int) -> [String] {
         var name: [Int32] = [CTL_KERN, KERN_PROCARGS2, processID]
         var size = 0
         guard sysctl(&name, UInt32(name.count), nil, &size, nil, 0) == 0, size > 0 else {
-            return nil
+            return []
         }
         var buffer = [UInt8](repeating: 0, count: size)
-        guard sysctl(&name, UInt32(name.count), &buffer, &size, nil, 0) == 0 else { return nil }
+        guard sysctl(&name, UInt32(name.count), &buffer, &size, nil, 0) == 0 else { return [] }
         let argumentCountWidth = MemoryLayout<Int32>.size
-        guard size > argumentCountWidth else { return nil }
+        guard size > argumentCountWidth else { return [] }
+        let argumentCount = buffer.withUnsafeBytes { $0.load(as: Int32.self) }
         let content = buffer[argumentCountWidth..<size]
-        guard let executablePathEnd = content.firstIndex(of: 0) else { return nil }
-        let padding = content[executablePathEnd...].prefix(while: { $0 == 0 })
-        let argumentBytes = content[padding.endIndex...].prefix(while: { $0 != 0 })
-        guard !argumentBytes.isEmpty else { return nil }
-        return String(decoding: argumentBytes, as: UTF8.self)
+        guard let executablePathEnd = content.firstIndex(of: 0) else { return [] }
+        var cursor = content[executablePathEnd...].prefix(while: { $0 == 0 }).endIndex
+        var arguments: [String] = []
+        while arguments.count < min(count, Int(argumentCount)), cursor < content.endIndex {
+            let argumentBytes = content[cursor...].prefix(while: { $0 != 0 })
+            arguments.append(String(decoding: argumentBytes, as: UTF8.self))
+            cursor = argumentBytes.endIndex + 1
+        }
+        return arguments
     }
 
     static func queryGhosttyTerminals() throws -> [GhosttyTerminal] {

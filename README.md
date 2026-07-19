@@ -4,7 +4,7 @@
 
 **Know when your coding agents need you—without leaving the notch.**
 
-AgentGlance is a quiet, native macOS indicator for Claude Code, OpenCode, and Codex CLI sessions. It lives around the MacBook notch — Codex and OpenCode on the left wing, Claude on the right — and returns you to the exact terminal tab or tmux pane with one click.
+AgentGlance is a quiet, native macOS indicator for Claude Code, OpenCode, Codex CLI, and [Pi](https://github.com/badlogic/pi-mono) sessions. It lives around the MacBook notch — Pi, Codex, and OpenCode on the left wing, Claude on the right — and returns you to the exact terminal tab or tmux pane with one click.
 
 > **Preview status:** AgentGlance is pre-1.0 and currently distributed as source. The local build is ad-hoc signed; signed and notarized downloads will follow once the release pipeline is ready.
 
@@ -23,7 +23,7 @@ AgentGlance is a quiet, native macOS indicator for Claude Code, OpenCode, and Co
 - macOS 14 Sonoma or newer;
 - a MacBook with a notch for the intended UI placement;
 - Swift 6.0 or newer to build from source;
-- Node.js 20+ to run the OpenCode behavioral tests;
+- Node.js 20+ to run the OpenCode and Pi behavioral tests;
 - Ghostty 1.3+ with AppleScript enabled, iTerm2, or Terminal.
 
 Apple Silicon is the tested development platform. Intel builds have not yet been validated.
@@ -50,8 +50,9 @@ Verify an existing installation at any time:
 ✓ hook binaries: all executables present in ~/.agentglance/bin
 ✓ state directory: ~/.agentglance/state exists
 ✓ Claude Code hooks: all lifecycle hooks registered in ~/.claude/settings.json
-✓ OpenCode plugin: ~/.config/opencode/plugins/agentglance.js matches the bundled plugin
+✓ OpenCode plugin: ~/.config/opencode/plugins/agentglance.js matches the bundled file
 ✓ Codex notify: notify hook registered in ~/.codex/config.toml
+✓ Pi extension: ~/.pi/agent/extensions/agentglance.ts matches the bundled file
 ```
 
 `doctor` is read-only and exits non-zero when something is broken, so it is also usable from scripts.
@@ -74,7 +75,8 @@ Without integrations the app still detects running agents (via a fast libproc pr
 - installs the CLI and hook scripts under `~/.agentglance/bin`;
 - merges AgentGlance-owned Claude Code hooks into `~/.claude/settings.json`, preserving every existing setting and hook (the merge is idempotent);
 - installs `~/.config/opencode/plugins/agentglance.js` only when it can do so safely;
-- adds a Codex `notify` entry only when no notification command exists.
+- adds a Codex `notify` entry only when no notification command exists;
+- installs the Pi extension `~/.pi/agent/extensions/agentglance.ts` only when it can do so safely.
 
 Installation fails instead of replacing an unknown AgentGlance-named plugin. Integration directories may be symlinks — common in dotfile setups — as long as they resolve to a directory you own inside your home; `~/.agentglance` itself must be symlink-free because hooks execute binaries from it. Agents started before installing need a restart to pick up the hooks.
 
@@ -99,7 +101,7 @@ macOS asks for Automation access the first time AgentGlance controls a terminal.
 
 ## How it works
 
-Claude hooks, an OpenCode plugin, the Codex rollout watcher, and a process fallback produce versioned session documents under `~/.agentglance/state`. The app observes that directory and renders active sessions. State is written atomically with user-only permissions.
+Claude hooks, an OpenCode plugin, a Pi extension, the Codex rollout watcher, and a process fallback produce versioned session documents under `~/.agentglance/state`. The app observes that directory and renders active sessions. State is written atomically with user-only permissions.
 
 Everything is event-driven and off the main thread: a libproc-based scanner (no subprocesses, ~2 ms per full sweep) runs on a 5-second heartbeat, kernel `EVFILT_PROC` exit watchers reap closed sessions instantly, and directory observation with debounce delivers state changes to the UI. Agent matching accepts either the kernel-resolved executable path or `argv[0]`, so versioned symlink installs like `~/.local/bin/claude → …/versions/x.y.z` are detected correctly.
 

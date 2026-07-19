@@ -8,7 +8,7 @@ public struct NotchLayout: Equatable, Sendable {
     public let originX: CGFloat
     public let originY: CGFloat
     public let contentTopPadding: CGFloat
-    /// Room reserved left of the notch for Codex and OpenCode.
+    /// Room reserved left of the notch for Pi, Codex, and OpenCode.
     public let leftContentWidth: CGFloat
     /// Room reserved right of the notch for Claude.
     public let rightContentWidth: CGFloat
@@ -24,7 +24,7 @@ public struct NotchLayout: Equatable, Sendable {
         leftNotchEdgeX: CGFloat?,
         rightNotchEdgeX: CGFloat?
     ) {
-        leftContentWidth = Self.wingWidth(activeToolCount: 2)
+        leftContentWidth = Self.wingWidth(activeToolCount: 3)
         rightContentWidth = Self.wingWidth(activeToolCount: 1)
         height = safeAreaTop > 0 ? safeAreaTop : 36
         expandedHeight = height + Self.menuMaxHeight

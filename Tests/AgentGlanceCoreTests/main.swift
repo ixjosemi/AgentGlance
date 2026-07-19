@@ -745,11 +745,14 @@ func testNotchWingPlacementSplitsToolsAroundNotch() throws {
         try AgentSession.decode(
             from: validStateJSON(sessionID: "x1", status: "working", tool: "codex")
         ),
+        try AgentSession.decode(
+            from: validStateJSON(sessionID: "p1", status: "working", tool: "pi")
+        ),
     ]
 
     let placement = NotchWingPlacement.place(ToolSummary.active(in: sessions))
 
-    try expect(placement.leftWing.map(\.tool), equals: [.codex, .opencode], "left wing order")
+    try expect(placement.leftWing.map(\.tool), equals: [.pi, .codex, .opencode], "left wing order")
     try expect(placement.rightWing.map(\.tool), equals: [.claude], "right wing")
 
     let opencodeOnly = NotchWingPlacement.place(
@@ -871,13 +874,13 @@ func testNotchLayoutExtendsFromLeftSideOfHardwareNotch() throws {
         rightNotchEdgeX: 846
     )
 
-    try expect(layout.width, equals: 376, "maximum panel width")
+    try expect(layout.width, equals: 432, "maximum panel width")
     try expect(layout.height, equals: 38, "collapsed panel height")
     try expect(layout.expandedHeight, equals: 398, "expanded panel height")
-    try expect(layout.originX, equals: 540, "panel x")
+    try expect(layout.originX, equals: 484, "panel x")
     try expect(layout.originY, equals: 944, "panel y")
     try expect(layout.contentTopPadding, equals: 7, "content top padding")
-    try expect(layout.leftContentWidth, equals: 126, "maximum left wing width")
+    try expect(layout.leftContentWidth, equals: 182, "maximum left wing width")
     try expect(layout.rightContentWidth, equals: 70, "maximum right wing width")
     try expect(layout.notchWidth, equals: 180, "hardware notch width")
     try expect(NotchLayout.wingWidth(activeToolCount: 1), equals: 70, "one-tool wing")
@@ -981,6 +984,110 @@ func testOpenCodePluginMapsLifecycleEvents() throws {
         states.map(\.status),
         equals: [.needsAttention, .working, .idle, .ended],
         "lifecycle statuses"
+    )
+}
+
+func testPiExtensionWritesSessionState() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let extensionURL = directory.appendingPathComponent("agentglance.mjs")
+    try FileManager.default.copyItem(at: BundledResources.piExtensionURL, to: extensionURL)
+    let driver = directory.appendingPathComponent("driver.mjs")
+    try Data(
+        """
+        import agentGlance from "\(extensionURL.absoluteString)";
+        const handlers = new Map();
+        agentGlance({ on: (event, handler) => handlers.set(event, handler) });
+        const ctx = {
+          cwd: "/tmp/pi-project",
+          sessionManager: { getSessionId: () => "pi-1" },
+        };
+        await handlers.get("session_start")({ reason: "start" }, ctx);
+        """.utf8
+    ).write(to: driver)
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = ["node", driver.path]
+    process.environment = [
+        "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
+        "AGENTGLANCE_HOME": directory.path,
+        "TERM_PROGRAM": "ghostty",
+    ]
+    let errors = Pipe()
+    process.standardError = errors
+    try process.run()
+    process.waitUntilExit()
+    let errorOutput = String(
+        data: errors.fileHandleForReading.readDataToEndOfFile(),
+        encoding: .utf8
+    ) ?? ""
+    try expect(process.terminationStatus, equals: 0, "extension process: \(errorOutput)")
+    let session = try StateRepository(directoryURL: directory.appendingPathComponent("state"))
+        .loadSessions().first.unwrap(or: "pi state was not saved")
+    try expect(session.tool, equals: .pi, "tool")
+    try expect(session.status, equals: .working, "status")
+    try expect(session.cwd, equals: "/tmp/pi-project", "cwd")
+    try expect(session.terminal.termProgram, equals: "ghostty", "terminal program")
+}
+
+func testPiExtensionMapsLifecycleEvents() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let extensionURL = directory.appendingPathComponent("agentglance.mjs")
+    try FileManager.default.copyItem(at: BundledResources.piExtensionURL, to: extensionURL)
+    let driver = directory.appendingPathComponent("lifecycle.mjs")
+    try Data(
+        """
+        import { readFile } from "node:fs/promises";
+        import agentGlance from "\(extensionURL.absoluteString)";
+        const handlers = new Map();
+        agentGlance({ on: (event, handler) => handlers.set(event, handler) });
+        const ctx = {
+          cwd: "/tmp/pi-project",
+          sessionManager: { getSessionId: () => "pi-1" },
+        };
+        const fire = async (event, payload = {}) => handlers.get(event)(payload, ctx);
+        const states = [];
+        const capture = async () => states.push(JSON.parse(
+          await readFile(`${process.env.AGENTGLANCE_HOME}/state/pi-cGktMQ.json`, "utf8")
+        ));
+        await fire("session_start", { reason: "start" });
+        await fire("agent_start"); await capture();
+        await fire("agent_end", { messages: [] }); await capture();
+        await fire("input", { text: "next prompt" }); await capture();
+        await fire("session_shutdown", { reason: "exit" }); await capture();
+        console.log(JSON.stringify(states));
+        """.utf8
+    ).write(to: driver)
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = ["node", driver.path]
+    process.environment = [
+        "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
+        "AGENTGLANCE_HOME": directory.path,
+    ]
+    let output = Pipe()
+    process.standardOutput = output
+    try process.run()
+    process.waitUntilExit()
+    try expect(process.terminationStatus, equals: 0, "extension lifecycle process")
+    let data = output.fileHandleForReading.readDataToEndOfFile()
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let states = try decoder.decode([AgentSession].self, from: data)
+    try expect(
+        states.map(\.status),
+        equals: [.working, .idle, .working, .ended],
+        "lifecycle statuses"
+    )
+    try expect(
+        states.map(\.attentionReason),
+        equals: [nil, .turnComplete, nil, nil],
+        "attention reasons"
     )
 }
 
@@ -1207,6 +1314,47 @@ func testProcessScannerDetectsSpawnedAgentProcessWithinBudget() throws {
     )
 }
 
+func testProcessScannerDetectsScriptRuntimeAgents() throws {
+    // Pi installs as an npm CLI: the kernel-resolved executable and argv[0]
+    // both name the runtime (node), and the agent name only appears as the
+    // script path in argv[1]. Modeled here with a fake "node" that runs a
+    // script named "pi".
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory
+        .appendingPathComponent("agentglance-runtime-\(UUID().uuidString)", isDirectory: true)
+    let binDirectory = root.appendingPathComponent("bin", isDirectory: true)
+    try fileManager.createDirectory(at: binDirectory, withIntermediateDirectories: true)
+    defer { try? fileManager.removeItem(at: root) }
+    let runtime = binDirectory.appendingPathComponent("node")
+    try fileManager.createSymbolicLink(
+        at: runtime,
+        withDestinationURL: URL(fileURLWithPath: "/bin/zsh")
+    )
+    let script = binDirectory.appendingPathComponent("pi")
+    try Data("/bin/sleep 300\n".utf8).write(to: script)
+    let process = Process()
+    process.executableURL = runtime
+    process.arguments = [script.path]
+    try process.run()
+    defer {
+        process.terminate()
+        process.waitUntilExit()
+    }
+
+    var match: DetectedAgentProcess?
+    let deadline = Date().addingTimeInterval(2)
+    repeat {
+        match = try SystemProcessScanner(ghosttyTerminalSource: { nil }).activeProcesses()
+            .first { $0.processID == process.processIdentifier }
+    } while match == nil && Date() < deadline
+
+    try expect(
+        match?.tool,
+        equals: .pi,
+        "a runtime-hosted script named pi must be detected as the pi agent"
+    )
+}
+
 func testProcessScannerIgnoresLookalikeProcessNames() throws {
     let agent = try spawnFakeAgent(named: "codexx")
     defer { agent.tearDown() }
@@ -1393,10 +1541,17 @@ func testInstallationDoctorReportsHealthyInstall() throws {
 
     let checks = InstallationDoctor(homeDirectoryURL: home).diagnose()
 
-    try expect(checks.count, equals: 5, "doctor check count")
+    try expect(checks.count, equals: 6, "doctor check count")
     for check in checks {
         try expect(check.passed, equals: true, "check '\(check.title)': \(check.detail)")
     }
+    try expect(
+        FileManager.default.fileExists(
+            atPath: home.appendingPathComponent(".pi/agent/extensions/agentglance.ts").path
+        ),
+        equals: true,
+        "pi extension installed"
+    )
 }
 
 func testInstallationDoctorPinpointsBrokenPieces() throws {
@@ -1414,6 +1569,9 @@ func testInstallationDoctorPinpointsBrokenPieces() throws {
     try Data("model = \"gpt-5\"\n".utf8).write(
         to: home.appendingPathComponent(".codex/config.toml")
     )
+    try FileManager.default.removeItem(
+        at: home.appendingPathComponent(".pi/agent/extensions/agentglance.ts")
+    )
 
     let checks = InstallationDoctor(homeDirectoryURL: home).diagnose()
     let byTitle = Dictionary(uniqueKeysWithValues: checks.map { ($0.title, $0) })
@@ -1425,6 +1583,11 @@ func testInstallationDoctorPinpointsBrokenPieces() throws {
     try expect(binaries.detail.contains("claude-hook.sh"), equals: true, "binaries detail names the missing script")
     try expect(openCode.passed, equals: false, "OpenCode check must fail")
     try expect(codex.passed, equals: false, "Codex check must fail")
+    try expect(
+        try byTitle["Pi extension"].unwrap(or: "missing Pi check").passed,
+        equals: false,
+        "Pi check must fail"
+    )
     try expect(
         try byTitle["Claude Code hooks"].unwrap(or: "missing Claude check").passed,
         equals: true,
@@ -1563,6 +1726,8 @@ let tests: [(String, () throws -> Void)] = [
     ("notch layout extends from left side of hardware notch", testNotchLayoutExtendsFromLeftSideOfHardwareNotch),
     ("opencode plugin writes session state", testOpenCodePluginWritesSessionState),
     ("opencode plugin maps lifecycle events", testOpenCodePluginMapsLifecycleEvents),
+    ("pi extension writes session state", testPiExtensionWritesSessionState),
+    ("pi extension maps lifecycle events", testPiExtensionMapsLifecycleEvents),
     ("Codex rollout parser maps session and turn events", testCodexRolloutParserMapsSessionAndTurnEvents),
     ("Codex rollout parser ignores malformed and unknown lines", testCodexRolloutParserIgnoresMalformedAndUnknownLines),
     ("Codex sessions watcher processes appended lines incrementally", testCodexSessionsWatcherProcessesAppendedLinesIncrementally),
@@ -1570,6 +1735,7 @@ let tests: [(String, () throws -> Void)] = [
     ("Ghostty matcher excludes orphaned processes and assigns exact terminals", testGhosttyMatcherExcludesOrphanedProcessesAndAssignsExactTerminals),
     ("process scanner detects spawned agent process within budget", testProcessScannerDetectsSpawnedAgentProcessWithinBudget),
     ("process scanner ignores lookalike process names", testProcessScannerIgnoresLookalikeProcessNames),
+    ("process scanner detects script runtime agents", testProcessScannerDetectsScriptRuntimeAgents),
     ("process scanner resolves parent of root-owned processes", testProcessScannerResolvesParentOfRootOwnedProcesses),
     ("process scanner identifies host terminal from ancestors", testProcessScannerIdentifiesHostTerminalFromAncestors),
     ("Claude settings merge preserves hooks and is idempotent", testClaudeSettingsMergePreservesHooksAndIsIdempotent),

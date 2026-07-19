@@ -14,11 +14,7 @@ public struct Installer {
         let agentGlanceDirectory = homeDirectoryURL.appendingPathComponent(".agentglance")
         let binaryDirectory = agentGlanceDirectory.appendingPathComponent("bin")
         try validatePrivateDirectory(agentGlanceDirectory)
-        try validateIntegrationDirectories([
-            homeDirectoryURL.appendingPathComponent(".claude"),
-            homeDirectoryURL.appendingPathComponent(".config/opencode/plugins"),
-            homeDirectoryURL.appendingPathComponent(".codex"),
-        ])
+        try validateIntegrationDirectories(Self.integrationDirectories(under: homeDirectoryURL))
         try preflightInstallation()
         try FileManager.default.createDirectory(
             at: agentGlanceDirectory.appendingPathComponent("state"),
@@ -35,30 +31,47 @@ public struct Installer {
         try installClaudeSettings(hookDirectory: binaryDirectory)
         try installOpenCodePlugin()
         try installCodexNotify(hookDirectory: binaryDirectory)
+        try installPiExtension()
+    }
+
+    static func integrationDirectories(under homeDirectoryURL: URL) -> [URL] {
+        [
+            homeDirectoryURL.appendingPathComponent(".claude"),
+            homeDirectoryURL.appendingPathComponent(".config/opencode/plugins"),
+            homeDirectoryURL.appendingPathComponent(".codex"),
+            homeDirectoryURL.appendingPathComponent(".pi/agent/extensions"),
+        ]
     }
 
     public func uninstall() throws {
         let agentGlanceDirectory = homeDirectoryURL.appendingPathComponent(".agentglance")
         try validatePrivateDirectory(agentGlanceDirectory)
-        try validateIntegrationDirectories([
-            homeDirectoryURL.appendingPathComponent(".claude"),
-            homeDirectoryURL.appendingPathComponent(".config/opencode/plugins"),
-            homeDirectoryURL.appendingPathComponent(".codex"),
-        ])
+        try validateIntegrationDirectories(Self.integrationDirectories(under: homeDirectoryURL))
         try uninstallClaudeSettings(
             hookDirectory: agentGlanceDirectory.appendingPathComponent("bin")
         )
         try uninstallCodexNotify(
             hookDirectory: agentGlanceDirectory.appendingPathComponent("bin")
         )
-        let plugin = homeDirectoryURL.appendingPathComponent(
-            ".config/opencode/plugins/agentglance.js"
+        try removeOwnedIntegrationFile(
+            at: homeDirectoryURL.appendingPathComponent(".config/opencode/plugins/agentglance.js"),
+            matching: BundledResources.opencodePluginURL
         )
-        if FileManager.default.fileExists(atPath: plugin.path),
-           try Data(contentsOf: plugin) == Data(contentsOf: BundledResources.opencodePluginURL) {
-            try removeIfPresent(plugin)
-        }
+        try removeOwnedIntegrationFile(
+            at: homeDirectoryURL.appendingPathComponent(".pi/agent/extensions/agentglance.ts"),
+            matching: BundledResources.piExtensionURL
+        )
         try removeIfPresent(agentGlanceDirectory)
+    }
+
+    /// Removes an installed integration file only when its content is exactly
+    /// what this build bundles; anything else was modified by the user and is
+    /// left in place.
+    private func removeOwnedIntegrationFile(at destination: URL, matching bundled: URL) throws {
+        if FileManager.default.fileExists(atPath: destination.path),
+           try Data(contentsOf: destination) == Data(contentsOf: bundled) {
+            try removeIfPresent(destination)
+        }
     }
 
     private func uninstallClaudeSettings(hookDirectory: URL) throws {
@@ -101,18 +114,36 @@ public struct Installer {
     }
 
     private func installOpenCodePlugin() throws {
-        let directory = homeDirectoryURL.appendingPathComponent(".config/opencode/plugins")
+        try installIntegrationFile(
+            bundled: BundledResources.opencodePluginURL,
+            intoDirectory: ".config/opencode/plugins",
+            named: "agentglance.js"
+        )
+    }
+
+    private func installPiExtension() throws {
+        try installIntegrationFile(
+            bundled: BundledResources.piExtensionURL,
+            intoDirectory: ".pi/agent/extensions",
+            named: "agentglance.ts"
+        )
+    }
+
+    /// Copies a bundled integration file, refusing to replace an existing
+    /// file with unknown content — that file belongs to the user.
+    private func installIntegrationFile(
+        bundled: URL,
+        intoDirectory relativeDirectory: String,
+        named fileName: String
+    ) throws {
+        let directory = homeDirectoryURL.appendingPathComponent(relativeDirectory)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let destination = directory.appendingPathComponent("agentglance.js")
+        let destination = directory.appendingPathComponent(fileName)
         if FileManager.default.fileExists(atPath: destination.path),
-           try Data(contentsOf: destination) != Data(contentsOf: BundledResources.opencodePluginURL) {
+           try Data(contentsOf: destination) != Data(contentsOf: bundled) {
             throw InstallationError.existingIntegrationFile(destination.path)
         }
-        try copy(
-            BundledResources.opencodePluginURL,
-            to: destination,
-            executable: false
-        )
+        try copy(bundled, to: destination, executable: false)
     }
 
     private func installCodexNotify(hookDirectory: URL) throws {
@@ -249,10 +280,16 @@ public struct Installer {
             _ = try String(contentsOf: codexConfig, encoding: .utf8)
         }
 
-        let plugin = homeDirectoryURL.appendingPathComponent(".config/opencode/plugins/agentglance.js")
-        if FileManager.default.fileExists(atPath: plugin.path),
-           try Data(contentsOf: plugin) != Data(contentsOf: BundledResources.opencodePluginURL) {
-            throw InstallationError.existingIntegrationFile(plugin.path)
+        let integrationFiles: [(destination: String, bundled: URL)] = [
+            (".config/opencode/plugins/agentglance.js", BundledResources.opencodePluginURL),
+            (".pi/agent/extensions/agentglance.ts", BundledResources.piExtensionURL),
+        ]
+        for file in integrationFiles {
+            let destination = homeDirectoryURL.appendingPathComponent(file.destination)
+            if FileManager.default.fileExists(atPath: destination.path),
+               try Data(contentsOf: destination) != Data(contentsOf: file.bundled) {
+                throw InstallationError.existingIntegrationFile(destination.path)
+            }
         }
     }
 }

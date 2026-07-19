@@ -8,6 +8,7 @@ public enum AgentTool: String, Codable, CaseIterable, Sendable {
     case claude
     case codex
     case opencode
+    case pi
 }
 
 public enum SessionStatus: String, Codable, Sendable {

@@ -362,6 +362,7 @@ private struct SessionMenuCard: View {
         case .claude: "Claude Code"
         case .opencode: "OpenCode"
         case .codex: "Codex"
+        case .pi: "Pi"
         }
     }
 

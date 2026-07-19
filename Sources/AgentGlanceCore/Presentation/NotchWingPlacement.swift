@@ -1,12 +1,13 @@
 import Foundation
 
-/// Splits the active tools across the hardware notch: Codex and OpenCode sit
-/// on the left wing (Codex outermost), Claude sits alone on the right wing.
+/// Splits the active tools across the hardware notch: Pi, Codex, and
+/// OpenCode sit on the left wing (Pi outermost), Claude sits alone on the
+/// right wing.
 public struct NotchWingPlacement: Equatable, Sendable {
     public let leftWing: [ToolSummary]
     public let rightWing: [ToolSummary]
 
-    private static let leftWingOrder: [AgentTool] = [.codex, .opencode]
+    private static let leftWingOrder: [AgentTool] = [.pi, .codex, .opencode]
     private static let rightWingOrder: [AgentTool] = [.claude]
 
     public static func place(_ summaries: [ToolSummary]) -> NotchWingPlacement {

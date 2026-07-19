@@ -21,6 +21,11 @@ public enum BundledResources {
         extension: "js",
         subdirectory: "Resources/opencode"
     )
+    public static let piExtensionURL = resourceURL(
+        named: "agentglance",
+        extension: "ts",
+        subdirectory: "Resources/pi"
+    )
 
     /// Official brand marks (Anthropic's Claude spark, sst/opencode's glyph,
     /// OpenAI's knot for Codex) — see NOTICE for trademark attribution.
