@@ -6,7 +6,6 @@ import AgentGlanceCore
 struct NotchWidgetView: View {
     @Bindable var store: StateStore
     @AppStorage("hideWhenEmpty") private var hideWhenEmpty = false
-    let contentTopPadding: CGFloat
     let notchWidth: CGFloat
     let leftContentWidth: CGFloat
     let rightContentWidth: CGFloat
@@ -133,15 +132,16 @@ struct NotchWidgetView: View {
         leftWidth: CGFloat,
         rightWidth: CGFloat
     ) -> some View {
+        // Wings span the full bar height so the click targets reach the top
+        // edge of the screen — the natural place to slam the pointer.
         HStack(spacing: 0) {
             wingContent(placement.leftWing, idleDot: isEmpty)
-                .frame(width: leftWidth, height: 24)
+                .frame(width: leftWidth, height: barHeight)
             Color.clear
-                .frame(width: notchWidth, height: 24)
+                .frame(width: notchWidth, height: barHeight)
             wingContent(placement.rightWing, idleDot: false)
-                .frame(width: rightWidth, height: 24)
+                .frame(width: rightWidth, height: barHeight)
         }
-        .padding(.top, contentTopPadding)
     }
 
     private func wingWidth(_ wing: [ToolSummary], idleDot: Bool) -> CGFloat {
@@ -263,14 +263,19 @@ private struct ToolIndicator: View {
                         }
                 }
             }
+            .frame(minWidth: 50, minHeight: 24)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(.white.opacity(isExpanded ? 0.12 : 0))
+            )
+            // The visible pill stays 24 pt tall, but the tappable area
+            // covers the whole bar strip — no dead pixels between the pill
+            // and the screen edge.
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .foregroundStyle(.white.opacity(summary.sessionCount == 0 ? 0.3 : 0.92))
-        .frame(minWidth: 50, minHeight: 24)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(.white.opacity(isExpanded ? 0.12 : 0))
-        )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
     }

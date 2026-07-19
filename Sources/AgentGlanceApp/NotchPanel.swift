@@ -19,6 +19,11 @@ final class NotchPanel: NSPanel {
 final class NotchHostingView<Content: View>: NSHostingView<Content> {
     var interactiveHeight: CGFloat = 0
 
+    /// The panel never becomes key, so every click arrives as a "first
+    /// mouse" while another app is frontmost. Accepting it makes the first
+    /// click act immediately instead of being swallowed as activation.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func hitTest(_ point: NSPoint) -> NSView? {
         let local = superview.map { convert(point, from: $0) } ?? point
         let distanceFromTop = isFlipped ? local.y : bounds.height - local.y
@@ -97,7 +102,6 @@ final class NotchPanelController {
         let controller = self
         let hostingView = NotchHostingView(rootView: NotchWidgetView(
             store: store,
-            contentTopPadding: layout.contentTopPadding,
             notchWidth: layout.notchWidth,
             leftContentWidth: layout.leftContentWidth,
             rightContentWidth: layout.rightContentWidth,

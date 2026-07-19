@@ -1210,7 +1210,6 @@ func testNotchLayoutExtendsFromLeftSideOfHardwareNotch() throws {
     try expect(layout.expandedHeight, equals: 398, "expanded panel height")
     try expect(layout.originX, equals: 484, "panel x")
     try expect(layout.originY, equals: 944, "panel y")
-    try expect(layout.contentTopPadding, equals: 7, "content top padding")
     try expect(layout.leftContentWidth, equals: 182, "maximum left wing width")
     try expect(layout.rightContentWidth, equals: 70, "maximum right wing width")
     try expect(layout.notchWidth, equals: 180, "hardware notch width")
