@@ -25,9 +25,26 @@ public final class ConvoyRunsWatcher {
         let convoyProcesses = detected.filter { $0.tool == .convoy }
         guard !convoyProcesses.isEmpty else { return }
         let runs = currentRuns(startedAfter: oldestProcessStart(of: convoyProcesses))
+        var liveRuns: [ConvoyRun] = []
         for process in convoyProcesses {
             guard let run = run(ownedBy: process, in: runs) else { continue }
             try repository.save(session(for: run, process: process))
+            liveRuns.append(run)
+        }
+        try suppressPipelineOwnedOpenCodeSessions(of: liveRuns)
+    }
+
+    /// Convoy phases run as OpenCode sessions on convoy's embedded server;
+    /// when that server loads the AgentGlance plugin, each phase would also
+    /// surface as a standalone OpenCode row next to the pipeline it belongs
+    /// to. The run metadata names those sessions, so they are removed here —
+    /// and again on every scan, which drains any rewrite by the plugin.
+    private func suppressPipelineOwnedOpenCodeSessions(of runs: [ConvoyRun]) throws {
+        let pipelineSessionIDs = Set(runs.flatMap { $0.phases.compactMap(\.sessionID) })
+        guard !pipelineSessionIDs.isEmpty else { return }
+        for session in try repository.loadSessions()
+        where session.tool == .opencode && pipelineSessionIDs.contains(session.sessionID) {
+            try repository.remove(session)
         }
     }
 

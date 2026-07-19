@@ -558,6 +558,39 @@ func testObservationSchedulerTickPersistsFallbackState() throws {
     try expect(sessions.first?.cwd, equals: "/tmp/scheduler-project", "fallback cwd")
 }
 
+func testObservationSchedulerPublishesConvoyRunOnTick() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: "20260719-161616-schd",
+        serverPid: Int32(getpid()),
+        serverStartedAt: Date().addingTimeInterval(-300),
+        phases: [("implementer", "running", "ses_impl")]
+    )
+    let scheduler = ObservationScheduler(
+        repository: repository,
+        processScanner: TestProcessScanner([detectedConvoyProcess()]),
+        codexSessionsDirectoryURL: stateDirectoryURL.appendingPathComponent("codex", isDirectory: true),
+        convoyRunsDirectoryURL: runsDirectoryURL
+    )
+
+    scheduler.requestTick()
+
+    let deadline = Date().addingTimeInterval(2)
+    var published: AgentSession?
+    repeat {
+        published = (try? repository.loadSessions())?
+            .first { $0.sessionID == "20260719-161616-schd" }
+        if published == nil { usleep(20_000) }
+    } while published == nil && Date() < deadline
+    let session = try published.unwrap(or: "scheduler never published the convoy run")
+    try expect(session.tool, equals: .convoy, "tool")
+    try expect(session.status, equals: .working, "status")
+    try expect(session.currentStep, equals: "implementer", "current step")
+}
+
 final class CountingProcessScanner: ProcessScanning, @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
@@ -1593,6 +1626,37 @@ func testConvoyWatcherIgnoresRunsNotOwnedByLiveProcess() throws {
     try expect(try repository.loadSessions().isEmpty, equals: true, "no session published")
 }
 
+func testConvoyWatcherSuppressesPipelineOwnedOpenCodeSessions() throws {
+    // Convoy phases run as OpenCode sessions on convoy's embedded server;
+    // if that server loads the AgentGlance plugin, each phase would also
+    // surface as a standalone OpenCode row next to the pipeline it belongs
+    // to. The run metadata names those session IDs, so they are removed.
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    try repository.save(AgentSession.decode(
+        from: validStateJSON(sessionID: "ses_security", status: "working", pid: Int32(getpid()), tool: "opencode")
+    ))
+    try repository.save(AgentSession.decode(
+        from: validStateJSON(sessionID: "ses_unrelated", status: "idle", pid: Int32(getpid()), tool: "opencode")
+    ))
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: "20260719-151515-supp",
+        serverPid: Int32(getpid()),
+        serverStartedAt: Date().addingTimeInterval(-300),
+        phases: [("security", "running", "ses_security")]
+    )
+    let watcher = ConvoyRunsWatcher(runsDirectoryURL: runsDirectoryURL, repository: repository)
+
+    try watcher.scan(detected: [detectedConvoyProcess()])
+
+    let opencodeSessionIDs = try repository.loadSessions()
+        .filter { $0.tool == .opencode }
+        .map(\.sessionID)
+    try expect(opencodeSessionIDs, equals: ["ses_unrelated"], "surviving opencode sessions")
+}
+
 func testFocusPlannerPrioritizesTmuxThenTerminal() throws {
     let data = Data(
         #"{"schema_version":1,"tool":"claude","session_id":"focus","pid":1,"status":"working","attention_reason":null,"cwd":"/tmp/project","started_at":"2026-07-18T10:00:00Z","updated_at":"2026-07-18T10:00:00Z","terminal":{"term_program":"ghostty","ghostty_terminal_id":"terminal-123","tmux_pane":"%3","window_title_hint":"project — claude"}}"#.utf8
@@ -2375,6 +2439,7 @@ let tests: [(String, () throws -> Void)] = [
     ("reaper prunes superseded sessions for same process", testReaperPrunesSupersededSessionsForSameProcess),
     ("reaper prefers native session over newer fallback", testReaperPrefersNativeSessionOverNewerFallback),
     ("observation scheduler tick persists fallback state", testObservationSchedulerTickPersistsFallbackState),
+    ("observation scheduler publishes convoy run on tick", testObservationSchedulerPublishesConvoyRunOnTick),
     ("observation scheduler reaps immediately when process exits", testObservationSchedulerReapsImmediatelyWhenProcessExits),
     ("observation scheduler coalesces tick bursts", testObservationSchedulerCoalescesTickBursts),
     ("native state replaces reaper fallback for same process", testNativeStateReplacesReaperFallbackForSameProcess),
@@ -2407,6 +2472,7 @@ let tests: [(String, () throws -> Void)] = [
     ("convoy watcher flags waiting human gate", testConvoyWatcherFlagsWaitingHumanGate),
     ("convoy watcher maps terminal pipeline states", testConvoyWatcherMapsTerminalPipelineStates),
     ("convoy watcher ignores runs not owned by live process", testConvoyWatcherIgnoresRunsNotOwnedByLiveProcess),
+    ("convoy watcher suppresses pipeline-owned opencode sessions", testConvoyWatcherSuppressesPipelineOwnedOpenCodeSessions),
     ("focus planner prioritizes tmux then terminal", testFocusPlannerPrioritizesTmuxThenTerminal),
     ("Ghostty matcher excludes orphaned processes and assigns exact terminals", testGhosttyMatcherExcludesOrphanedProcessesAndAssignsExactTerminals),
     ("Ghostty matcher prefers same-directory terminal naming the tool", testGhosttyMatcherPrefersSameDirectoryTerminalNamingTheTool),
