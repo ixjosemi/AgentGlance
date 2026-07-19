@@ -6,6 +6,8 @@
     <string>AgentGlance</string>
     <key>CFBundleExecutable</key>
     <string>AgentGlance</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.agentglance.app</string>
     <key>CFBundleInfoDictionaryVersion</key>

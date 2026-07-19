@@ -119,7 +119,7 @@ Treat `agentglance debug` output as private because it includes session and proj
 
 - Codex rollout formats are not a stable public contract; unknown lines are ignored and the notify hook is the reliable turn-complete signal.
 - Same-directory Codex sessions can be ambiguous when upstream events provide no PID or terminal identifier.
-- The app currently has no signed/notarized binary release, automatic updater, app icon, or Homebrew cask.
+- The app currently has no signed/notarized binary release, automatic updater, or Homebrew cask.
 - The behavioral runner is an executable because the minimal Command Line Tools environment used during early development did not ship XCTest or Swift Testing. Run it with `swift run agentglance-tests`.
 
 ## Contributing

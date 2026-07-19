@@ -1,0 +1,68 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="AgentGlance app icon">
+  <defs>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#33333f"/>
+      <stop offset="0.5" stop-color="#22222b"/>
+      <stop offset="1" stop-color="#15151a"/>
+    </linearGradient>
+    <radialGradient id="yellowGlow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#f5c542" stop-opacity="0.4"/>
+      <stop offset="1" stop-color="#f5c542" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="redGlow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ff5f57" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#ff5f57" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="yellowDot" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd964"/>
+      <stop offset="1" stop-color="#e8b32e"/>
+    </linearGradient>
+    <linearGradient id="redDot" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff7b74"/>
+      <stop offset="1" stop-color="#f04a42"/>
+    </linearGradient>
+    <linearGradient id="greenDot" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4ee06a"/>
+      <stop offset="1" stop-color="#28b842"/>
+    </linearGradient>
+    <clipPath id="squircleClip">
+      <rect x="100" y="100" width="824" height="824" rx="184"/>
+    </clipPath>
+  </defs>
+
+  <!-- Screen (macOS squircle) -->
+  <rect x="100" y="100" width="824" height="824" rx="184" fill="url(#screen)"/>
+  <g clip-path="url(#squircleClip)">
+    <!-- Notch bar + session menu: the app's one-piece silhouette -->
+    <path d="M222 100 h580 v454 a66 66 0 0 1 -66 66 h-448 a66 66 0 0 1 -66 -66 z" fill="#000000"/>
+
+    <!-- Camera -->
+    <circle cx="512" cy="156" r="18" fill="#131318" stroke="#26262e" stroke-width="4"/>
+
+    <!-- Left wing: waiting for a prompt -->
+    <circle cx="336" cy="156" r="104" fill="url(#yellowGlow)"/>
+    <circle cx="336" cy="156" r="38" fill="url(#yellowDot)"/>
+
+    <!-- Right wing: needs you now, radar ping -->
+    <circle cx="688" cy="156" r="116" fill="url(#redGlow)"/>
+    <circle cx="688" cy="156" r="38" fill="url(#redDot)"/>
+    <circle cx="688" cy="156" r="66" fill="none" stroke="#ff5f57" stroke-width="9" opacity="0.32"/>
+
+    <!-- Menu rows: one session per state -->
+    <g>
+      <circle cx="316" cy="300" r="26" fill="url(#greenDot)"/>
+      <circle cx="316" cy="300" r="46" fill="none" stroke="#32d74b" stroke-width="7" opacity="0.3"/>
+      <rect x="376" y="282" width="304" height="36" rx="18" fill="#2b2b33"/>
+
+      <circle cx="316" cy="404" r="26" fill="url(#yellowDot)"/>
+      <rect x="376" y="386" width="240" height="36" rx="18" fill="#26262e"/>
+
+      <circle cx="316" cy="508" r="26" fill="url(#redDot)"/>
+      <rect x="376" y="490" width="272" height="36" rx="18" fill="#26262e"/>
+    </g>
+
+    <!-- Subtle top sheen -->
+    <path d="M100 100 h824 v64 c-260 36 -564 36 -824 0 z" fill="#ffffff" opacity="0.04"/>
+  </g>
+  <rect x="102" y="102" width="820" height="820" rx="182" fill="none" stroke="#3e3e4a" stroke-width="4" opacity="0.7"/>
+</svg>
