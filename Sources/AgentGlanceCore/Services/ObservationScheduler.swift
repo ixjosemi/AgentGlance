@@ -131,10 +131,11 @@ public final class ObservationScheduler {
         }
     }
 
-    /// Rebuilds the Codex watcher whenever the set of visible Codex processes
-    /// changes, then lets it ingest new rollout lines. Mirrors the process
-    /// map into the watcher's PID resolver so rollout sessions attach to the
-    /// right process.
+    /// Keeps one long-lived Codex watcher and retargets its PID resolver
+    /// whenever the set of visible Codex processes changes, then lets it
+    /// ingest new rollout lines. Retargeting in place preserves the read
+    /// offsets, so a process-table change never re-ingests already-consumed
+    /// rollout bytes.
     private func refreshCodexWatcher(detected: [DetectedAgentProcess]) {
         var currentMap: [String: Int32] = [:]
         for process in detected where process.tool == .codex {
@@ -142,16 +143,21 @@ public final class ObservationScheduler {
                 currentMap[process.cwd] = process.processID
             }
         }
-        if currentMap != codexProcessMap || codexWatcher == nil {
-            codexProcessMap = currentMap
-            let capturedMap = currentMap
+        let capturedMap = currentMap
+        let resolver: @Sendable (AgentSession) -> Int32? = { capturedMap[$0.cwd] }
+        if let codexWatcher {
+            if currentMap != codexProcessMap {
+                codexWatcher.processIDResolver = resolver
+            }
+        } else {
             codexWatcher = CodexSessionsWatcher(
                 sessionsDirectoryURL: codexSessionsDirectoryURL,
                 repository: repository,
-                minimumModificationDate: Date().addingTimeInterval(-3600),
-                processIDResolver: { session in capturedMap[session.cwd] }
+                ingestionWindow: 3600,
+                processIDResolver: resolver
             )
         }
+        codexProcessMap = currentMap
         do {
             try codexWatcher?.scan()
         } catch {

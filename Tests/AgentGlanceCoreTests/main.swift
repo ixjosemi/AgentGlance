@@ -1186,6 +1186,71 @@ func testCodexSessionsWatcherProcessesAppendedLinesIncrementally() throws {
     try expect(session.attentionReason, equals: .permission, "appended event reason")
 }
 
+func testCodexSessionsWatcherResavesWhenProcessAppearsLater() throws {
+    // A rollout's session_meta can be ingested before the scanner has seen
+    // the codex process. Retargeting the resolver must publish the
+    // already-parsed session without waiting for new rollout bytes —
+    // recreating the watcher (the old behavior) re-read entire files.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let sessionsDirectory = root.appendingPathComponent("sessions", isDirectory: true)
+    let stateDirectory = root.appendingPathComponent("state", isDirectory: true)
+    try FileManager.default.createDirectory(at: sessionsDirectory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let metadata = #"{"timestamp":"2026-07-18T10:00:00Z","type":"session_meta","payload":{"id":"codex-late","cwd":"/tmp/late-bound","timestamp":"2026-07-18T10:00:00Z"}}"#
+    try Data("\(metadata)\n".utf8).write(to: sessionsDirectory.appendingPathComponent("rollout.jsonl"))
+    let repository = StateRepository(directoryURL: stateDirectory)
+    let watcher = CodexSessionsWatcher(
+        sessionsDirectoryURL: sessionsDirectory,
+        repository: repository,
+        processIDResolver: { _ in nil }
+    )
+
+    try watcher.scan()
+    try expect(
+        try repository.loadSessions().isEmpty,
+        equals: true,
+        "unresolved session stays unpublished"
+    )
+
+    watcher.processIDResolver = { _ in Int32(getpid()) }
+    try watcher.scan()
+
+    let session = try repository.loadSessions().first.unwrap(or: "session was not published")
+    try expect(session.sessionID, equals: "codex-late", "published session identity")
+    try expect(session.pid, equals: Int32(getpid()), "session adopts the resolved pid")
+}
+
+func testCodexSessionsWatcherSkipsDateDirectoriesOutsideWindow() throws {
+    // Codex stores rollouts under YYYY/MM/DD directories and the tree grows
+    // without bound. Directories whose date period ends before the
+    // ingestion window must be skipped without visiting their contents,
+    // even when file mtimes are recent (a copied or restored tree).
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let sessionsDirectory = root.appendingPathComponent("sessions", isDirectory: true)
+    let stateDirectory = root.appendingPathComponent("state", isDirectory: true)
+    let oldDirectory = sessionsDirectory.appendingPathComponent("2020/01/01", isDirectory: true)
+    try FileManager.default.createDirectory(at: oldDirectory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let oldMetadata = #"{"timestamp":"2026-07-18T10:00:00Z","type":"session_meta","payload":{"id":"codex-old","cwd":"/tmp/old","timestamp":"2026-07-18T10:00:00Z"}}"#
+    try Data("\(oldMetadata)\n".utf8).write(to: oldDirectory.appendingPathComponent("rollout.jsonl"))
+    let currentMetadata = #"{"timestamp":"2026-07-18T10:00:00Z","type":"session_meta","payload":{"id":"codex-current","cwd":"/tmp/current","timestamp":"2026-07-18T10:00:00Z"}}"#
+    try Data("\(currentMetadata)\n".utf8).write(to: sessionsDirectory.appendingPathComponent("rollout.jsonl"))
+    let repository = StateRepository(directoryURL: stateDirectory)
+    let watcher = CodexSessionsWatcher(
+        sessionsDirectoryURL: sessionsDirectory,
+        repository: repository,
+        processID: Int32(getpid()),
+        ingestionWindow: 3600
+    )
+
+    try watcher.scan()
+
+    let sessionIDs = Set(try repository.loadSessions().map(\.sessionID))
+    try expect(sessionIDs, equals: ["codex-current"], "only in-window rollouts are ingested")
+}
+
 func testFocusPlannerPrioritizesTmuxThenTerminal() throws {
     let data = Data(
         #"{"schema_version":1,"tool":"claude","session_id":"focus","pid":1,"status":"working","attention_reason":null,"cwd":"/tmp/project","started_at":"2026-07-18T10:00:00Z","updated_at":"2026-07-18T10:00:00Z","terminal":{"term_program":"ghostty","ghostty_terminal_id":"terminal-123","tmux_pane":"%3","window_title_hint":"project — claude"}}"#.utf8
@@ -1951,6 +2016,8 @@ let tests: [(String, () throws -> Void)] = [
     ("Codex rollout parser maps session and turn events", testCodexRolloutParserMapsSessionAndTurnEvents),
     ("Codex rollout parser ignores malformed and unknown lines", testCodexRolloutParserIgnoresMalformedAndUnknownLines),
     ("Codex sessions watcher processes appended lines incrementally", testCodexSessionsWatcherProcessesAppendedLinesIncrementally),
+    ("Codex sessions watcher resaves when process appears later", testCodexSessionsWatcherResavesWhenProcessAppearsLater),
+    ("Codex sessions watcher skips date directories outside window", testCodexSessionsWatcherSkipsDateDirectoriesOutsideWindow),
     ("focus planner prioritizes tmux then terminal", testFocusPlannerPrioritizesTmuxThenTerminal),
     ("Ghostty matcher excludes orphaned processes and assigns exact terminals", testGhosttyMatcherExcludesOrphanedProcessesAndAssignsExactTerminals),
     ("Ghostty matcher prefers same-directory terminal naming the tool", testGhosttyMatcherPrefersSameDirectoryTerminalNamingTheTool),
