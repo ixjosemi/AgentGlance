@@ -19,6 +19,7 @@ struct NotchWidgetView: View {
     @State private var isHoveringPanel = false
     @State private var openMenuTrackingCount = 0
     @State private var rowInteractionActive = false
+    @State private var outsideClickMonitor: Any?
 
     var body: some View {
         // The bar semaphore ignores waiting sessions the user has already
@@ -113,7 +114,9 @@ struct NotchWidgetView: View {
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: expandedTool)
         .onChange(of: expandedTool != nil) { _, isVisible in
             onMenuVisibilityChange(isVisible)
+            updateOutsideClickMonitor(menuIsVisible: isVisible)
         }
+        .onDisappear { updateOutsideClickMonitor(menuIsVisible: false) }
         // Killing or losing the last session of the expanded tool leaves
         // nothing to show — and the tool's own bar icon disappears with it —
         // so the menu closes itself instead of floating over an empty list.
@@ -207,6 +210,23 @@ struct NotchWidgetView: View {
         scheduleCollapseOnHoverExit(false)
     }
 
+    /// A click anywhere outside the app dismisses the open menu immediately,
+    /// the way any system menu behaves. Global monitors never see events in
+    /// our own windows, so clicks inside the panel are unaffected; they also
+    /// bypass the hover grace period and the row-interaction lock — clicking
+    /// elsewhere is an unambiguous "I am done here".
+    private func updateOutsideClickMonitor(menuIsVisible: Bool) {
+        if let outsideClickMonitor {
+            NSEvent.removeMonitor(outsideClickMonitor)
+            self.outsideClickMonitor = nil
+        }
+        guard menuIsVisible else { return }
+        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { _ in
+            collapseMenu()
+        }
+    }
 }
 
 // MARK: - Tool indicator
@@ -524,9 +544,8 @@ private struct SessionRow: View {
             .overlay(RightClickCatcher(onRightClick: toggleActions))
             if isActionsExpanded {
                 actionArea
-                    .padding(.leading, 26)
-                    .padding(.trailing, 12)
-                    .padding(.bottom, 8)
+                    .padding(.horizontal, 6)
+                    .padding(.bottom, 6)
                     .transition(.opacity)
             }
         }
@@ -745,12 +764,12 @@ private struct ActionListRow: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 8) {
+            HStack(spacing: 9) {
                 Image(systemName: systemImage)
-                    .font(.system(size: 10, weight: .semibold))
-                    .frame(width: 14)
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(width: 15)
                 Text(label)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.system(size: 11.5, weight: .medium))
                 if fillsWidth {
                     Spacer(minLength: 0)
                 }
@@ -760,8 +779,8 @@ private struct ActionListRow: View {
                     ? Color.red.opacity(isHovered ? 1 : 0.85)
                     : Color.white.opacity(isHovered ? 0.95 : 0.8)
             )
-            .padding(.horizontal, 8)
-            .frame(height: 24)
+            .padding(.horizontal, 10)
+            .frame(height: 30)
             .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
