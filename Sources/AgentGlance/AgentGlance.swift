@@ -5,6 +5,16 @@ import AgentGlanceCore
 let arguments = Array(CommandLine.arguments.dropFirst())
 let isHookInvocation = arguments.first == "hook"
 
+/// The kernel-resolved path of this binary. argv[0] is whatever the caller
+/// typed: invoked by bare name via PATH it resolves against the current
+/// directory and could name a different file than the one running.
+func currentExecutableURL() throws -> URL {
+    guard let path = Bundle.main.executablePath else {
+        throw CocoaError(.fileNoSuchFile)
+    }
+    return URL(fileURLWithPath: path).standardizedFileURL
+}
+
 do {
     let command = try CLICommand.parse(arguments: arguments)
     let environment = ProcessInfo.processInfo.environment
@@ -25,13 +35,13 @@ do {
     case .install:
         try Installer(
             homeDirectoryURL: FileManager.default.homeDirectoryForCurrentUser,
-            executableURL: URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+            executableURL: try currentExecutableURL()
         ).install()
         print("AgentGlance hooks installed.")
     case .uninstall:
         try Installer(
             homeDirectoryURL: FileManager.default.homeDirectoryForCurrentUser,
-            executableURL: URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+            executableURL: try currentExecutableURL()
         ).uninstall()
         print("AgentGlance files removed.")
     case .doctor:
