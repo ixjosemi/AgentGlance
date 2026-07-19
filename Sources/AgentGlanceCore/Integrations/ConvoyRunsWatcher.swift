@@ -64,16 +64,27 @@ public final class ConvoyRunsWatcher {
             at: runsDirectoryURL,
             includingPropertiesForKeys: [.isDirectoryKey]
         )) ?? []
-        return runDirectoryURLs.compactMap { runDirectoryURL in
+        var currentMetadataURLs: Set<URL> = []
+        var runs: [ConvoyRun] = []
+        for runDirectoryURL in runDirectoryURLs {
             let metadataURL = runDirectoryURL.appendingPathComponent("metadata.json")
             guard let modifiedAt = try? metadataURL
                 .resourceValues(forKeys: [.contentModificationDateKey])
                 .contentModificationDate,
                 modifiedAt >= cutoff else {
-                return nil
+                continue
             }
-            return parsedRun(at: metadataURL, modifiedAt: modifiedAt)
+            currentMetadataURLs.insert(metadataURL)
+            if let run = parsedRun(at: metadataURL, modifiedAt: modifiedAt) {
+                runs.append(run)
+            }
         }
+        // Runs aging out of the cutoff never come back; their cached parses
+        // would otherwise accumulate for the lifetime of the app.
+        parsedRunsByFileURL = parsedRunsByFileURL.filter {
+            currentMetadataURLs.contains($0.key)
+        }
+        return runs
     }
 
     private func parsedRun(at metadataURL: URL, modifiedAt: Date) -> ConvoyRun? {

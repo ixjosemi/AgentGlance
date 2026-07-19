@@ -45,10 +45,23 @@ public final class CodexSessionsWatcher {
 
     public func scan() throws {
         let cutoff = ingestionWindow.map { Date().addingTimeInterval(-$0) }
-        for fileURL in try rolloutFileURLs(cutoff: cutoff) {
+        let fileURLs = try rolloutFileURLs(cutoff: cutoff)
+        for fileURL in fileURLs {
             try consumeNewData(from: fileURL)
         }
         try publishPendingSessions()
+        pruneFileState(keeping: Set(fileURLs))
+    }
+
+    /// Rollout files age out of the ingestion window and normally never
+    /// return; their read state would otherwise accumulate for the lifetime
+    /// of the app. The rare file that does come back — a session resumed
+    /// after a long pause — is re-ingested from the start.
+    private func pruneFileState(keeping fileURLs: Set<URL>) {
+        offsets = offsets.filter { fileURLs.contains($0.key) }
+        buffers = buffers.filter { fileURLs.contains($0.key) }
+        parsers = parsers.filter { fileURLs.contains($0.key) }
+        pendingSessions = pendingSessions.filter { fileURLs.contains($0.key) }
     }
 
     /// Sessions parsed while their process was not yet visible are retried
