@@ -586,28 +586,31 @@ private struct SessionRow: View {
                     .font(.system(size: 13, weight: .semibold, design: .rounded))
                     .foregroundStyle(.white.opacity(0.94))
                     .lineLimit(1)
-                // A pipeline's current step outranks the branch: convoy
-                // targets worktrees whose directory name already carries
-                // the branch, and the step is what changes over time.
-                if let currentStep = session.currentStep {
-                    HStack(spacing: 3) {
+                // The title belongs to the tab now, so the directory keeps
+                // the project context here, followed by the pipeline step —
+                // which outranks the branch: convoy targets worktrees whose
+                // directory name already carries it — or the git branch.
+                HStack(spacing: 3) {
+                    Image(systemName: "folder")
+                        .font(.system(size: 8, weight: .semibold))
+                    Text(SessionTitleFormatter.truncate(session.projectName, to: 14))
+                        .font(.system(size: 10, design: .monospaced))
+                    if let currentStep = session.currentStep {
+                        Text("·")
                         Image(systemName: "point.3.filled.connected.trianglepath.dotted")
                             .font(.system(size: 8, weight: .semibold))
                         Text(currentStep)
                             .font(.system(size: 10, design: .monospaced))
-                    }
-                    .foregroundStyle(.white.opacity(0.55))
-                    .lineLimit(1)
-                } else if let branch = branchName {
-                    HStack(spacing: 3) {
+                    } else if let branch = branchName {
+                        Text("·")
                         Image(systemName: "arrow.triangle.branch")
                             .font(.system(size: 8, weight: .semibold))
                         Text(branch)
                             .font(.system(size: 10, design: .monospaced))
                     }
-                    .foregroundStyle(.white.opacity(0.55))
-                    .lineLimit(1)
                 }
+                .foregroundStyle(.white.opacity(0.55))
+                .lineLimit(1)
             }
             Spacer(minLength: 8)
             // The system wakes this view on minute boundaries while the

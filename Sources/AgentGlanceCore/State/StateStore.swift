@@ -90,8 +90,15 @@ public final class StateStore {
         persistNameOverrides()
     }
 
+    /// Row title precedence: a manual rename always wins, then the cleaned
+    /// live tab title (the reaper refreshes `windowTitleHint` from the
+    /// Ghostty scan each tick), then the directory name.
     public func displayName(for session: AgentSession) -> String {
-        nameOverrides.displayName(for: session) ?? session.projectName
+        nameOverrides.displayName(for: session)
+            ?? SessionTitleFormatter.rowTitle(
+                tabTitle: session.terminal.windowTitleHint,
+                fallback: session.projectName
+            )
     }
 
     /// Persistence failures only cost the custom names on the next launch;

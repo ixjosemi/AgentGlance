@@ -2604,6 +2604,68 @@ func testTerminationServiceKillsPolitelyAndEscalatesToSigkill() throws {
     try TerminationService.terminate(try sessionForProcessID(polite.processIdentifier), gracePeriod: 0.3)
 }
 
+func testSessionTitleFormatterCleansTabTitles() throws {
+    // Agent status decorations — emoji dots, spinners, separators — and
+    // ellipses are stripped; whitespace collapses; 20 characters maximum.
+    try expect(
+        SessionTitleFormatter.rowTitle(tabTitle: "🟢 | Ideas de naming... · main", fallback: "repo"),
+        equals: "Ideas de naming · m…",
+        "opencode-style tab title"
+    )
+    try expect(
+        SessionTitleFormatter.rowTitle(tabTitle: "✳ AgentGlance — claude", fallback: "repo"),
+        equals: "AgentGlance — claude",
+        "claude-style tab title at exactly the limit"
+    )
+    try expect(
+        SessionTitleFormatter.rowTitle(tabTitle: "convoy", fallback: "repo"),
+        equals: "convoy",
+        "plain short title"
+    )
+    try expect(
+        SessionTitleFormatter.rowTitle(tabTitle: "● ● ●", fallback: "repo"),
+        equals: "repo",
+        "decoration-only title falls back"
+    )
+    try expect(
+        SessionTitleFormatter.rowTitle(tabTitle: nil, fallback: "repo"),
+        equals: "repo",
+        "missing title falls back"
+    )
+    try expect(
+        SessionTitleFormatter.truncate("really-long-directory-name", to: 14),
+        equals: "really-long-d…",
+        "directory truncation"
+    )
+    try expect(
+        SessionTitleFormatter.truncate("AgentGlance", to: 14),
+        equals: "AgentGlance",
+        "short directory untouched"
+    )
+}
+
+func testStateStoreDisplayNamePrefersOverrideThenTabTitle() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let store = StateStore(repository: repository)
+    let titled = try AgentSession.decode(from: Data(
+        #"{"schema_version":1,"tool":"claude","session_id":"t1","pid":1,"status":"working","attention_reason":null,"cwd":"/tmp/project","started_at":"2026-07-18T10:00:00Z","updated_at":"2026-07-18T10:00:00Z","terminal":{"window_title_hint":"🟢 | Fixing the reaper"}}"#.utf8
+    ))
+
+    try expect(store.displayName(for: titled), equals: "Fixing the reaper", "tab title beats directory")
+
+    store.rename(titled, to: "Mi tarea")
+    try expect(store.displayName(for: titled), equals: "Mi tarea", "manual rename beats tab title")
+
+    let untitled = try AgentSession.decode(
+        from: validStateJSON(sessionID: "t2", status: "working")
+    )
+    try expect(store.displayName(for: untitled), equals: "project", "no hint falls back to directory")
+}
+
 extension Data {
     func writeAtomically(to url: URL) throws {
         try FileManager.default.createDirectory(
@@ -2698,6 +2760,8 @@ let tests: [(String, () throws -> Void)] = [
     ("state store rename persists across restarts and prunes", testStateStoreRenamePersistsAcrossRestartsAndPrunesWithSessions),
     ("termination planner closes only exact containers", testTerminationPlannerClosesOnlyExactContainers),
     ("termination service kills politely and escalates to SIGKILL", testTerminationServiceKillsPolitelyAndEscalatesToSigkill),
+    ("session title formatter cleans tab titles", testSessionTitleFormatterCleansTabTitles),
+    ("state store display name prefers override then tab title", testStateStoreDisplayNamePrefersOverrideThenTabTitle),
 ]
 
 do {
