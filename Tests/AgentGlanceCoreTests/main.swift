@@ -1785,6 +1785,44 @@ func testInstallerFollowsUserOwnedSymlinkedIntegrationDirectories() throws {
     )
 }
 
+func testInstallerReplacesMarkedIntegrationFilesOnReinstall() throws {
+    // Upgraded builds ship different plugin content, so exact-match
+    // replacement alone would block every reinstall of our own files. The
+    // ownership marker in the first line authorizes replacement; unmarked
+    // files belong to the user and still refuse the install.
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let home = root.appendingPathComponent("home")
+    try FileManager.default.createDirectory(
+        at: home.appendingPathComponent(".config/opencode/plugins"),
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    let outdated = "// AgentGlance-managed integration; reinstalls replace this file.\nexport const Old = 1;\n"
+    let pluginURL = home.appendingPathComponent(".config/opencode/plugins/agentglance.js")
+    try Data(outdated.utf8).write(to: pluginURL)
+
+    try Installer(homeDirectoryURL: home, executableURL: Bundle.main.executableURL!).install()
+
+    try expect(
+        try Data(contentsOf: pluginURL) == Data(contentsOf: BundledResources.opencodePluginURL),
+        equals: true,
+        "marked plugin is replaced by the bundled one"
+    )
+
+    let userExtensionURL = home.appendingPathComponent(".pi/agent/extensions/agentglance.ts")
+    try Data("export default function mine() {}\n".utf8).write(to: userExtensionURL)
+    do {
+        try Installer(homeDirectoryURL: home, executableURL: Bundle.main.executableURL!).install()
+        throw TestFailure.expectation("install must refuse an unmarked integration file")
+    } catch let error as InstallationError {
+        try expect(
+            error,
+            equals: .existingIntegrationFile(userExtensionURL.path),
+            "unmarked files still refuse"
+        )
+    }
+}
+
 func testInstallerPrependsCodexNotifyBeforeExistingContent() throws {
     // A multi-line TOML value may continue on a line that begins with "[",
     // so inserting before the first such line can land inside a value. The
@@ -2033,6 +2071,7 @@ let tests: [(String, () throws -> Void)] = [
     ("Claude settings quotes hook paths for the shell", testClaudeSettingsQuotesHookPathsForTheShell),
     ("installer rejects symlinked private directory", testInstallerRejectsSymlinkedPrivateDirectory),
     ("installer follows user-owned symlinked integration directories", testInstallerFollowsUserOwnedSymlinkedIntegrationDirectories),
+    ("installer replaces marked integration files on reinstall", testInstallerReplacesMarkedIntegrationFilesOnReinstall),
     ("installer prepends codex notify before existing content", testInstallerPrependsCodexNotifyBeforeExistingContent),
     ("installation doctor reports healthy install", testInstallationDoctorReportsHealthyInstall),
     ("installation doctor pinpoints broken pieces", testInstallationDoctorPinpointsBrokenPieces),

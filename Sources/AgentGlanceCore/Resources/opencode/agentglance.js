@@ -1,3 +1,4 @@
+// AgentGlance-managed integration; reinstalls replace this file.
 import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";

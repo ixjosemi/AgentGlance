@@ -1,3 +1,4 @@
+// AgentGlance-managed integration; reinstalls replace this file.
 // AgentGlance session-status extension for Pi (https://github.com/badlogic/pi-mono).
 // Installed by `agentglance install` into ~/.pi/agent/extensions/. Mirrors the
 // OpenCode plugin: every lifecycle event is persisted as a versioned state

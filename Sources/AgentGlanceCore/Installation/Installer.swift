@@ -64,12 +64,33 @@ public struct Installer {
         try removeIfPresent(agentGlanceDirectory)
     }
 
-    /// Removes an installed integration file only when its content is exactly
-    /// what this build bundles; anything else was modified by the user and is
-    /// left in place.
+    /// First-line marker that identifies an installed integration file as
+    /// ours: bundled integrations carry it, user files do not. Without it,
+    /// exact-match comparison alone would block every reinstall that ships
+    /// changed plugin content.
+    static let integrationOwnershipMarker = "AgentGlance-managed integration"
+
+    private static func isAgentGlanceOwned(_ contents: Data) -> Bool {
+        // Only the first line counts, so a user file that merely mentions
+        // the marker somewhere inside is never claimed.
+        let firstLine = String(decoding: contents.prefix(200), as: UTF8.self)
+            .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+            .first ?? ""
+        return firstLine.contains(integrationOwnershipMarker)
+    }
+
+    /// An integration file may be replaced (or removed on uninstall) when it
+    /// does not exist, matches this build's bundled content, or carries the
+    /// ownership marker; anything else belongs to the user.
+    private func mayReplaceIntegrationFile(at destination: URL, bundled: URL) throws -> Bool {
+        guard FileManager.default.fileExists(atPath: destination.path) else { return true }
+        let existing = try Data(contentsOf: destination)
+        return existing == (try Data(contentsOf: bundled)) || Self.isAgentGlanceOwned(existing)
+    }
+
     private func removeOwnedIntegrationFile(at destination: URL, matching bundled: URL) throws {
         if FileManager.default.fileExists(atPath: destination.path),
-           try Data(contentsOf: destination) == Data(contentsOf: bundled) {
+           try mayReplaceIntegrationFile(at: destination, bundled: bundled) {
             try removeIfPresent(destination)
         }
     }
@@ -139,8 +160,7 @@ public struct Installer {
         let directory = homeDirectoryURL.appendingPathComponent(relativeDirectory)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let destination = directory.appendingPathComponent(fileName)
-        if FileManager.default.fileExists(atPath: destination.path),
-           try Data(contentsOf: destination) != Data(contentsOf: bundled) {
+        guard try mayReplaceIntegrationFile(at: destination, bundled: bundled) else {
             throw InstallationError.existingIntegrationFile(destination.path)
         }
         try copy(bundled, to: destination, executable: false)
@@ -285,8 +305,7 @@ public struct Installer {
         ]
         for file in integrationFiles {
             let destination = homeDirectoryURL.appendingPathComponent(file.destination)
-            if FileManager.default.fileExists(atPath: destination.path),
-               try Data(contentsOf: destination) != Data(contentsOf: file.bundled) {
+            guard try mayReplaceIntegrationFile(at: destination, bundled: file.bundled) else {
                 throw InstallationError.existingIntegrationFile(destination.path)
             }
         }
