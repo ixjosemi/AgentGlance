@@ -1408,6 +1408,191 @@ func testCodexSessionsWatcherSkipsDateDirectoriesOutsideWindow() throws {
     try expect(sessionIDs, equals: ["codex-current"], "only in-window rollouts are ingested")
 }
 
+func writeConvoyRunFixture(
+    at runsDirectoryURL: URL,
+    runID: String,
+    serverPid: Int32,
+    serverStartedAt: Date,
+    targetDir: String = "/tmp/convoy-target",
+    phases: [(name: String, status: String, sessionID: String?)],
+    humanSteps: Set<String> = []
+) throws {
+    let phaseEntries = phases.map { phase in
+        let sessionIDField = phase.sessionID.map { "\"sessionID\": \"\($0)\"," } ?? ""
+        return """
+        "\(phase.name)": {
+          "status": "\(phase.status)",
+          \(sessionIDField)
+          "startedAt": \(Int(serverStartedAt.timeIntervalSince1970 * 1000))
+        }
+        """
+    }.joined(separator: ",\n")
+    let steps = phases.map { phase in
+        """
+        {"type": "\(humanSteps.contains(phase.name) ? "human" : "agent")", "name": "\(phase.name)"}
+        """
+    }.joined(separator: ",\n")
+    let metadata = """
+    {
+      "schemaVersion": 2,
+      "runID": "\(runID)",
+      "targetDir": "\(targetDir)",
+      "createdAt": \(Int(serverStartedAt.timeIntervalSince1970 * 1000)),
+      "updatedAt": \(Int(Date().timeIntervalSince1970 * 1000)),
+      "server": {
+        "url": "http://127.0.0.1:4096",
+        "pid": \(serverPid),
+        "startedAt": \(Int(serverStartedAt.timeIntervalSince1970 * 1000))
+      },
+      "phases": { \(phaseEntries) },
+      "pipeline": { "name": "test", "steps": [ \(steps) ] }
+    }
+    """
+    let runDirectoryURL = runsDirectoryURL.appendingPathComponent(runID, isDirectory: true)
+    try FileManager.default.createDirectory(at: runDirectoryURL, withIntermediateDirectories: true)
+    try Data(metadata.utf8).write(to: runDirectoryURL.appendingPathComponent("metadata.json"))
+}
+
+func makeConvoyTestDirectories() throws -> (stateDirectoryURL: URL, runsDirectoryURL: URL) {
+    let base = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let state = base.appendingPathComponent("state", isDirectory: true)
+    let runs = base.appendingPathComponent("runs", isDirectory: true)
+    try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: runs, withIntermediateDirectories: true)
+    return (state, runs)
+}
+
+func detectedConvoyProcess(elapsedSeconds: TimeInterval = 600) -> DetectedAgentProcess {
+    DetectedAgentProcess(
+        tool: .convoy,
+        processID: Int32(getpid()),
+        cwd: "/tmp/convoy-target",
+        terminal: TerminalContext(termProgram: "ghostty", tty: "/dev/ttys009"),
+        elapsedSeconds: elapsedSeconds
+    )
+}
+
+func testConvoyWatcherPublishesRunningPipelineStep() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: "20260719-101010-abcd",
+        serverPid: Int32(getpid()),
+        serverStartedAt: Date().addingTimeInterval(-300),
+        phases: [
+            ("scope", "completed", "ses_scope"),
+            ("security", "running", "ses_security"),
+        ]
+    )
+    let watcher = ConvoyRunsWatcher(runsDirectoryURL: runsDirectoryURL, repository: repository)
+
+    try watcher.scan(detected: [detectedConvoyProcess()])
+
+    let session = try repository.loadSessions().first.unwrap(or: "no convoy session was published")
+    try expect(session.tool, equals: .convoy, "tool")
+    try expect(session.sessionID, equals: "20260719-101010-abcd", "session ID")
+    try expect(session.pid, equals: Int32(getpid()), "pid")
+    try expect(session.status, equals: .working, "status")
+    try expect(session.currentStep, equals: "security", "current step")
+    try expect(session.cwd, equals: "/tmp/convoy-target", "cwd")
+    try expect(session.terminal.termProgram, equals: "ghostty", "terminal context adopted")
+}
+
+func testConvoyWatcherFlagsWaitingHumanGate() throws {
+    // A human gate reports itself as a running phase, but the pipeline is
+    // actually paused waiting for the user — the semaphore must go red,
+    // never green (the same trap Claude's SessionStart used to fall into).
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: "20260719-111111-gate",
+        serverPid: Int32(getpid()),
+        serverStartedAt: Date().addingTimeInterval(-300),
+        phases: [
+            ("implementer", "completed", "ses_impl"),
+            ("human-review", "running", nil),
+        ],
+        humanSteps: ["human-review"]
+    )
+    let watcher = ConvoyRunsWatcher(runsDirectoryURL: runsDirectoryURL, repository: repository)
+
+    try watcher.scan(detected: [detectedConvoyProcess()])
+
+    let session = try repository.loadSessions().first.unwrap(or: "no convoy session was published")
+    try expect(session.status, equals: .needsAttention, "status")
+    try expect(session.attentionReason, equals: .permission, "attention reason")
+    try expect(session.currentStep, equals: "human-review", "current step")
+}
+
+func testConvoyWatcherMapsTerminalPipelineStates() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    let watcher = ConvoyRunsWatcher(runsDirectoryURL: runsDirectoryURL, repository: repository)
+
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: "20260719-121212-fail",
+        serverPid: Int32(getpid()),
+        serverStartedAt: Date().addingTimeInterval(-300),
+        phases: [("implementer", "completed", "ses_impl"), ("tests", "failed", "ses_tests")]
+    )
+    try watcher.scan(detected: [detectedConvoyProcess()])
+    let failed = try repository.loadSessions().first.unwrap(or: "failed run was not published")
+    try expect(failed.status, equals: .needsAttention, "failed status")
+    try expect(failed.attentionReason, equals: .turnComplete, "failed attention reason")
+    try expect(failed.currentStep, equals: "tests failed", "failed step")
+
+    try repository.remove(failed)
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: "20260719-131313-done",
+        serverPid: Int32(getpid()),
+        serverStartedAt: Date().addingTimeInterval(-200),
+        phases: [("implementer", "completed", "ses_impl"), ("tests", "completed", "ses_tests")]
+    )
+    try watcher.scan(detected: [detectedConvoyProcess()])
+    let finished = try repository.loadSessions().first.unwrap(or: "finished run was not published")
+    try expect(finished.sessionID, equals: "20260719-131313-done", "newest run wins")
+    try expect(finished.status, equals: .idle, "finished status")
+    try expect(finished.currentStep, equals: nil, "finished step")
+}
+
+func testConvoyWatcherIgnoresRunsNotOwnedByLiveProcess() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    let watcher = ConvoyRunsWatcher(runsDirectoryURL: runsDirectoryURL, repository: repository)
+
+    // A historical run whose recorded server pid now belongs to a live
+    // convoy process (pid recycling) must not resurrect: its server started
+    // long before the process did.
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: "20260601-090909-old",
+        serverPid: Int32(getpid()),
+        serverStartedAt: Date().addingTimeInterval(-86_400),
+        phases: [("security", "running", "ses_old")]
+    )
+    // A run recorded by some other process entirely.
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: "20260719-141414-othr",
+        serverPid: 999_999,
+        serverStartedAt: Date().addingTimeInterval(-60),
+        phases: [("security", "running", "ses_other")]
+    )
+
+    try watcher.scan(detected: [detectedConvoyProcess(elapsedSeconds: 600)])
+
+    try expect(try repository.loadSessions().isEmpty, equals: true, "no session published")
+}
+
 func testFocusPlannerPrioritizesTmuxThenTerminal() throws {
     let data = Data(
         #"{"schema_version":1,"tool":"claude","session_id":"focus","pid":1,"status":"working","attention_reason":null,"cwd":"/tmp/project","started_at":"2026-07-18T10:00:00Z","updated_at":"2026-07-18T10:00:00Z","terminal":{"term_program":"ghostty","ghostty_terminal_id":"terminal-123","tmux_pane":"%3","window_title_hint":"project — claude"}}"#.utf8
@@ -2218,6 +2403,10 @@ let tests: [(String, () throws -> Void)] = [
     ("Codex sessions watcher processes appended lines incrementally", testCodexSessionsWatcherProcessesAppendedLinesIncrementally),
     ("Codex sessions watcher resaves when process appears later", testCodexSessionsWatcherResavesWhenProcessAppearsLater),
     ("Codex sessions watcher skips date directories outside window", testCodexSessionsWatcherSkipsDateDirectoriesOutsideWindow),
+    ("convoy watcher publishes running pipeline step", testConvoyWatcherPublishesRunningPipelineStep),
+    ("convoy watcher flags waiting human gate", testConvoyWatcherFlagsWaitingHumanGate),
+    ("convoy watcher maps terminal pipeline states", testConvoyWatcherMapsTerminalPipelineStates),
+    ("convoy watcher ignores runs not owned by live process", testConvoyWatcherIgnoresRunsNotOwnedByLiveProcess),
     ("focus planner prioritizes tmux then terminal", testFocusPlannerPrioritizesTmuxThenTerminal),
     ("Ghostty matcher excludes orphaned processes and assigns exact terminals", testGhosttyMatcherExcludesOrphanedProcessesAndAssignsExactTerminals),
     ("Ghostty matcher prefers same-directory terminal naming the tool", testGhosttyMatcherPrefersSameDirectoryTerminalNamingTheTool),
