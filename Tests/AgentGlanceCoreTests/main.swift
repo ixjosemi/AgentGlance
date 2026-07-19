@@ -169,7 +169,9 @@ func testStateRepositoryIgnoresSymbolicLinks() throws {
     try expect(sessions.isEmpty, equals: true, "symbolic-link states")
 }
 
-func testClaudeSessionStartCreatesWorkingState() throws {
+/// A freshly launched Claude sits at the prompt waiting for input, so
+/// SessionStart must not paint the session green.
+func testClaudeSessionStartCreatesIdleState() throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -188,10 +190,42 @@ func testClaudeSessionStartCreatesWorkingState() throws {
 
     let session = try StateRepository(directoryURL: directory).loadSessions().first
         .unwrap(or: "session was not saved")
-    try expect(session.status, equals: .working, "session status")
+    try expect(session.status, equals: .idle, "session status")
     try expect(session.startedAt, equals: now, "started at")
     try expect(session.terminal.termProgram, equals: "ghostty", "terminal program")
     try expect(session.terminal.tmuxPane, equals: "%7", "tmux pane")
+}
+
+/// SessionStart also fires after /compact, /clear, and auto-compaction —
+/// mid-conversation moments that say nothing about whether Claude is
+/// working. An existing session keeps its current status.
+func testClaudeSessionStartPreservesExistingStatus() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let processor = ClaudeHookProcessor(repository: repository)
+    let payload = Data(#"{"session_id":"claude-1","cwd":"/tmp/project"}"#.utf8)
+    try processor.process(
+        event: "UserPromptSubmit",
+        payload: payload,
+        environment: [:],
+        processID: 4321,
+        now: Date(timeIntervalSince1970: 100)
+    )
+
+    try processor.process(
+        event: "SessionStart",
+        payload: payload,
+        environment: [:],
+        processID: 4321,
+        now: Date(timeIntervalSince1970: 200)
+    )
+
+    let session = try repository.loadSessions().first.unwrap(or: "session was not saved")
+    try expect(session.status, equals: .working, "status preserved across auto-compact")
+    try expect(session.startedAt, equals: Date(timeIntervalSince1970: 100), "original start time")
 }
 
 func testClaudePermissionNotificationRequestsAttention() throws {
@@ -2020,7 +2054,8 @@ let tests: [(String, () throws -> Void)] = [
     ("saving session publishes canonical state file", testSavingSessionPublishesCanonicalStateFile),
     ("state files are private and session names do not collide", testStateFilesArePrivateAndSessionNamesDoNotCollide),
     ("state repository ignores symbolic links", testStateRepositoryIgnoresSymbolicLinks),
-    ("Claude session start creates working state", testClaudeSessionStartCreatesWorkingState),
+    ("Claude session start creates idle state", testClaudeSessionStartCreatesIdleState),
+    ("Claude session start preserves existing status", testClaudeSessionStartPreservesExistingStatus),
     ("Claude permission notification requests attention", testClaudePermissionNotificationRequestsAttention),
     ("Claude lifecycle events produce expected states", testClaudeLifecycleEventsProduceExpectedStates),
     ("reaper deletes state for dead process", testReaperDeletesStateForDeadProcess),

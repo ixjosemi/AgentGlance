@@ -32,8 +32,8 @@ public struct ClaudeHookProcessor: Sendable {
         now: Date = Date()
     ) throws {
         let input = try JSONDecoder().decode(Payload.self, from: payload)
-        let state = try state(for: event, notificationType: input.notificationType)
         let existing = try repository.loadSessions().first { $0.sessionID == input.sessionID }
+        let state = try state(for: event, notificationType: input.notificationType, existing: existing)
         let session = AgentSession(
             tool: .claude,
             sessionID: input.sessionID,
@@ -50,11 +50,16 @@ public struct ClaudeHookProcessor: Sendable {
 
     private func state(
         for event: String,
-        notificationType: String?
+        notificationType: String?,
+        existing: AgentSession?
     ) throws -> (status: SessionStatus, reason: AttentionReason?) {
         switch event {
         case "SessionStart":
-            return (.working, nil)
+            // Fires on launch but also mid-conversation (resume, /clear,
+            // /compact, auto-compaction), so it carries no signal about
+            // activity: keep whatever status the session already has, and
+            // treat a brand-new session as sitting idle at the prompt.
+            return (existing?.status ?? .idle, existing?.attentionReason)
         case "Notification" where notificationType == "permission_prompt":
             return (.needsAttention, .permission)
         case "Notification" where notificationType == "idle_prompt":
