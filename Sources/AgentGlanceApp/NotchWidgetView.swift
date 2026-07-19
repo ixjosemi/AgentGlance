@@ -114,6 +114,12 @@ struct NotchWidgetView: View {
         .onChange(of: expandedTool != nil) { _, isVisible in
             onMenuVisibilityChange(isVisible)
         }
+        // Killing or losing the last session of the expanded tool leaves
+        // nothing to show — and the tool's own bar icon disappears with it —
+        // so the menu closes itself instead of floating over an empty list.
+        .onChange(of: expandedTool.map { store.sessions(for: $0).isEmpty } ?? false) { _, isNowEmpty in
+            if isNowEmpty { collapseMenu() }
+        }
     }
 
     // MARK: Bar
@@ -501,21 +507,26 @@ private struct SessionRow: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Button {
-                focus(session)
-            } label: {
-                mainRow.contentShape(Rectangle())
+            HStack(spacing: 0) {
+                Button {
+                    focus(session)
+                } label: {
+                    mainRow.contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                // The chevron sits beside — not inside — the focus button,
+                // so each click has exactly one unambiguous target.
+                chevronButton
+                    .padding(.trailing, 12)
             }
-            .buttonStyle(.plain)
-            // A right (or control) click expands the actions inline instead
-            // of opening a floating menu; the catcher passes every other
-            // event through to the focus button underneath.
+            // A right (or control) click also expands the actions inline;
+            // the catcher passes every other event through.
             .overlay(RightClickCatcher(onRightClick: toggleActions))
             if isActionsExpanded {
                 actionArea
-                    .padding(.leading, 32)
-                    .padding(.trailing, 20)
-                    .padding(.bottom, 9)
+                    .padding(.leading, 26)
+                    .padding(.trailing, 12)
+                    .padding(.bottom, 8)
                     .transition(.opacity)
             }
         }
@@ -589,29 +600,49 @@ private struct SessionRow: View {
                     .foregroundStyle(.white.opacity(0.45))
             }
         }
-        .padding(.horizontal, 14)
+        .padding(.leading, 14)
+        .padding(.trailing, 8)
         .frame(height: sessionRowHeight)
+    }
+
+    private var chevronButton: some View {
+        Button(action: toggleActions) {
+            Image(systemName: "chevron.down")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.white.opacity(isHovered || isActionsExpanded ? 0.65 : 0.3))
+                .rotationEffect(.degrees(isActionsExpanded ? 180 : 0))
+                .frame(width: 20, height: 20)
+                .background(Circle().fill(.white.opacity(isActionsExpanded ? 0.1 : 0)))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Session actions")
     }
 
     @ViewBuilder
     private var actionArea: some View {
         switch mode {
         case .menu:
-            HStack(spacing: 6) {
-                actionButton("Rename", systemImage: "pencil") { beginRename() }
-                actionButton("Copy Path", systemImage: "doc.on.doc") {
+            VStack(spacing: 1) {
+                ActionListRow(label: "Rename Session", systemImage: "pencil") {
+                    beginRename()
+                }
+                ActionListRow(label: "Copy Project Path", systemImage: "doc.on.doc") {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(session.cwd, forType: .string)
                     toggleActions()
                 }
-                actionButton("Finder", systemImage: "folder") {
+                ActionListRow(label: "Reveal in Finder", systemImage: "folder") {
                     NSWorkspace.shared.activateFileViewerSelecting(
                         [URL(fileURLWithPath: session.cwd)]
                     )
                     toggleActions()
                 }
-                Spacer(minLength: 0)
-                actionButton("Kill", systemImage: "xmark.octagon", isDestructive: true) {
+                ActionListRow(
+                    label: "Kill Session",
+                    systemImage: "xmark.octagon",
+                    isDestructive: true
+                ) {
                     mode = .confirmingKill
                 }
             }
@@ -630,45 +661,47 @@ private struct SessionRow: View {
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
                             .fill(.white.opacity(0.1))
                     )
-                actionButton("Save", systemImage: "checkmark", action: commitRename)
-                actionButton("Cancel", systemImage: "xmark", action: cancelRename)
+                iconButton("checkmark", accessibilityLabel: "Save name", action: commitRename)
+                iconButton("xmark", accessibilityLabel: "Cancel rename", action: cancelRename)
             }
         case .confirmingKill:
-            HStack(spacing: 6) {
+            HStack(spacing: 8) {
                 Text("Kill the process and close its pane?")
                     .font(.system(size: 10))
                     .foregroundStyle(.white.opacity(0.7))
                     .lineLimit(1)
                 Spacer(minLength: 0)
-                actionButton("Kill", systemImage: "xmark.octagon", isDestructive: true) {
+                ActionListRow(
+                    label: "Kill",
+                    systemImage: "xmark.octagon",
+                    isDestructive: true,
+                    fillsWidth: false
+                ) {
                     kill(session)
                     toggleActions()
                 }
-                actionButton("Cancel", systemImage: "arrow.uturn.backward") { mode = .menu }
+                ActionListRow(label: "Cancel", systemImage: "arrow.uturn.backward", fillsWidth: false) {
+                    mode = .menu
+                }
             }
         }
     }
 
-    private func actionButton(
-        _ label: String,
-        systemImage: String,
-        isDestructive: Bool = false,
+    private func iconButton(
+        _ systemImage: String,
+        accessibilityLabel: String,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
-            HStack(spacing: 4) {
-                Image(systemName: systemImage)
-                    .font(.system(size: 8, weight: .semibold))
-                Text(label)
-                    .font(.system(size: 10, weight: .medium))
-            }
-            .foregroundStyle(isDestructive ? Color.red.opacity(0.9) : .white.opacity(0.75))
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Capsule().fill(.white.opacity(0.08)))
-            .contentShape(Capsule())
+            Image(systemName: systemImage)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.75))
+                .frame(width: 22, height: 22)
+                .background(Circle().fill(.white.opacity(0.08)))
+                .contentShape(Circle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
     }
 
     private func beginRename() {
@@ -695,6 +728,57 @@ private struct SessionRow: View {
         guard mode == .renaming else { return }
         renameFieldIsFocused = false
         setKeyboardFocus(false)
+    }
+}
+
+/// One entry of the inline action list: icon, label, hover highlight — the
+/// look of a menu item, rendered inside the row instead of a floating menu.
+private struct ActionListRow: View {
+    let label: String
+    let systemImage: String
+    var isDestructive = false
+    /// List entries span the row; the kill-confirmation buttons keep their
+    /// natural width so the question stays on the same line.
+    var fillsWidth = true
+    let action: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 14)
+                Text(label)
+                    .font(.system(size: 11, weight: .medium))
+                if fillsWidth {
+                    Spacer(minLength: 0)
+                }
+            }
+            .foregroundStyle(
+                isDestructive
+                    ? Color.red.opacity(isHovered ? 1 : 0.85)
+                    : Color.white.opacity(isHovered ? 0.95 : 0.8)
+            )
+            .padding(.horizontal, 8)
+            .frame(height: 24)
+            .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(backgroundOpacity)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+    }
+
+    private var backgroundOpacity: Color {
+        if isDestructive && isHovered {
+            return .red.opacity(0.18)
+        }
+        let restingOpacity = fillsWidth ? 0.0 : 0.08
+        return .white.opacity(isHovered ? 0.1 : restingOpacity)
     }
 }
 
