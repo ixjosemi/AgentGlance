@@ -31,14 +31,16 @@ public struct ReaperService: Sendable {
             "\($0.tool.rawValue)-\($0.processID)"
         })
         var removedSessionIDs: [String] = []
-        for session in sessions where shouldRemove(session, activeProcessKeys: activeProcessKeys) {
-            try repository.remove(session)
-            removedSessionIDs.append(session.sessionID)
+        var survivors: [AgentSession] = []
+        for session in sessions {
+            if shouldRemove(session, activeProcessKeys: activeProcessKeys) {
+                try repository.remove(session)
+                removedSessionIDs.append(session.sessionID)
+            } else {
+                survivors.append(session)
+            }
         }
-        let remaining = try rebindDaemonHostedSessions(
-            try repository.loadSessions(),
-            to: activeProcesses
-        )
+        let remaining = try rebindDaemonHostedSessions(survivors, to: activeProcesses)
         let tracked = remaining.reduce(into: [String: AgentSession]()) { result, session in
             let key = "\(session.tool.rawValue)-\(session.pid)"
             if result[key].map({ $0.updatedAt >= session.updatedAt }) != true {
