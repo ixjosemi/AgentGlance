@@ -2625,6 +2625,48 @@ func testStateStoreRaisesAttentionOnlyOnTransitionsIntoRed() throws {
     try expect(raisedBatches, equals: [["turns-red"]], "still-red session does not re-raise")
 }
 
+func testStateStoreRaisesTurnCompletionOnlyFromWorkingToIdle() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let store = StateStore(repository: repository)
+    var completedBatches: [[String]] = []
+    store.onTurnCompleted = { completedBatches.append($0.map(\.sessionID)) }
+
+    // A session appearing already idle is not a finished turn — nothing to
+    // announce: the agent did not just hand the conversation back.
+    try repository.save(AgentSession.decode(
+        from: validStateJSON(sessionID: "born-idle", status: "idle", pid: Int32(getpid()))
+    ))
+    try store.reload()
+    try repository.save(AgentSession.decode(
+        from: validStateJSON(sessionID: "finishes", status: "working", pid: Int32(getpid()))
+    ))
+    try store.reload()
+    try expect(completedBatches, equals: [], "no completion before any turn ends")
+
+    try repository.save(AgentSession.decode(
+        from: validStateJSON(sessionID: "finishes", status: "idle", pid: Int32(getpid()))
+    ))
+    try store.reload()
+    try expect(completedBatches, equals: [["finishes"]], "working to idle announces the turn")
+    try store.reload()
+    try expect(completedBatches, equals: [["finishes"]], "still-idle session stays quiet")
+
+    // Red to idle means the user was already interacting — no announcement.
+    try repository.save(AgentSession.decode(
+        from: validStateJSON(sessionID: "finishes", status: "needs_attention", pid: Int32(getpid()))
+    ))
+    try store.reload()
+    try repository.save(AgentSession.decode(
+        from: validStateJSON(sessionID: "finishes", status: "idle", pid: Int32(getpid()))
+    ))
+    try store.reload()
+    try expect(completedBatches, equals: [["finishes"]], "red to idle stays quiet")
+}
+
 func testTerminationPlannerClosesOnlyExactContainers() throws {
     // A tmux session closes its pane and nothing else: the surrounding
     // Ghostty tab may host other panes, so the tab must stay open.
@@ -2861,6 +2903,7 @@ let tests: [(String, () throws -> Void)] = [
     ("state store display name prefers override then tab title", testStateStoreDisplayNamePrefersOverrideThenTabTitle),
     ("state store clears all session names", testStateStoreClearsAllSessionNames),
     ("state store raises attention only on transitions into red", testStateStoreRaisesAttentionOnlyOnTransitionsIntoRed),
+    ("state store raises turn completion only from working to idle", testStateStoreRaisesTurnCompletionOnlyFromWorkingToIdle),
 ]
 
 do {

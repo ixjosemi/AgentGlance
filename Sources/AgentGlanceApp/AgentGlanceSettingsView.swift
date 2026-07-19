@@ -7,6 +7,7 @@ struct AgentGlanceSettingsView: View {
     let store: StateStore?
     @AppStorage("hideWhenEmpty") private var hideWhenEmpty = false
     @AppStorage("attentionSoundEnabled") private var attentionSoundEnabled = true
+    @AppStorage("turnCompleteSoundEnabled") private var turnCompleteSoundEnabled = true
     @State private var loginItemEnabled = SMAppService.mainApp.status == .enabled
     @State private var errorMessage: String?
 
@@ -19,6 +20,7 @@ struct AgentGlanceSettingsView: View {
                 ))
                 Toggle("Hide when no sessions are active", isOn: $hideWhenEmpty)
                 Toggle("Play the alert sound when a session needs you", isOn: $attentionSoundEnabled)
+                Toggle("Play a soft sound when a session finishes its turn", isOn: $turnCompleteSoundEnabled)
             }
             Section {
                 Button("Reset custom session names") {

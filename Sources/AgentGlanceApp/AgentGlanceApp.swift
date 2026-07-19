@@ -35,12 +35,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .appendingPathComponent(".agentglance/session-names.json")
         )
         self.store = store
-        // The system alert sound respects the user's chosen sound and alert
-        // volume; a session turning red is exactly what it exists for.
-        UserDefaults.standard.register(defaults: ["attentionSoundEnabled": true])
+        // Two-sound language: the system alert (user-configured sound and
+        // volume) means "a session needs you"; the soft Tink means "the
+        // agent finished its turn — the conversation is yours".
+        UserDefaults.standard.register(defaults: [
+            "attentionSoundEnabled": true,
+            "turnCompleteSoundEnabled": true,
+        ])
         store.onAttentionRaised = { _ in
             guard UserDefaults.standard.bool(forKey: "attentionSoundEnabled") else { return }
             NSSound.beep()
+        }
+        store.onTurnCompleted = { _ in
+            guard UserDefaults.standard.bool(forKey: "turnCompleteSoundEnabled") else { return }
+            NSSound(named: "Tink")?.play()
         }
         do {
             // Directory events and Darwin notifications deliver state changes
