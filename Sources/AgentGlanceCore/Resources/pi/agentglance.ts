@@ -53,13 +53,14 @@ async function writeState(state) {
   await chmod(stateDirectory, 0o700);
   await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   await rename(temporary, destination);
-  try {
-    spawn("/usr/bin/notifyutil", ["-p", "com.agentglance.stateChanged"], {
-      stdio: "ignore",
-    }).unref();
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-  }
+  // Spawn failures surface as asynchronous "error" events; without a
+  // listener they would crash the host process. A missed notification is
+  // harmless — the app also observes the state directory directly.
+  const notifier = spawn("/usr/bin/notifyutil", ["-p", "com.agentglance.stateChanged"], {
+    stdio: "ignore",
+  });
+  notifier.on("error", () => {});
+  notifier.unref();
 }
 
 async function transition(ctx, status, attentionReason) {
