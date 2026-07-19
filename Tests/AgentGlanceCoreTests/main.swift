@@ -519,6 +519,43 @@ func testReaperAdoptsScannedGhosttyTerminalForNativeSession() throws {
     let secondPassModifiedAt = try fileURL.resourceValues(forKeys: [.contentModificationDateKey])
         .contentModificationDate
     try expect(secondPassModifiedAt, equals: firstPassModifiedAt, "document not rewritten")
+
+    // The tab title feeds the row title, so a meaningful rename must land
+    // in the document even though the surface id is already adopted.
+    let retitledProcess = DetectedAgentProcess(
+        tool: .opencode,
+        processID: Int32(getpid()),
+        cwd: "/tmp/oc-project",
+        terminal: TerminalContext(
+            termProgram: "ghostty",
+            ghosttyTerminalID: "term-42",
+            windowTitleHint: "🟢 fixing the reaper loop"
+        )
+    )
+    _ = try ReaperService(repository: repository).reap(detected: [retitledProcess])
+    let retitled = try repository.loadSessions().first.unwrap(or: "native session disappeared")
+    try expect(
+        retitled.terminal.windowTitleHint,
+        equals: "🟢 fixing the reaper loop",
+        "meaningful title change adopted"
+    )
+    try expect(retitled.updatedAt, equals: writtenAt, "title refresh is not activity")
+
+    // Spinner and status-emoji churn cleans to the same display title and
+    // must not rewrite the document every tick.
+    let decoratedData = try Data(contentsOf: fileURL)
+    let spinnerProcess = DetectedAgentProcess(
+        tool: .opencode,
+        processID: Int32(getpid()),
+        cwd: "/tmp/oc-project",
+        terminal: TerminalContext(
+            termProgram: "ghostty",
+            ghosttyTerminalID: "term-42",
+            windowTitleHint: "🟡 fixing the reaper loop…"
+        )
+    )
+    _ = try ReaperService(repository: repository).reap(detected: [spinnerProcess])
+    try expect(try Data(contentsOf: fileURL), equals: decoratedData, "decoration churn not persisted")
 }
 
 func testReaperPrunesSupersededSessionsForSameProcess() throws {

@@ -177,17 +177,23 @@ public struct ReaperService: Sendable {
     /// plugins run in daemons), so focusing them falls back to title
     /// heuristics that break as soon as agents rewrite tab titles. The
     /// process scan resolves the exact surface per process — the document
-    /// adopts its identifier, keeping its own tty/tmux context and its
-    /// updatedAt: enrichment is not activity.
+    /// adopts its identifier and keeps following the live tab title, while
+    /// keeping its own tty/tmux context and its updatedAt: enrichment is
+    /// not activity.
     private func adoptScannedTerminal(
         _ session: AgentSession,
         from process: DetectedAgentProcess
     ) throws {
         guard session.source != .reaper,
-              let scannedTerminalID = process.terminal.ghosttyTerminalID,
-              session.terminal.ghosttyTerminalID != scannedTerminalID else {
+              let scannedTerminalID = process.terminal.ghosttyTerminalID else {
             return
         }
+        let adoptsIdentifier = session.terminal.ghosttyTerminalID != scannedTerminalID
+        let adoptsTitle = titleMeaningfullyChanged(
+            scanned: process.terminal.windowTitleHint,
+            current: session.terminal.windowTitleHint
+        )
+        guard adoptsIdentifier || adoptsTitle else { return }
         try repository.save(AgentSession(
             tool: session.tool,
             sessionID: session.sessionID,
@@ -209,6 +215,16 @@ public struct ReaperService: Sendable {
             source: session.source,
             currentStep: session.currentStep
         ))
+    }
+
+    /// Agents decorate tab titles with spinners and status emoji that churn
+    /// every few seconds; comparing display-cleaned titles keeps that churn
+    /// from rewriting the document — and storming the state observers — on
+    /// every tick. A scan without a title never clears an existing one.
+    private func titleMeaningfullyChanged(scanned: String?, current: String?) -> Bool {
+        guard let scanned else { return false }
+        return SessionTitleFormatter.rowTitle(tabTitle: scanned, fallback: "")
+            != SessionTitleFormatter.rowTitle(tabTitle: current, fallback: "")
     }
 
     private func isAlive(_ processID: Int32) -> Bool {
