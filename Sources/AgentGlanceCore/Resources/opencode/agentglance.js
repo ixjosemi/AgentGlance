@@ -9,6 +9,7 @@ const stateDirectory = join(
   "state",
 );
 const sessions = new Map();
+const childSessionIDs = new Set();
 
 function timestamp() {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -62,16 +63,43 @@ function eventSessionID(event) {
     || event.properties.info?.id;
 }
 
-async function updateState(event, directory) {
+async function isRootSession(client, sessionID) {
+  try {
+    const response = await client.session.get({ path: { id: sessionID } });
+    return !response.data?.parentID;
+  } catch {
+    // Fail open: a lookup hiccup must not blind the app to a real root
+    // session, and the app's reaper prunes any duplicate that slips through.
+    return true;
+  }
+}
+
+async function updateState(client, event, directory) {
   const sessionID = eventSessionID(event);
-  if (!sessionID) return;
+  if (!sessionID || childSessionIDs.has(sessionID)) return;
   if (event.type === "session.created") {
+    // Child sessions (subagents, title generation) run inside a root
+    // session's terminal; tracking them would list phantom sessions.
+    if (event.properties.info?.parentID) {
+      childSessionIDs.add(sessionID);
+      return;
+    }
     const state = createState(event.properties.info, directory);
     sessions.set(sessionID, state);
     await writeState(state);
     return;
   }
-  const state = sessions.get(sessionID) || createState({ id: sessionID }, directory);
+  let state = sessions.get(sessionID);
+  if (!state) {
+    // Unknown mid-stream session: the plugin instance is younger than the
+    // session (daemon restart). Ask the server whether it is a root
+    // session before fabricating a document for it.
+    if (!(await isRootSession(client, sessionID))) {
+      childSessionIDs.add(sessionID);
+      return;
+    }
+    state = createState({ id: sessionID }, directory);
+  }
   const transitions = {
     "permission.asked": ["needs_attention", "permission"],
     "permission.replied": ["working", null],
@@ -94,7 +122,7 @@ async function updateState(event, directory) {
 export const AgentGlancePlugin = async ({ client, directory }) => ({
   event: async ({ event }) => {
     try {
-      await updateState(event, directory);
+      await updateState(client, event, directory);
     } catch (error) {
       await client.app.log({
         body: {
