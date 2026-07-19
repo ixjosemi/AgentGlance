@@ -4,7 +4,7 @@
 
 **Know when your coding agents need you—without leaving the notch.**
 
-AgentGlance is a quiet, native macOS indicator for Claude Code, OpenCode, Codex CLI, [Pi](https://github.com/badlogic/pi-mono), and Convoy pipeline sessions. It lives around the MacBook notch — Convoy, Pi, Codex, and OpenCode on the left wing, Claude on the right — and returns you to the exact terminal tab or tmux pane with one click.
+AgentGlance is a quiet, native macOS indicator for Claude Code, OpenCode, Codex CLI, [Pi](https://github.com/badlogic/pi-mono), and [Convoy](https://github.com/Inakitajes/convoy) pipeline sessions. It lives around the MacBook notch — Convoy, Pi, Codex, and OpenCode on the left wing, Claude on the right — and returns you to the exact terminal tab or tmux pane with one click.
 
 > **Preview status:** AgentGlance is pre-1.0 and currently distributed as source. The local build is ad-hoc signed; signed and notarized downloads will follow once the release pipeline is ready.
 
