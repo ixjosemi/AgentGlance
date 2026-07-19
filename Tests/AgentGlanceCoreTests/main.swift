@@ -1355,6 +1355,74 @@ func testProcessScannerDetectsScriptRuntimeAgents() throws {
     )
 }
 
+func testProcessScannerCollapsesRuntimeLauncherOntoNativeChild() throws {
+    // npm's codex ships a node launcher (`node .../bin/codex`) that spawns
+    // the platform binary (`.../codex-darwin-arm64/.../bin/codex`) as a
+    // child. Both carry the tool name, but only the leaf process is the
+    // agent — counting both shows two sessions for one Codex.
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory
+        .appendingPathComponent("agentglance-launcher-\(UUID().uuidString)", isDirectory: true)
+    let binDirectory = root.appendingPathComponent("bin", isDirectory: true)
+    let vendorDirectory = root.appendingPathComponent("vendor", isDirectory: true)
+    try fileManager.createDirectory(at: binDirectory, withIntermediateDirectories: true)
+    try fileManager.createDirectory(at: vendorDirectory, withIntermediateDirectories: true)
+    defer { try? fileManager.removeItem(at: root) }
+    let runtime = binDirectory.appendingPathComponent("node")
+    try fileManager.createSymbolicLink(
+        at: runtime,
+        withDestinationURL: URL(fileURLWithPath: "/bin/zsh")
+    )
+    let nativeAgent = vendorDirectory.appendingPathComponent("codex")
+    try fileManager.createSymbolicLink(
+        at: nativeAgent,
+        withDestinationURL: URL(fileURLWithPath: "/bin/sleep")
+    )
+    let launcherScript = binDirectory.appendingPathComponent("codex")
+    // The trailing builtin keeps the fake node alive as the parent instead
+    // of exec-replacing itself with the native agent.
+    try Data("\"\(nativeAgent.path)\" 300; :\n".utf8).write(to: launcherScript)
+    let launcher = Process()
+    launcher.executableURL = runtime
+    launcher.arguments = [launcherScript.path]
+    try launcher.run()
+    var nativeChildPID: pid_t?
+    defer {
+        launcher.terminate()
+        launcher.waitUntilExit()
+        if let nativeChildPID { kill(nativeChildPID, SIGTERM) }
+    }
+
+    let scanner = SystemProcessScanner(ghosttyTerminalSource: { nil })
+    var codexProcesses: [DetectedAgentProcess] = []
+    let deadline = Date().addingTimeInterval(2)
+    func detectedNativeChild() -> pid_t? {
+        codexProcesses.first {
+            $0.processID != launcher.processIdentifier
+                && SystemProcessScanner.parentProcessID(of: $0.processID) == launcher.processIdentifier
+        }?.processID
+    }
+    repeat {
+        codexProcesses = try scanner.activeProcesses().filter {
+            $0.processID == launcher.processIdentifier
+                || SystemProcessScanner.parentProcessID(of: $0.processID) == launcher.processIdentifier
+        }
+        if detectedNativeChild() == nil { usleep(50_000) }
+    } while detectedNativeChild() == nil && Date() < deadline
+    nativeChildPID = detectedNativeChild()
+
+    try expect(
+        codexProcesses.map(\.tool),
+        equals: [.codex],
+        "exactly one codex process must survive for one launcher+child pair"
+    )
+    try expect(
+        codexProcesses.first?.processID != launcher.processIdentifier,
+        equals: true,
+        "the surviving process must be the native child, not the launcher"
+    )
+}
+
 func testProcessScannerIgnoresLookalikeProcessNames() throws {
     let agent = try spawnFakeAgent(named: "codexx")
     defer { agent.tearDown() }
@@ -1736,6 +1804,7 @@ let tests: [(String, () throws -> Void)] = [
     ("process scanner detects spawned agent process within budget", testProcessScannerDetectsSpawnedAgentProcessWithinBudget),
     ("process scanner ignores lookalike process names", testProcessScannerIgnoresLookalikeProcessNames),
     ("process scanner detects script runtime agents", testProcessScannerDetectsScriptRuntimeAgents),
+    ("process scanner collapses runtime launcher onto native child", testProcessScannerCollapsesRuntimeLauncherOntoNativeChild),
     ("process scanner resolves parent of root-owned processes", testProcessScannerResolvesParentOfRootOwnedProcesses),
     ("process scanner identifies host terminal from ancestors", testProcessScannerIdentifiesHostTerminalFromAncestors),
     ("Claude settings merge preserves hooks and is idempotent", testClaudeSettingsMergePreservesHooksAndIsIdempotent),

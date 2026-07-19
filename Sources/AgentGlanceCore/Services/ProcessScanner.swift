@@ -43,7 +43,9 @@ public struct SystemProcessScanner: ProcessScanning {
     }
 
     public func activeProcesses() throws -> [DetectedAgentProcess] {
-        let detected = try Self.allProcessIDs().compactMap(Self.detectAgentProcess)
+        let detected = Self.droppingRuntimeLaunchers(
+            try Self.allProcessIDs().compactMap(Self.detectAgentProcess)
+        )
         let ghosttyProcesses = detected.filter { $0.terminal.termProgram == "ghostty" }
         guard !ghosttyProcesses.isEmpty,
               let terminals = ghosttyTerminalSource() else {
@@ -77,26 +79,67 @@ public struct SystemProcessScanner: ProcessScanning {
         throw POSIXError(.EAGAIN)
     }
 
+    private struct ClassifiedAgentProcess {
+        let process: DetectedAgentProcess
+        let viaRuntimeLauncher: Bool
+    }
+
     /// Classifies one process, returning nil unless it is a running agent
     /// whose metadata is fully readable. Processes that exit mid-scan simply
     /// disappear from the result instead of failing the whole scan.
-    private static func detectAgentProcess(_ processID: pid_t) -> DetectedAgentProcess? {
-        guard let tool = agentTool(processID: processID),
+    private static func detectAgentProcess(_ processID: pid_t) -> ClassifiedAgentProcess? {
+        guard let classification = agentTool(processID: processID),
               let cwd = workingDirectory(processID: processID),
               let bsdInfo = bsdInfo(processID: processID) else {
             return nil
         }
         let startedAt = TimeInterval(bsdInfo.pbi_start_tvsec)
-        return DetectedAgentProcess(
-            tool: tool,
-            processID: processID,
-            cwd: cwd,
-            terminal: TerminalContext(
-                termProgram: hostTerminalProgram(descendant: bsdInfo),
-                tty: controllingTTY(bsdInfo)
+        return ClassifiedAgentProcess(
+            process: DetectedAgentProcess(
+                tool: classification.tool,
+                processID: processID,
+                cwd: cwd,
+                terminal: TerminalContext(
+                    termProgram: hostTerminalProgram(descendant: bsdInfo),
+                    tty: controllingTTY(bsdInfo)
+                ),
+                elapsedSeconds: max(0, Date().timeIntervalSince1970 - startedAt)
             ),
-            elapsedSeconds: max(0, Date().timeIntervalSince1970 - startedAt)
+            viaRuntimeLauncher: classification.viaRuntimeLauncher
         )
+    }
+
+    /// npm-style CLIs often pair a runtime launcher (`node .../bin/codex`)
+    /// with the platform binary it spawns; both processes carry the tool
+    /// name, but only the leaf is the agent. Launcher ancestors of a
+    /// detected same-tool process are dropped. Native ancestors are kept:
+    /// an agent started from inside another agent's shell is a real session.
+    private static func droppingRuntimeLaunchers(
+        _ classified: [ClassifiedAgentProcess]
+    ) -> [DetectedAgentProcess] {
+        let launcherProcessIDsByTool: [AgentTool: Set<pid_t>] = classified
+            .filter(\.viaRuntimeLauncher)
+            .reduce(into: [:]) { result, entry in
+                result[entry.process.tool, default: []].insert(entry.process.processID)
+            }
+        guard !launcherProcessIDsByTool.isEmpty else { return classified.map(\.process) }
+        var droppedProcessIDs: Set<pid_t> = []
+        for entry in classified {
+            guard let launcherProcessIDs = launcherProcessIDsByTool[entry.process.tool] else {
+                continue
+            }
+            var ancestorProcessID = parentProcessID(of: entry.process.processID)
+            for _ in 0..<8 {
+                guard let current = ancestorProcessID, current > 1 else { break }
+                if launcherProcessIDs.contains(current) {
+                    droppedProcessIDs.insert(current)
+                }
+                ancestorProcessID = parentProcessID(of: current)
+            }
+        }
+        return classified.map(\.process).filter {
+            !droppedProcessIDs.contains($0.processID)
+        }
     }
 
     private static let terminalAppMarkers: [(pathMarker: String, termProgram: String)] = [
@@ -155,9 +198,11 @@ public struct SystemProcessScanner: ProcessScanning {
     /// CLIs (Pi installs via npm) name only the runtime in both places, so
     /// when the command is a known runtime the script path in the leading
     /// arguments is classified instead.
-    private static func agentTool(processID: pid_t) -> AgentTool? {
+    private static func agentTool(
+        processID: pid_t
+    ) -> (tool: AgentTool, viaRuntimeLauncher: Bool)? {
         if let tool = classifyByCommandIdentifier(processID: processID, classifyToolName) {
-            return tool
+            return (tool, false)
         }
         guard classifyByCommandIdentifier(processID: processID, isScriptRuntime) == true else {
             return nil
@@ -166,6 +211,7 @@ public struct SystemProcessScanner: ProcessScanning {
             .dropFirst()
             .first { !$0.hasPrefix("-") }
             .flatMap(classifyToolName)
+            .map { ($0, true) }
     }
 
     private static let scriptRuntimeNames: Set<String> = ["node", "bun", "deno"]
