@@ -33,6 +33,7 @@ public struct SystemProcessScanner: ProcessScanning {
     public typealias GhosttyTerminalSource = @Sendable () -> [GhosttyTerminal]?
 
     private let terminalQueryCache: GhosttyTerminalQueryCache
+    private let assignmentMemory = GhosttyAssignmentMemory()
 
     public init() {
         // 30 s keeps tab titles reasonably fresh while cutting the osascript
@@ -69,8 +70,10 @@ public struct SystemProcessScanner: ProcessScanning {
         let nonGhosttyProcesses = detected.filter { $0.terminal.termProgram != "ghostty" }
         let matched = GhosttySessionMatcher.match(
             processes: ghosttyProcesses,
-            terminals: terminals
+            terminals: terminals,
+            previousAssignments: assignmentMemory.assignments()
         )
+        assignmentMemory.remember(matched)
         return nonGhosttyProcesses + matched
     }
 

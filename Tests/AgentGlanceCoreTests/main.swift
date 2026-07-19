@@ -1838,6 +1838,88 @@ func testGhosttyMatcherPrefersSameDirectoryTerminalNamingTheTool() throws {
     )
 }
 
+func testGhosttyMatcherResolvesRetitledTabsBySignatureAndForeignCommands() throws {
+    // Live incident 2026-07-19: three tabs shared one project directory —
+    // claude's (spinner title), opencode's (emoji-pipe title), and one
+    // running `caffeinate -di`. No title named a tool, so assignment fell
+    // to enumeration order and opencode adopted the caffeinate tab.
+    let processes = [
+        DetectedAgentProcess(
+            tool: .claude,
+            processID: 97,
+            cwd: "/tmp/glance",
+            terminal: TerminalContext(termProgram: "ghostty", tty: "/dev/ttys001"),
+            elapsedSeconds: 100
+        ),
+        DetectedAgentProcess(
+            tool: .opencode,
+            processID: 96,
+            cwd: "/tmp/glance",
+            terminal: TerminalContext(termProgram: "ghostty", tty: "/dev/ttys006"),
+            elapsedSeconds: 200
+        ),
+    ]
+    let terminals = [
+        GhosttyTerminal(id: "other-project", name: "~/dev/runway", cwd: "/tmp/runway"),
+        GhosttyTerminal(id: "claude-tab", name: "⠂ Optimizar rendimiento en Mac", cwd: "/tmp/glance"),
+        GhosttyTerminal(id: "caffeinate-tab", name: "caffeinate -di", cwd: "/tmp/glance"),
+        GhosttyTerminal(id: "opencode-tab", name: "🟢 | Descripción del repositorio · main", cwd: "/tmp/glance"),
+    ]
+
+    let matched = GhosttySessionMatcher.match(processes: processes, terminals: terminals)
+
+    try expect(
+        matched.first(where: { $0.tool == .claude })?.terminal.ghosttyTerminalID,
+        equals: "claude-tab",
+        "spinner signature resolves the claude tab"
+    )
+    try expect(
+        matched.first(where: { $0.tool == .opencode })?.terminal.ghosttyTerminalID,
+        equals: "opencode-tab",
+        "emoji-pipe signature resolves the opencode tab"
+    )
+}
+
+func testGhosttyMatcherKeepsPreviousAssignmentsAcrossRetitles() throws {
+    // A Ghostty surface never migrates to another process: once a process
+    // was matched to a tab, later scans must keep that match even when the
+    // titles no longer carry any signal at all.
+    let processes = [
+        detectedProcess(id: 21, cwd: "/tmp/shared", elapsed: 10),
+        DetectedAgentProcess(
+            tool: .claude,
+            processID: 22,
+            cwd: "/tmp/shared",
+            terminal: TerminalContext(termProgram: "ghostty"),
+            elapsedSeconds: 20
+        ),
+    ]
+    let retitledTerminals = [
+        GhosttyTerminal(id: "tab-one", name: "renombrada sin señal", cwd: "/tmp/shared"),
+        GhosttyTerminal(id: "tab-two", name: "otra igual de muda", cwd: "/tmp/shared"),
+    ]
+
+    let matched = GhosttySessionMatcher.match(
+        processes: processes,
+        terminals: retitledTerminals,
+        previousAssignments: [
+            GhosttySessionMatcher.assignmentKey(for: processes[0]): "tab-two",
+            GhosttySessionMatcher.assignmentKey(for: processes[1]): "tab-one",
+        ]
+    )
+
+    try expect(
+        matched.first(where: { $0.processID == 21 })?.terminal.ghosttyTerminalID,
+        equals: "tab-two",
+        "opencode keeps its tab"
+    )
+    try expect(
+        matched.first(where: { $0.processID == 22 })?.terminal.ghosttyTerminalID,
+        equals: "tab-one",
+        "claude keeps its tab"
+    )
+}
+
 func detectedProcess(id: Int32, cwd: String, elapsed: TimeInterval) -> DetectedAgentProcess {
     DetectedAgentProcess(
         tool: .opencode,
@@ -2875,6 +2957,8 @@ let tests: [(String, () throws -> Void)] = [
     ("focus planner prioritizes tmux then terminal", testFocusPlannerPrioritizesTmuxThenTerminal),
     ("Ghostty matcher excludes orphaned processes and assigns exact terminals", testGhosttyMatcherExcludesOrphanedProcessesAndAssignsExactTerminals),
     ("Ghostty matcher prefers same-directory terminal naming the tool", testGhosttyMatcherPrefersSameDirectoryTerminalNamingTheTool),
+    ("Ghostty matcher resolves retitled tabs by signature and foreign commands", testGhosttyMatcherResolvesRetitledTabsBySignatureAndForeignCommands),
+    ("Ghostty matcher keeps previous assignments across retitles", testGhosttyMatcherKeepsPreviousAssignmentsAcrossRetitles),
     ("Ghostty terminal query cache avoids redundant queries", testGhosttyTerminalQueryCacheAvoidsRedundantQueries),
     ("process scanner detects spawned agent process within budget", testProcessScannerDetectsSpawnedAgentProcessWithinBudget),
     ("process scanner ignores lookalike process names", testProcessScannerIgnoresLookalikeProcessNames),
