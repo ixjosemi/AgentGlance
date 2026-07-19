@@ -390,6 +390,7 @@ private struct SessionRow: View {
     let session: AgentSession
     let focus: (AgentSession) -> Void
     @State private var isHovered = false
+    @State private var branchName: String?
 
     var body: some View {
         Button {
@@ -453,11 +454,16 @@ private struct SessionRow: View {
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
+        // Resolving the branch reads .git/HEAD from disk; the render path
+        // must not pay for it on every body evaluation. Menu rows are
+        // transient, so a branch switched mid-display refreshes on the
+        // next open.
+        .task(id: session.cwd) { [cwd = session.cwd] in
+            branchName = await Task.detached {
+                GitWorkspaceInspector.branchName(forWorkingDirectory: cwd)
+            }.value
+        }
         .accessibilityLabel("\(session.projectName), \(session.status.rawValue)")
-    }
-
-    private var branchName: String? {
-        GitWorkspaceInspector.branchName(forWorkingDirectory: session.cwd)
     }
 
     private var tabTitle: String? {
