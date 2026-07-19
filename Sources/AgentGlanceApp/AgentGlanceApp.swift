@@ -27,7 +27,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let stateDirectory = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".agentglance/state", isDirectory: true)
         let repository = StateRepository(directoryURL: stateDirectory)
-        let store = StateStore(repository: repository)
+        // Session names live next to — never inside — the state directory:
+        // the store watches that directory and decode-attempts every .json.
+        let store = StateStore(
+            repository: repository,
+            nameOverridesFileURL: FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".agentglance/session-names.json")
+        )
         self.store = store
         do {
             // Directory events and Darwin notifications deliver state changes

@@ -15,6 +15,8 @@ struct NotchWidgetView: View {
 
     @State private var expandedTool: AgentTool?
     @State private var collapseWorkItem: DispatchWorkItem?
+    @State private var isHoveringPanel = false
+    @State private var openMenuTrackingCount = 0
 
     var body: some View {
         // The bar semaphore ignores waiting sessions the user has already
@@ -43,7 +45,10 @@ struct NotchWidgetView: View {
                             tool: expandedTool,
                             sessions: store.sessions(for: expandedTool),
                             dismiss: collapseMenu,
-                            acknowledge: { store.acknowledge($0) }
+                            acknowledge: { store.acknowledge($0) },
+                            sessionTitle: { store.displayName(for: $0) },
+                            requestRename: promptRename,
+                            requestKill: confirmKill
                         )
                         .frame(width: barWidth)
                         .transition(.opacity)
@@ -74,7 +79,25 @@ struct NotchWidgetView: View {
                         Label("Quit AgentGlance", systemImage: "power")
                     }
                 }
-                .onHover(perform: scheduleCollapseOnHoverExit)
+                .onHover { isHovering in
+                    isHoveringPanel = isHovering
+                    scheduleCollapseOnHoverExit(isHovering)
+                }
+                // A session row's context menu is an NSMenu window outside
+                // this view: opening it fires a hover exit that would
+                // collapse the panel — and the menu with it — mid-read.
+                .onReceive(
+                    NotificationCenter.default.publisher(for: NSMenu.didBeginTrackingNotification)
+                ) { _ in
+                    openMenuTrackingCount += 1
+                    collapseWorkItem?.cancel()
+                }
+                .onReceive(
+                    NotificationCenter.default.publisher(for: NSMenu.didEndTrackingNotification)
+                ) { _ in
+                    openMenuTrackingCount = max(0, openMenuTrackingCount - 1)
+                    settleAfterDetachedInteraction()
+                }
                 .padding(.leading, leftContentWidth - leftWidth)
                 .padding(.trailing, rightContentWidth - rightWidth)
             }
@@ -150,12 +173,75 @@ struct NotchWidgetView: View {
 
     /// Collapse shortly after the pointer leaves the notch surface, mirroring
     /// how notch utilities dismiss; the grace period tolerates brief exits.
+    /// While a context menu is open the pointer legitimately lives outside
+    /// the panel, so collapsing is deferred until the menu closes.
     private func scheduleCollapseOnHoverExit(_ isHovering: Bool) {
         collapseWorkItem?.cancel()
-        guard !isHovering, expandedTool != nil else { return }
+        guard !isHovering, expandedTool != nil, openMenuTrackingCount == 0 else { return }
         let workItem = DispatchWorkItem { expandedTool = nil }
         collapseWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: workItem)
+    }
+
+    /// After a menu or modal dialog closes, no hover event fires if the
+    /// pointer already sits outside the panel — re-arm the collapse manually
+    /// so the panel never sticks open.
+    private func settleAfterDetachedInteraction() {
+        guard !isHoveringPanel else { return }
+        scheduleCollapseOnHoverExit(false)
+    }
+
+    // MARK: Session actions
+
+    private func promptRename(_ session: AgentSession) {
+        let alert = NSAlert()
+        alert.messageText = "Rename Session"
+        alert.informativeText = "The name only changes how this session is listed in AgentGlance."
+        let nameField = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        nameField.stringValue = store.nameOverrides.displayName(for: session) ?? ""
+        nameField.placeholderString = session.projectName
+        alert.accessoryView = nameField
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = nameField
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            store.rename(session, to: nameField.stringValue)
+        }
+        settleAfterDetachedInteraction()
+    }
+
+    private func confirmKill(_ session: AgentSession) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Kill \(store.displayName(for: session))?"
+        alert.informativeText =
+            "Terminates the \(session.tool.rawValue) process and closes its terminal pane."
+        alert.addButton(withTitle: "Kill Session").hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        let confirmed = alert.runModal() == .alertFirstButtonReturn
+        settleAfterDetachedInteraction()
+        guard confirmed else { return }
+        // The kill waits up to two grace periods; keep it off the main
+        // thread. The state document needs no cleanup here: the scheduler's
+        // exit watcher sees the death and the reaper removes it on its tick.
+        Task.detached(priority: .userInitiated) {
+            do {
+                try TerminationService.terminate(session)
+            } catch {
+                await MainActor.run { presentKillFailure(error) }
+            }
+        }
+    }
+
+    private func presentKillFailure(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Could not kill the session"
+        alert.informativeText = String(describing: error)
+        alert.runModal()
+        settleAfterDetachedInteraction()
     }
 }
 
@@ -300,6 +386,9 @@ private struct SessionMenuCard: View {
     let sessions: [AgentSession]
     let dismiss: () -> Void
     let acknowledge: (AgentSession) -> Void
+    let sessionTitle: (AgentSession) -> String
+    let requestRename: (AgentSession) -> Void
+    let requestKill: (AgentSession) -> Void
     @State private var errorMessage: String?
 
     var body: some View {
@@ -328,7 +417,13 @@ private struct SessionMenuCard: View {
             } else if sessions.count <= 5 {
                 VStack(spacing: 0) {
                     ForEach(sessions) { session in
-                        SessionRow(session: session, focus: focusSession)
+                        SessionRow(
+                            session: session,
+                            title: sessionTitle(session),
+                            focus: focusSession,
+                            requestRename: requestRename,
+                            requestKill: requestKill
+                        )
                     }
                 }
                 .padding(.bottom, 8)
@@ -337,7 +432,13 @@ private struct SessionMenuCard: View {
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 0) {
                         ForEach(sessions) { session in
-                            SessionRow(session: session, focus: focusSession)
+                            SessionRow(
+                            session: session,
+                            title: sessionTitle(session),
+                            focus: focusSession,
+                            requestRename: requestRename,
+                            requestKill: requestKill
+                        )
                         }
                     }
                 }
@@ -389,7 +490,10 @@ private struct SessionMenuCard: View {
 
 private struct SessionRow: View {
     let session: AgentSession
+    let title: String
     let focus: (AgentSession) -> Void
+    let requestRename: (AgentSession) -> Void
+    let requestKill: (AgentSession) -> Void
     @State private var isHovered = false
     @State private var branchName: String?
 
@@ -406,7 +510,7 @@ private struct SessionRow: View {
                         .frame(width: 8, height: 8)
                 }
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(session.projectName)
+                    Text(title)
                         .font(.system(size: 13, weight: .semibold, design: .rounded))
                         .foregroundStyle(.white.opacity(0.94))
                         .lineLimit(1)
@@ -454,6 +558,32 @@ private struct SessionRow: View {
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
+        .contextMenu {
+            Button {
+                requestRename(session)
+            } label: {
+                Label("Rename Session…", systemImage: "pencil")
+            }
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(session.cwd, forType: .string)
+            } label: {
+                Label("Copy Project Path", systemImage: "doc.on.doc")
+            }
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting(
+                    [URL(fileURLWithPath: session.cwd)]
+                )
+            } label: {
+                Label("Reveal in Finder", systemImage: "folder")
+            }
+            Divider()
+            Button(role: .destructive) {
+                requestKill(session)
+            } label: {
+                Label("Kill Session", systemImage: "xmark.octagon")
+            }
+        }
         // Resolving the branch reads .git/HEAD from disk; the render path
         // must not pay for it on every body evaluation. Menu rows are
         // transient, so a branch switched mid-display refreshes on the
@@ -463,6 +593,6 @@ private struct SessionRow: View {
                 GitWorkspaceInspector.branchName(forWorkingDirectory: cwd)
             }.value
         }
-        .accessibilityLabel("\(session.projectName), \(session.status.rawValue)")
+        .accessibilityLabel("\(title), \(session.status.rawValue)")
     }
 }

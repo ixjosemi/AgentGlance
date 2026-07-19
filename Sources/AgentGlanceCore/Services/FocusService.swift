@@ -97,7 +97,7 @@ public enum FocusPlanner {
         }
     }
 
-    private static func appleScriptString(_ value: String) -> String {
+    static func appleScriptString(_ value: String) -> String {
         value
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
@@ -107,8 +107,18 @@ public enum FocusPlanner {
 
 public enum FocusService {
     public static func focus(_ session: AgentSession) throws {
+        try FocusActionRunner.run(FocusPlanner.actions(for: session))
+    }
+}
+
+/// Executes planned terminal actions — subprocess or AppleScript — for both
+/// focusing and terminating sessions. Every action runs even after an
+/// earlier one fails, so a dead tmux binding never blocks the terminal
+/// action behind it; the first failure is still reported.
+enum FocusActionRunner {
+    static func run(_ actions: [FocusAction]) throws {
         var firstError: Error?
-        for action in try FocusPlanner.actions(for: session) {
+        for action in actions {
             let process = Process()
             switch action {
             case let .run(executable, arguments):

@@ -32,15 +32,26 @@ public final class StateStore {
     public private(set) var sessions: [AgentSession] = []
     public private(set) var lastErrorDescription: String?
     public private(set) var acknowledgments = AttentionAcknowledgments()
+    public private(set) var nameOverrides = SessionNameOverrides()
 
     private let repository: StateRepository
+    private let nameOverridesFileURL: URL?
     private var pollingTimer: Timer?
     private var directorySource: DispatchSourceFileSystemObject?
     private var observesDarwinNotifications = false
     private var reloadScheduled = false
 
-    public init(repository: StateRepository) {
+    /// The overrides file must live outside the repository's directory: the
+    /// store watches that directory for session changes, and the repository
+    /// decode-attempts every `.json` in it.
+    public init(repository: StateRepository, nameOverridesFileURL: URL? = nil) {
         self.repository = repository
+        self.nameOverridesFileURL = nameOverridesFileURL
+        if let nameOverridesFileURL,
+           let data = try? Data(contentsOf: nameOverridesFileURL),
+           let stored = try? JSONDecoder().decode(SessionNameOverrides.self, from: data) {
+            nameOverrides = stored
+        }
     }
 
     /// Reloading is strictly a read: ended sessions are filtered from the UI
@@ -52,6 +63,15 @@ public final class StateStore {
             .filter { $0.status != .ended }
             .sorted(by: Self.precedes)
         acknowledgments.prune(keeping: sessions)
+        let prunedOverrides = {
+            var overrides = nameOverrides
+            overrides.prune(keeping: sessions)
+            return overrides
+        }()
+        if prunedOverrides != nameOverrides {
+            nameOverrides = prunedOverrides
+            persistNameOverrides()
+        }
     }
 
     public func sessions(for tool: AgentTool) -> [AgentSession] {
@@ -62,6 +82,33 @@ public final class StateStore {
     /// until the session shows new activity.
     public func acknowledge(_ session: AgentSession) {
         acknowledgments.acknowledge(session)
+    }
+
+    /// Renames a session for display; a blank name restores the project name.
+    public func rename(_ session: AgentSession, to name: String) {
+        nameOverrides.rename(session, to: name)
+        persistNameOverrides()
+    }
+
+    public func displayName(for session: AgentSession) -> String {
+        nameOverrides.displayName(for: session) ?? session.projectName
+    }
+
+    /// Persistence failures only cost the custom names on the next launch;
+    /// they must never take down reload or rename, so they are logged and
+    /// swallowed here.
+    private func persistNameOverrides() {
+        guard let nameOverridesFileURL else { return }
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(nameOverrides).write(to: nameOverridesFileURL, options: .atomic)
+        } catch {
+            NSLog(
+                "AgentGlance could not persist session names: %@",
+                String(describing: error)
+            )
+        }
     }
 
     public func startObserving(

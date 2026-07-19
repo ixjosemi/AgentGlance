@@ -2465,6 +2465,145 @@ func testCodexNotifyMarksTurnComplete() throws {
     try expect(session.attentionReason, equals: .turnComplete, "notify reason")
 }
 
+func testSessionNameOverridesRenameAndPrune() throws {
+    let session = try AgentSession.decode(from: validStateJSON(sessionID: "ses_a", status: "working"))
+    var overrides = SessionNameOverrides()
+    try expect(overrides.displayName(for: session), equals: nil, "no override yet")
+
+    overrides.rename(session, to: "API refactor")
+    try expect(overrides.displayName(for: session), equals: "API refactor", "renamed")
+
+    // A name sticks to the session identity, not to its momentary status.
+    let laterActivity = try AgentSession.decode(from: validStateJSON(sessionID: "ses_a", status: "idle"))
+    try expect(overrides.displayName(for: laterActivity), equals: "API refactor", "survives status change")
+
+    overrides.rename(session, to: "   ")
+    try expect(overrides.displayName(for: session), equals: nil, "blank input clears the override")
+
+    overrides.rename(session, to: "kept")
+    let doomed = try AgentSession.decode(from: validStateJSON(sessionID: "ses_b", status: "working"))
+    overrides.rename(doomed, to: "gone")
+    overrides.prune(keeping: [session])
+    try expect(overrides.displayName(for: session), equals: "kept", "prune keeps live session names")
+    try expect(overrides.displayName(for: doomed), equals: nil, "prune drops dead session names")
+}
+
+func testStateStoreRenamePersistsAcrossRestartsAndPrunesWithSessions() throws {
+    let rootDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let stateDirectory = rootDirectory.appendingPathComponent("state", isDirectory: true)
+    try FileManager.default.createDirectory(at: stateDirectory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: rootDirectory) }
+    let namesFileURL = rootDirectory.appendingPathComponent("session-names.json")
+    let repository = StateRepository(directoryURL: stateDirectory)
+    let session = try AgentSession.decode(
+        from: validStateJSON(sessionID: "ses_named", status: "working", pid: Int32(getpid()))
+    )
+    try repository.save(session)
+
+    let store = StateStore(repository: repository, nameOverridesFileURL: namesFileURL)
+    try store.reload()
+    store.rename(session, to: "Mi pipeline")
+    try expect(store.nameOverrides.displayName(for: session), equals: "Mi pipeline", "renamed in store")
+
+    // A fresh store — the app restarting — reads the same override back.
+    let restartedStore = StateStore(repository: repository, nameOverridesFileURL: namesFileURL)
+    try restartedStore.reload()
+    try expect(
+        restartedStore.nameOverrides.displayName(for: session),
+        equals: "Mi pipeline",
+        "override survives restart"
+    )
+
+    // Once the session document disappears, reload prunes the override and
+    // persists the prune, so dead names never accumulate on disk.
+    try repository.remove(session)
+    try restartedStore.reload()
+    let prunedStore = StateStore(repository: repository, nameOverridesFileURL: namesFileURL)
+    try prunedStore.reload()
+    try expect(
+        prunedStore.nameOverrides.displayName(for: session),
+        equals: nil,
+        "override pruned after session death"
+    )
+}
+
+func testTerminationPlannerClosesOnlyExactContainers() throws {
+    // A tmux session closes its pane and nothing else: the surrounding
+    // Ghostty tab may host other panes, so the tab must stay open.
+    let tmuxSession = try AgentSession.decode(from: Data(
+        #"{"schema_version":1,"tool":"claude","session_id":"kill-tmux","pid":1,"status":"working","attention_reason":null,"cwd":"/tmp/project","started_at":"2026-07-18T10:00:00Z","updated_at":"2026-07-18T10:00:00Z","terminal":{"term_program":"ghostty","ghostty_terminal_id":"terminal-123","tmux_pane":"%3"}}"#.utf8
+    ))
+    try expect(
+        TerminationPlanner.closeActions(for: tmuxSession),
+        equals: [.run(executable: "tmux", arguments: ["kill-pane", "-t", "%3"])],
+        "tmux close actions"
+    )
+
+    // A plain Ghostty tab closes by exact surface id.
+    let ghosttySession = try AgentSession.decode(from: Data(
+        #"{"schema_version":1,"tool":"opencode","session_id":"kill-ghostty","pid":1,"status":"working","attention_reason":null,"cwd":"/tmp/project","started_at":"2026-07-18T10:00:00Z","updated_at":"2026-07-18T10:00:00Z","terminal":{"term_program":"ghostty","ghostty_terminal_id":"terminal-456"}}"#.utf8
+    ))
+    let ghosttyActions = try TerminationPlanner.closeActions(for: ghosttySession)
+    guard case let .appleScript(script)? = ghosttyActions.first, ghosttyActions.count == 1 else {
+        throw TestFailure.expectation("expected a single Ghostty close script, got \(ghosttyActions)")
+    }
+    try expect(script.contains("close"), equals: true, "script closes")
+    try expect(script.contains("terminal-456"), equals: true, "script targets exact id")
+    // Closing is destructive: unlike focusing, no cwd or title heuristics.
+    try expect(script.contains("working directory"), equals: false, "no cwd fallback")
+    try expect(script.contains("name contains"), equals: false, "no title fallback")
+
+    // Without an exact container there is nothing safe to close.
+    let anonymousSession = try AgentSession.decode(
+        from: validStateJSON(sessionID: "kill-anon", status: "working")
+    )
+    try expect(TerminationPlanner.closeActions(for: anonymousSession), equals: [], "no container, no close")
+
+    // A malformed pane id must fail fast, never reach tmux.
+    let corruptSession = try AgentSession.decode(from: Data(
+        #"{"schema_version":1,"tool":"claude","session_id":"kill-bad","pid":1,"status":"working","attention_reason":null,"cwd":"/tmp/project","started_at":"2026-07-18T10:00:00Z","updated_at":"2026-07-18T10:00:00Z","terminal":{"tmux_pane":"%3; rm -rf /"}}"#.utf8
+    ))
+    do {
+        _ = try TerminationPlanner.closeActions(for: corruptSession)
+        throw TestFailure.expectation("malformed tmux pane was accepted")
+    } catch let error as FocusError {
+        try expect(error, equals: .invalidTmuxPane("%3; rm -rf /"), "tmux pane validation")
+    }
+}
+
+func testTerminationServiceKillsPolitelyAndEscalatesToSigkill() throws {
+    func spawn(_ arguments: [String]) throws -> Process {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: arguments[0])
+        process.arguments = Array(arguments.dropFirst())
+        try process.run()
+        return process
+    }
+    func sessionForProcessID(_ processID: Int32) throws -> AgentSession {
+        try AgentSession.decode(
+            from: validStateJSON(sessionID: "kill-\(processID)", status: "working", pid: processID)
+        )
+    }
+
+    // A well-behaved process dies on SIGTERM within the grace period.
+    let polite = try spawn(["/bin/sleep", "60"])
+    try TerminationService.terminate(try sessionForProcessID(polite.processIdentifier), gracePeriod: 2)
+    polite.waitUntilExit()
+    try expect(polite.terminationReason, equals: .uncaughtSignal, "polite process killed by signal")
+
+    // A process ignoring SIGTERM is escalated to SIGKILL after the grace.
+    let stubborn = try spawn(["/bin/sh", "-c", "trap '' TERM; sleep 60"])
+    // Give the shell a beat to install its trap before signaling.
+    usleep(200_000)
+    try TerminationService.terminate(try sessionForProcessID(stubborn.processIdentifier), gracePeriod: 0.3)
+    stubborn.waitUntilExit()
+    try expect(stubborn.terminationReason, equals: .uncaughtSignal, "stubborn process killed by signal")
+
+    // A pid that is already gone is not an error: the goal state holds.
+    try TerminationService.terminate(try sessionForProcessID(polite.processIdentifier), gracePeriod: 0.3)
+}
+
 extension Data {
     func writeAtomically(to url: URL) throws {
         try FileManager.default.createDirectory(
@@ -2555,6 +2694,10 @@ let tests: [(String, () throws -> Void)] = [
     ("front terminal matcher matches by ID and falls back to cwd", testFrontTerminalMatcherMatchesByIDAndFallsBackToWorkingDirectory),
     ("hook input rejects oversized payloads", testHookInputRejectsOversizedPayloads),
     ("Codex notify marks turn complete", testCodexNotifyMarksTurnComplete),
+    ("session name overrides rename and prune", testSessionNameOverridesRenameAndPrune),
+    ("state store rename persists across restarts and prunes", testStateStoreRenamePersistsAcrossRestartsAndPrunesWithSessions),
+    ("termination planner closes only exact containers", testTerminationPlannerClosesOnlyExactContainers),
+    ("termination service kills politely and escalates to SIGKILL", testTerminationServiceKillsPolitelyAndEscalatesToSigkill),
 ]
 
 do {
