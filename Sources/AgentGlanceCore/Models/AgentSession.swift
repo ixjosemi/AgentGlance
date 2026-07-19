@@ -7,6 +7,7 @@ public enum AgentSessionError: Error, Equatable, Sendable {
 public enum AgentTool: String, Codable, CaseIterable, Sendable {
     case claude
     case codex
+    case convoy
     case opencode
     case pi
 }
@@ -74,6 +75,9 @@ public struct AgentSession: Codable, Identifiable, Equatable, Sendable {
     public let updatedAt: Date
     public let terminal: TerminalContext
     public let source: SessionSource?
+    /// The pipeline step a convoy run is currently executing; nil for
+    /// conversational tools, which have no notion of a step.
+    public let currentStep: String?
 
     public var id: String { "\(tool.rawValue)-\(sessionID)" }
     public var projectName: String { URL(fileURLWithPath: cwd).lastPathComponent }
@@ -90,7 +94,8 @@ public struct AgentSession: Codable, Identifiable, Equatable, Sendable {
             startedAt: startedAt,
             updatedAt: updatedAt,
             terminal: terminal,
-            source: source
+            source: source,
+            currentStep: currentStep
         )
     }
 
@@ -105,7 +110,8 @@ public struct AgentSession: Codable, Identifiable, Equatable, Sendable {
         startedAt: Date,
         updatedAt: Date,
         terminal: TerminalContext = TerminalContext(),
-        source: SessionSource? = nil
+        source: SessionSource? = nil,
+        currentStep: String? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.tool = tool
@@ -118,6 +124,7 @@ public struct AgentSession: Codable, Identifiable, Equatable, Sendable {
         self.updatedAt = updatedAt
         self.terminal = terminal
         self.source = source
+        self.currentStep = currentStep
     }
 
     enum CodingKeys: String, CodingKey {
@@ -132,6 +139,7 @@ public struct AgentSession: Codable, Identifiable, Equatable, Sendable {
         case updatedAt = "updated_at"
         case terminal
         case source
+        case currentStep = "current_step"
     }
 
     public static func decode(from data: Data) throws -> AgentSession {

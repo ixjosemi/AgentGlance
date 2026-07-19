@@ -51,6 +51,34 @@ func testVersionOneStateDocumentReconstructsSession() throws {
     try expect(session.projectName, equals: "project", "project name")
 }
 
+func testConvoySessionDecodesCurrentStep() throws {
+    let data = Data(
+        """
+        {
+          "schema_version": 1,
+          "tool": "convoy",
+          "session_id": "20260719-101010-abcd",
+          "pid": 4242,
+          "status": "working",
+          "attention_reason": null,
+          "cwd": "/tmp/project",
+          "started_at": "2026-07-19T10:00:00Z",
+          "updated_at": "2026-07-19T10:05:00Z",
+          "terminal": {},
+          "current_step": "security-audit"
+        }
+        """.utf8
+    )
+
+    let session = try AgentSession.decode(from: data)
+
+    try expect(session.tool, equals: .convoy, "tool")
+    try expect(session.currentStep, equals: "security-audit", "current step")
+
+    let withoutStep = try AgentSession.decode(from: validStateJSON(sessionID: "plain", status: "idle"))
+    try expect(withoutStep.currentStep, equals: nil, "absent step decodes as nil")
+}
+
 func testUnsupportedSchemaVersionIsRejected() throws {
     let data = Data(
         """
@@ -900,11 +928,18 @@ func testNotchWingPlacementSplitsToolsAroundNotch() throws {
         try AgentSession.decode(
             from: validStateJSON(sessionID: "p1", status: "working", tool: "pi")
         ),
+        try AgentSession.decode(
+            from: validStateJSON(sessionID: "v1", status: "working", tool: "convoy")
+        ),
     ]
 
     let placement = NotchWingPlacement.place(ToolSummary.active(in: sessions))
 
-    try expect(placement.leftWing.map(\.tool), equals: [.pi, .codex, .opencode], "left wing order")
+    try expect(
+        placement.leftWing.map(\.tool),
+        equals: [.convoy, .pi, .codex, .opencode],
+        "left wing order"
+    )
     try expect(placement.rightWing.map(\.tool), equals: [.claude], "right wing")
 
     let opencodeOnly = NotchWingPlacement.place(
@@ -2135,6 +2170,7 @@ extension Data {
 
 let tests: [(String, () throws -> Void)] = [
     ("version 1 state document reconstructs session", testVersionOneStateDocumentReconstructsSession),
+    ("convoy session decodes current step", testConvoySessionDecodesCurrentStep),
     ("unsupported schema version is rejected", testUnsupportedSchemaVersionIsRejected),
     ("state repository reconstructs sessions from disk", testStateRepositoryReconstructsSessionsFromDisk),
     ("missing state directory loads as empty", testMissingStateDirectoryLoadsAsEmpty),

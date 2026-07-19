@@ -360,6 +360,7 @@ private struct SessionMenuCard: View {
     private var displayName: String {
         switch tool {
         case .claude: "Claude Code"
+        case .convoy: "Convoy"
         case .opencode: "OpenCode"
         case .codex: "Codex"
         case .pi: "Pi"
