@@ -25,20 +25,15 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
 
 @MainActor
 final class NotchPanelController {
+    private let store: StateStore
     private let panel: NotchPanel
-    private let layout: NotchLayout
+    private var layout: NotchLayout
     private var hostingView: NotchHostingView<NotchWidgetView>?
+    private var screenObserver: NSObjectProtocol?
 
     init(store: StateStore) {
-        let screen = NSScreen.main ?? NSScreen.screens.first
-        layout = NotchLayout(
-            screenMinX: screen?.frame.minX ?? 0,
-            screenWidth: screen?.frame.width ?? 1_512,
-            screenMaxY: screen?.frame.maxY ?? 982,
-            safeAreaTop: screen?.safeAreaInsets.top ?? 0,
-            leftNotchEdgeX: screen?.auxiliaryTopLeftArea?.maxX,
-            rightNotchEdgeX: screen?.auxiliaryTopRightArea?.minX
-        )
+        self.store = store
+        layout = Self.currentLayout()
         panel = NotchPanel(
             contentRect: NSRect(x: 0, y: 0, width: layout.width, height: layout.expandedHeight),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -52,6 +47,49 @@ final class NotchPanelController {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = false
+        applyLayout()
+        // Display changes — docking, resolution switches, lid state —
+        // invalidate every notch metric, so the panel re-derives its layout
+        // from the current screen instead of keeping the launch-time one.
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.layout = Self.currentLayout()
+                self.applyLayout()
+            }
+        }
+    }
+
+    deinit {
+        if let screenObserver {
+            NotificationCenter.default.removeObserver(screenObserver)
+        }
+    }
+
+    func show() {
+        panel.orderFrontRegardless()
+    }
+
+    private static func currentLayout() -> NotchLayout {
+        let screen = NSScreen.main ?? NSScreen.screens.first
+        return NotchLayout(
+            screenMinX: screen?.frame.minX ?? 0,
+            screenWidth: screen?.frame.width ?? 1_512,
+            screenMaxY: screen?.frame.maxY ?? 982,
+            safeAreaTop: screen?.safeAreaInsets.top ?? 0,
+            leftNotchEdgeX: screen?.auxiliaryTopLeftArea?.maxX,
+            rightNotchEdgeX: screen?.auxiliaryTopRightArea?.minX
+        )
+    }
+
+    /// Builds the hosting view for the current layout and pins the panel to
+    /// the notch. Rebuilding collapses an open menu, which is the right
+    /// outcome when the screen the menu was measured for just changed.
+    private func applyLayout() {
         let controller = self
         let hostingView = NotchHostingView(rootView: NotchWidgetView(
             store: store,
@@ -72,12 +110,8 @@ final class NotchPanelController {
                 width: layout.width,
                 height: layout.expandedHeight
             ),
-            display: false
+            display: true
         )
-    }
-
-    func show() {
-        panel.orderFrontRegardless()
     }
 
     private func setMenuVisible(_ isVisible: Bool) {
