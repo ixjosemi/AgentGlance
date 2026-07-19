@@ -6,6 +6,7 @@ import AgentGlanceCore
 struct AgentGlanceSettingsView: View {
     let store: StateStore?
     @AppStorage("hideWhenEmpty") private var hideWhenEmpty = false
+    @AppStorage("attentionSoundEnabled") private var attentionSoundEnabled = true
     @State private var loginItemEnabled = SMAppService.mainApp.status == .enabled
     @State private var errorMessage: String?
 
@@ -17,6 +18,7 @@ struct AgentGlanceSettingsView: View {
                     set: updateLoginItem
                 ))
                 Toggle("Hide when no sessions are active", isOn: $hideWhenEmpty)
+                Toggle("Play the alert sound when a session needs you", isOn: $attentionSoundEnabled)
             }
             Section {
                 Button("Reset custom session names") {

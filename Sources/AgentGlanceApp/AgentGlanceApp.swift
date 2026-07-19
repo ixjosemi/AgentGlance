@@ -35,6 +35,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .appendingPathComponent(".agentglance/session-names.json")
         )
         self.store = store
+        // The system alert sound respects the user's chosen sound and alert
+        // volume; a session turning red is exactly what it exists for.
+        UserDefaults.standard.register(defaults: ["attentionSoundEnabled": true])
+        store.onAttentionRaised = { _ in
+            guard UserDefaults.standard.bool(forKey: "attentionSoundEnabled") else { return }
+            NSSound.beep()
+        }
         do {
             // Directory events and Darwin notifications deliver state changes
             // immediately; polling is only a 30-second safety heartbeat.

@@ -2591,6 +2591,40 @@ func testStateStoreClearsAllSessionNames() throws {
     )
 }
 
+func testStateStoreRaisesAttentionOnlyOnTransitionsIntoRed() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let store = StateStore(repository: repository)
+    var raisedBatches: [[String]] = []
+    store.onAttentionRaised = { raisedBatches.append($0.map(\.sessionID)) }
+
+    // The first reload is a baseline: sessions already waiting when the app
+    // launches must not chime — a reinstall would beep spuriously.
+    try repository.save(AgentSession.decode(
+        from: validStateJSON(sessionID: "already-red", status: "needs_attention", pid: Int32(getpid()))
+    ))
+    try store.reload()
+    try expect(raisedBatches, equals: [], "baseline reload stays silent")
+
+    // A session transitioning into red raises once, then stays quiet while
+    // it remains red.
+    try repository.save(AgentSession.decode(
+        from: validStateJSON(sessionID: "turns-red", status: "working", pid: Int32(getpid()))
+    ))
+    try store.reload()
+    try expect(raisedBatches, equals: [], "green session raises nothing")
+    try repository.save(AgentSession.decode(
+        from: validStateJSON(sessionID: "turns-red", status: "needs_attention", pid: Int32(getpid()))
+    ))
+    try store.reload()
+    try expect(raisedBatches, equals: [["turns-red"]], "transition into red raises once")
+    try store.reload()
+    try expect(raisedBatches, equals: [["turns-red"]], "still-red session does not re-raise")
+}
+
 func testTerminationPlannerClosesOnlyExactContainers() throws {
     // A tmux session closes its pane and nothing else: the surrounding
     // Ghostty tab may host other panes, so the tab must stay open.
@@ -2826,6 +2860,7 @@ let tests: [(String, () throws -> Void)] = [
     ("session title formatter cleans tab titles", testSessionTitleFormatterCleansTabTitles),
     ("state store display name prefers override then tab title", testStateStoreDisplayNamePrefersOverrideThenTabTitle),
     ("state store clears all session names", testStateStoreClearsAllSessionNames),
+    ("state store raises attention only on transitions into red", testStateStoreRaisesAttentionOnlyOnTransitionsIntoRed),
 ]
 
 do {

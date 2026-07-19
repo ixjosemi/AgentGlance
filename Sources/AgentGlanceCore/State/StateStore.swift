@@ -34,8 +34,15 @@ public final class StateStore {
     public private(set) var acknowledgments = AttentionAcknowledgments()
     public private(set) var nameOverrides = SessionNameOverrides()
 
+    /// Invoked from `reload()` with the sessions that just transitioned into
+    /// `.needsAttention` — at most once per reload, never on the baseline
+    /// load. The app layer hangs the notification chime on it.
+    public var onAttentionRaised: (([AgentSession]) -> Void)?
+
     private let repository: StateRepository
     private let nameOverridesFileURL: URL?
+    // nil until the first reload establishes the baseline.
+    private var previousAttentionSessionIDs: Set<String>?
     private var pollingTimer: Timer?
     private var directorySource: DispatchSourceFileSystemObject?
     private var observesDarwinNotifications = false
@@ -63,6 +70,7 @@ public final class StateStore {
             .filter { $0.status != .ended }
             .sorted(by: Self.precedes)
         acknowledgments.prune(keeping: sessions)
+        raiseNewlyWaitingSessions()
         let prunedOverrides = {
             var overrides = nameOverrides
             overrides.prune(keeping: sessions)
@@ -93,6 +101,19 @@ public final class StateStore {
     /// Row title precedence: a manual rename always wins, then the cleaned
     /// live tab title (the reaper refreshes `windowTitleHint` from the
     /// Ghostty scan each tick), then the directory name.
+    private func raiseNewlyWaitingSessions() {
+        let attentionSessionIDs = Set(
+            sessions.filter { $0.status == .needsAttention }.map(\.id)
+        )
+        defer { previousAttentionSessionIDs = attentionSessionIDs }
+        guard let previousAttentionSessionIDs else { return }
+        let newlyRaised = sessions.filter {
+            $0.status == .needsAttention && !previousAttentionSessionIDs.contains($0.id)
+        }
+        guard !newlyRaised.isEmpty else { return }
+        onAttentionRaised?(newlyRaised)
+    }
+
     /// Drops every custom session name, in memory and on disk — the reset
     /// offered from Settings.
     public func clearAllSessionNames() {
