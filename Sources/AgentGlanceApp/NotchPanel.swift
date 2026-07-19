@@ -4,7 +4,11 @@ import SwiftUI
 import AgentGlanceCore
 
 final class NotchPanel: NSPanel {
-    override var canBecomeKey: Bool { false }
+    /// The panel must never steal keyboard focus from the frontmost app —
+    /// except while the user edits a session name inline, when the rename
+    /// field needs key status to receive typing.
+    var allowsKeyboardFocus = false
+    override var canBecomeKey: Bool { allowsKeyboardFocus }
     override var canBecomeMain: Bool { false }
 }
 
@@ -98,7 +102,8 @@ final class NotchPanelController {
             leftContentWidth: layout.leftContentWidth,
             rightContentWidth: layout.rightContentWidth,
             barHeight: layout.height,
-            onMenuVisibilityChange: { controller.setMenuVisible($0) }
+            onMenuVisibilityChange: { controller.setMenuVisible($0) },
+            onKeyboardFocusChange: { controller.setKeyboardFocus($0) }
         ))
         hostingView.interactiveHeight = layout.height
         self.hostingView = hostingView
@@ -116,5 +121,14 @@ final class NotchPanelController {
 
     private func setMenuVisible(_ isVisible: Bool) {
         hostingView?.interactiveHeight = isVisible ? layout.expandedHeight : layout.height
+    }
+
+    private func setKeyboardFocus(_ wantsKeyboard: Bool) {
+        panel.allowsKeyboardFocus = wantsKeyboard
+        if wantsKeyboard {
+            panel.makeKey()
+        } else if panel.isKeyWindow {
+            panel.resignKey()
+        }
     }
 }

@@ -12,11 +12,13 @@ struct NotchWidgetView: View {
     let rightContentWidth: CGFloat
     let barHeight: CGFloat
     let onMenuVisibilityChange: (Bool) -> Void
+    let onKeyboardFocusChange: (Bool) -> Void
 
     @State private var expandedTool: AgentTool?
     @State private var collapseWorkItem: DispatchWorkItem?
     @State private var isHoveringPanel = false
     @State private var openMenuTrackingCount = 0
+    @State private var rowInteractionActive = false
 
     var body: some View {
         // The bar semaphore ignores waiting sessions the user has already
@@ -47,8 +49,13 @@ struct NotchWidgetView: View {
                             dismiss: collapseMenu,
                             acknowledge: { store.acknowledge($0) },
                             sessionTitle: { store.displayName(for: $0) },
-                            requestRename: promptRename,
-                            requestKill: confirmKill
+                            overrideName: { store.nameOverrides.displayName(for: $0) },
+                            rename: { store.rename($0, to: $1) },
+                            setKeyboardFocus: onKeyboardFocusChange,
+                            onRowInteractionChange: { isActive in
+                                rowInteractionActive = isActive
+                                if !isActive { settleAfterDetachedInteraction() }
+                            }
                         )
                         .frame(width: barWidth)
                         .transition(.opacity)
@@ -173,11 +180,14 @@ struct NotchWidgetView: View {
 
     /// Collapse shortly after the pointer leaves the notch surface, mirroring
     /// how notch utilities dismiss; the grace period tolerates brief exits.
-    /// While a context menu is open the pointer legitimately lives outside
-    /// the panel, so collapsing is deferred until the menu closes.
+    /// While a menu is open or a row interaction — inline rename, kill
+    /// confirmation — is underway, collapsing is deferred until it ends.
     private func scheduleCollapseOnHoverExit(_ isHovering: Bool) {
         collapseWorkItem?.cancel()
-        guard !isHovering, expandedTool != nil, openMenuTrackingCount == 0 else { return }
+        guard !isHovering,
+              expandedTool != nil,
+              openMenuTrackingCount == 0,
+              !rowInteractionActive else { return }
         let workItem = DispatchWorkItem { expandedTool = nil }
         collapseWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: workItem)
@@ -191,58 +201,6 @@ struct NotchWidgetView: View {
         scheduleCollapseOnHoverExit(false)
     }
 
-    // MARK: Session actions
-
-    private func promptRename(_ session: AgentSession) {
-        let alert = NSAlert()
-        alert.messageText = "Rename Session"
-        alert.informativeText = "The name only changes how this session is listed in AgentGlance."
-        let nameField = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        nameField.stringValue = store.nameOverrides.displayName(for: session) ?? ""
-        nameField.placeholderString = session.projectName
-        alert.accessoryView = nameField
-        alert.addButton(withTitle: "Rename")
-        alert.addButton(withTitle: "Cancel")
-        alert.window.initialFirstResponder = nameField
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
-            store.rename(session, to: nameField.stringValue)
-        }
-        settleAfterDetachedInteraction()
-    }
-
-    private func confirmKill(_ session: AgentSession) {
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Kill \(store.displayName(for: session))?"
-        alert.informativeText =
-            "Terminates the \(session.tool.rawValue) process and closes its terminal pane."
-        alert.addButton(withTitle: "Kill Session").hasDestructiveAction = true
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        let confirmed = alert.runModal() == .alertFirstButtonReturn
-        settleAfterDetachedInteraction()
-        guard confirmed else { return }
-        // The kill waits up to two grace periods; keep it off the main
-        // thread. The state document needs no cleanup here: the scheduler's
-        // exit watcher sees the death and the reaper removes it on its tick.
-        Task.detached(priority: .userInitiated) {
-            do {
-                try TerminationService.terminate(session)
-            } catch {
-                await MainActor.run { presentKillFailure(error) }
-            }
-        }
-    }
-
-    private func presentKillFailure(_ error: Error) {
-        let alert = NSAlert()
-        alert.alertStyle = .critical
-        alert.messageText = "Could not kill the session"
-        alert.informativeText = String(describing: error)
-        alert.runModal()
-        settleAfterDetachedInteraction()
-    }
 }
 
 // MARK: - Tool indicator
@@ -387,9 +345,13 @@ private struct SessionMenuCard: View {
     let dismiss: () -> Void
     let acknowledge: (AgentSession) -> Void
     let sessionTitle: (AgentSession) -> String
-    let requestRename: (AgentSession) -> Void
-    let requestKill: (AgentSession) -> Void
+    let overrideName: (AgentSession) -> String?
+    let rename: (AgentSession, String) -> Void
+    let setKeyboardFocus: (Bool) -> Void
+    let onRowInteractionChange: (Bool) -> Void
     @State private var errorMessage: String?
+    // At most one row shows its inline actions; opening another closes it.
+    @State private var actionsSessionID: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -417,13 +379,7 @@ private struct SessionMenuCard: View {
             } else if sessions.count <= 5 {
                 VStack(spacing: 0) {
                     ForEach(sessions) { session in
-                        SessionRow(
-                            session: session,
-                            title: sessionTitle(session),
-                            focus: focusSession,
-                            requestRename: requestRename,
-                            requestKill: requestKill
-                        )
+                        row(for: session)
                     }
                 }
                 .padding(.bottom, 8)
@@ -432,13 +388,7 @@ private struct SessionMenuCard: View {
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 0) {
                         ForEach(sessions) { session in
-                            SessionRow(
-                            session: session,
-                            title: sessionTitle(session),
-                            focus: focusSession,
-                            requestRename: requestRename,
-                            requestKill: requestKill
-                        )
+                            row(for: session)
                         }
                     }
                 }
@@ -456,6 +406,30 @@ private struct SessionMenuCard: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.bottom, 6)
+        // The whole panel can collapse while a row interaction is open;
+        // the interaction lock must not outlive the card.
+        .onDisappear { onRowInteractionChange(false) }
+    }
+
+    private func row(for session: AgentSession) -> some View {
+        SessionRow(
+            session: session,
+            title: sessionTitle(session),
+            renamePrefill: overrideName(session) ?? "",
+            isActionsExpanded: actionsSessionID == session.id,
+            toggleActions: { toggleActions(for: session) },
+            focus: focusSession,
+            rename: rename,
+            kill: killSession,
+            setKeyboardFocus: setKeyboardFocus
+        )
+    }
+
+    private func toggleActions(for session: AgentSession) {
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.9)) {
+            actionsSessionID = actionsSessionID == session.id ? nil : session.id
+        }
+        onRowInteractionChange(actionsSessionID != nil)
     }
 
     private var displayName: String {
@@ -465,6 +439,21 @@ private struct SessionMenuCard: View {
         case .opencode: "OpenCode"
         case .codex: "Codex"
         case .pi: "Pi"
+        }
+    }
+
+    /// The kill waits up to two grace periods; keep it off the main thread.
+    /// The state document needs no cleanup here: the scheduler's exit
+    /// watcher sees the death and the reaper removes it on its tick.
+    private func killSession(_ session: AgentSession) {
+        Task.detached(priority: .userInitiated) {
+            do {
+                try TerminationService.terminate(session)
+            } catch {
+                await MainActor.run {
+                    errorMessage = "Could not kill this session."
+                }
+            }
         }
     }
 
@@ -491,99 +480,56 @@ private struct SessionMenuCard: View {
 private struct SessionRow: View {
     let session: AgentSession
     let title: String
+    let renamePrefill: String
+    let isActionsExpanded: Bool
+    let toggleActions: () -> Void
     let focus: (AgentSession) -> Void
-    let requestRename: (AgentSession) -> Void
-    let requestKill: (AgentSession) -> Void
+    let rename: (AgentSession, String) -> Void
+    let kill: (AgentSession) -> Void
+    let setKeyboardFocus: (Bool) -> Void
+
+    /// Sub-modes of the inline action area: the button strip, the rename
+    /// field, or the kill confirmation. All live inside the row itself so
+    /// nothing ever floats outside the notch silhouette.
+    private enum ActionMode { case menu, renaming, confirmingKill }
+
     @State private var isHovered = false
     @State private var branchName: String?
+    @State private var mode: ActionMode = .menu
+    @State private var renameDraft = ""
+    @FocusState private var renameFieldIsFocused: Bool
 
     var body: some View {
-        Button {
-            focus(session)
-        } label: {
-            HStack(spacing: 10) {
-                if session.status == .working {
-                    WorkingIndicator()
-                } else {
-                    Circle()
-                        .fill(semaphoreColor(for: session.status))
-                        .frame(width: 8, height: 8)
-                }
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(title)
-                        .font(.system(size: 13, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.94))
-                        .lineLimit(1)
-                    // A pipeline's current step outranks the branch: convoy
-                    // targets worktrees whose directory name already carries
-                    // the branch, and the step is what changes over time.
-                    if let currentStep = session.currentStep {
-                        HStack(spacing: 3) {
-                            Image(systemName: "point.3.filled.connected.trianglepath.dotted")
-                                .font(.system(size: 8, weight: .semibold))
-                            Text(currentStep)
-                                .font(.system(size: 10, design: .monospaced))
-                        }
-                        .foregroundStyle(.white.opacity(0.55))
-                        .lineLimit(1)
-                    } else if let branch = branchName {
-                        HStack(spacing: 3) {
-                            Image(systemName: "arrow.triangle.branch")
-                                .font(.system(size: 8, weight: .semibold))
-                            Text(branch)
-                                .font(.system(size: 10, design: .monospaced))
-                        }
-                        .foregroundStyle(.white.opacity(0.55))
-                        .lineLimit(1)
-                    }
-                }
-                Spacer(minLength: 8)
-                // The system wakes this view on minute boundaries while the
-                // row is on screen — no timers, no polling while collapsed.
-                TimelineView(.everyMinute) { context in
-                    Text(SessionDurationFormatter.string(from: session.startedAt, to: context.date))
-                        .font(.system(size: 10, weight: .medium, design: .rounded))
-                        .monospacedDigit()
-                        .foregroundStyle(.white.opacity(0.45))
-                }
+        VStack(spacing: 0) {
+            Button {
+                focus(session)
+            } label: {
+                mainRow.contentShape(Rectangle())
             }
-            .padding(.horizontal, 14)
-            .frame(height: sessionRowHeight)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(.white.opacity(isHovered ? 0.08 : 0))
-                    .padding(.horizontal, 6)
-            )
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            // A right (or control) click expands the actions inline instead
+            // of opening a floating menu; the catcher passes every other
+            // event through to the focus button underneath.
+            .overlay(RightClickCatcher(onRightClick: toggleActions))
+            if isActionsExpanded {
+                actionArea
+                    .padding(.leading, 32)
+                    .padding(.trailing, 20)
+                    .padding(.bottom, 9)
+                    .transition(.opacity)
+            }
         }
-        .buttonStyle(.plain)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.white.opacity(isHovered || isActionsExpanded ? 0.08 : 0))
+                .padding(.horizontal, 6)
+        )
         .onHover { isHovered = $0 }
-        .contextMenu {
-            Button {
-                requestRename(session)
-            } label: {
-                Label("Rename Session…", systemImage: "pencil")
-            }
-            Button {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(session.cwd, forType: .string)
-            } label: {
-                Label("Copy Project Path", systemImage: "doc.on.doc")
-            }
-            Button {
-                NSWorkspace.shared.activateFileViewerSelecting(
-                    [URL(fileURLWithPath: session.cwd)]
-                )
-            } label: {
-                Label("Reveal in Finder", systemImage: "folder")
-            }
-            Divider()
-            Button(role: .destructive) {
-                requestKill(session)
-            } label: {
-                Label("Kill Session", systemImage: "xmark.octagon")
-            }
+        .onChange(of: isActionsExpanded) { _, _ in
+            endRenameKeyboard()
+            mode = .menu
         }
+        .onDisappear { endRenameKeyboard() }
         // Resolving the branch reads .git/HEAD from disk; the render path
         // must not pay for it on every body evaluation. Menu rows are
         // transient, so a branch switched mid-display refreshes on the
@@ -594,5 +540,207 @@ private struct SessionRow: View {
             }.value
         }
         .accessibilityLabel("\(title), \(session.status.rawValue)")
+    }
+
+    private var mainRow: some View {
+        HStack(spacing: 10) {
+            if session.status == .working {
+                WorkingIndicator()
+            } else {
+                Circle()
+                    .fill(semaphoreColor(for: session.status))
+                    .frame(width: 8, height: 8)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.94))
+                    .lineLimit(1)
+                // A pipeline's current step outranks the branch: convoy
+                // targets worktrees whose directory name already carries
+                // the branch, and the step is what changes over time.
+                if let currentStep = session.currentStep {
+                    HStack(spacing: 3) {
+                        Image(systemName: "point.3.filled.connected.trianglepath.dotted")
+                            .font(.system(size: 8, weight: .semibold))
+                        Text(currentStep)
+                            .font(.system(size: 10, design: .monospaced))
+                    }
+                    .foregroundStyle(.white.opacity(0.55))
+                    .lineLimit(1)
+                } else if let branch = branchName {
+                    HStack(spacing: 3) {
+                        Image(systemName: "arrow.triangle.branch")
+                            .font(.system(size: 8, weight: .semibold))
+                        Text(branch)
+                            .font(.system(size: 10, design: .monospaced))
+                    }
+                    .foregroundStyle(.white.opacity(0.55))
+                    .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 8)
+            // The system wakes this view on minute boundaries while the
+            // row is on screen — no timers, no polling while collapsed.
+            TimelineView(.everyMinute) { context in
+                Text(SessionDurationFormatter.string(from: session.startedAt, to: context.date))
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.white.opacity(0.45))
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(height: sessionRowHeight)
+    }
+
+    @ViewBuilder
+    private var actionArea: some View {
+        switch mode {
+        case .menu:
+            HStack(spacing: 6) {
+                actionButton("Rename", systemImage: "pencil") { beginRename() }
+                actionButton("Copy Path", systemImage: "doc.on.doc") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(session.cwd, forType: .string)
+                    toggleActions()
+                }
+                actionButton("Finder", systemImage: "folder") {
+                    NSWorkspace.shared.activateFileViewerSelecting(
+                        [URL(fileURLWithPath: session.cwd)]
+                    )
+                    toggleActions()
+                }
+                Spacer(minLength: 0)
+                actionButton("Kill", systemImage: "xmark.octagon", isDestructive: true) {
+                    mode = .confirmingKill
+                }
+            }
+        case .renaming:
+            HStack(spacing: 6) {
+                TextField(session.projectName, text: $renameDraft)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .focused($renameFieldIsFocused)
+                    .onSubmit(commitRename)
+                    .onExitCommand(perform: cancelRename)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(.white.opacity(0.1))
+                    )
+                actionButton("Save", systemImage: "checkmark", action: commitRename)
+                actionButton("Cancel", systemImage: "xmark", action: cancelRename)
+            }
+        case .confirmingKill:
+            HStack(spacing: 6) {
+                Text("Kill the process and close its pane?")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.white.opacity(0.7))
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                actionButton("Kill", systemImage: "xmark.octagon", isDestructive: true) {
+                    kill(session)
+                    toggleActions()
+                }
+                actionButton("Cancel", systemImage: "arrow.uturn.backward") { mode = .menu }
+            }
+        }
+    }
+
+    private func actionButton(
+        _ label: String,
+        systemImage: String,
+        isDestructive: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 8, weight: .semibold))
+                Text(label)
+                    .font(.system(size: 10, weight: .medium))
+            }
+            .foregroundStyle(isDestructive ? Color.red.opacity(0.9) : .white.opacity(0.75))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Capsule().fill(.white.opacity(0.08)))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func beginRename() {
+        renameDraft = renamePrefill
+        mode = .renaming
+        // The panel refuses key status except during this edit; grant it
+        // first, then focus the field once the window can accept it.
+        setKeyboardFocus(true)
+        DispatchQueue.main.async { renameFieldIsFocused = true }
+    }
+
+    private func commitRename() {
+        rename(session, renameDraft)
+        endRenameKeyboard()
+        toggleActions()
+    }
+
+    private func cancelRename() {
+        endRenameKeyboard()
+        mode = .menu
+    }
+
+    private func endRenameKeyboard() {
+        guard mode == .renaming else { return }
+        renameFieldIsFocused = false
+        setKeyboardFocus(false)
+    }
+}
+
+/// Claims right and control clicks for the inline action toggle and lets
+/// every other event — left clicks, hover, scroll — fall through to the
+/// SwiftUI row underneath.
+private struct RightClickCatcher: NSViewRepresentable {
+    let onRightClick: () -> Void
+
+    func makeNSView(context: Context) -> RightClickForwardingView {
+        let view = RightClickForwardingView()
+        view.onRightClick = onRightClick
+        return view
+    }
+
+    func updateNSView(_ view: RightClickForwardingView, context: Context) {
+        view.onRightClick = onRightClick
+    }
+}
+
+private final class RightClickForwardingView: NSView {
+    var onRightClick: (() -> Void)?
+
+    override func rightMouseDown(with event: NSEvent) {
+        onRightClick?()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        // Control-click is the trackpad spelling of a right click.
+        if event.modifierFlags.contains(.control) {
+            onRightClick?()
+        }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard bounds.contains(convert(point, from: superview)),
+              let event = NSApp.currentEvent else {
+            return nil
+        }
+        switch event.type {
+        case .rightMouseDown, .rightMouseUp:
+            return self
+        case .leftMouseDown where event.modifierFlags.contains(.control):
+            return self
+        default:
+            return nil
+        }
     }
 }
