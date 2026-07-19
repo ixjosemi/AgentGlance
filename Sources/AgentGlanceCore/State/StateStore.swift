@@ -78,10 +78,14 @@ public final class StateStore {
             try startDirectoryObservation()
         }
         if layers.contains(.polling), let pollInterval {
-            pollingTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) {
+            let timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) {
                 [weak self] _ in
                 self?.reloadRecordingError()
             }
+            // Polling is only a safety net behind the event-driven layers;
+            // tolerance lets the kernel coalesce the wakeup with other timers.
+            timer.tolerance = pollInterval / 5
+            pollingTimer = timer
         }
     }
 

@@ -32,9 +32,13 @@ final class FocusAcknowledgmentObserver {
         }
         // Tab switches inside Ghostty fire no workspace notification, so a
         // slow poll covers them; the guards below make idle ticks free.
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        let timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.checkFrontTerminal() }
         }
+        // Acknowledgment latency is invisible below half a second; tolerance
+        // lets the kernel coalesce the wakeup with other timers.
+        timer.tolerance = 0.5
+        pollTimer = timer
     }
 
     func stop() {

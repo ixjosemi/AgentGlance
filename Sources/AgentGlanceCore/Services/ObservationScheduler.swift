@@ -48,12 +48,16 @@ public final class ObservationScheduler {
         stop()
         requestTick()
         workQueue.async { [weak self] in self?.startCodexDirectorySource() }
-        heartbeatTimer = Timer.scheduledTimer(
+        let timer = Timer.scheduledTimer(
             withTimeInterval: heartbeatInterval,
             repeats: true
         ) { [weak self] _ in
             self?.requestTick()
         }
+        // A late heartbeat is indistinguishable from a slow one; tolerance
+        // lets the kernel coalesce the wakeup with other timers.
+        timer.tolerance = heartbeatInterval / 5
+        heartbeatTimer = timer
     }
 
     public func stop() {
