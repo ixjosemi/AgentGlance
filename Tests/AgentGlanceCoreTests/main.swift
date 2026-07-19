@@ -371,6 +371,36 @@ func testReaperReapsAgainstProvidedScan() throws {
     try expect(session.cwd, equals: "/tmp/shared-scan", "fallback cwd")
 }
 
+func testReaperRebindsDaemonHostedSessionToVisibleProcess() throws {
+    // The OpenCode plugin runs inside the detached `opencode2 serve` daemon,
+    // so its state documents record the daemon PID — alive forever and never
+    // present in a scan. Such a session must adopt the PID of the visible
+    // same-tool process in its directory: no duplicate fallback appears and
+    // the session dies with the terminal instead of outliving it.
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let now = Date(timeIntervalSince1970: 100)
+    try repository.save(AgentSession(
+        tool: .opencode, sessionID: "daemon-doc", pid: 1, status: .idle,
+        cwd: "/tmp/oc-project", startedAt: now, updatedAt: now
+    ))
+    let visibleProcess = DetectedAgentProcess(
+        tool: .opencode,
+        processID: Int32(getpid()),
+        cwd: "/tmp/oc-project",
+        terminal: TerminalContext(tty: "/dev/ttys001")
+    )
+
+    let result = try ReaperService(repository: repository).reap(detected: [visibleProcess])
+
+    try expect(result.createdSessionIDs, equals: [], "no fallback for an adopted process")
+    let session = try repository.loadSessions().first.unwrap(or: "daemon session disappeared")
+    try expect(session.sessionID, equals: "daemon-doc", "session identity survives")
+    try expect(session.pid, equals: Int32(getpid()), "session adopts the visible PID")
+}
+
 func testObservationSchedulerTickPersistsFallbackState() throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1811,6 +1841,7 @@ let tests: [(String, () throws -> Void)] = [
     ("reaper deletes state for dead process", testReaperDeletesStateForDeadProcess),
     ("reaper creates fallback state for untracked process", testReaperCreatesFallbackStateForUntrackedProcess),
     ("reaper reaps against provided scan", testReaperReapsAgainstProvidedScan),
+    ("reaper rebinds daemon-hosted session to visible process", testReaperRebindsDaemonHostedSessionToVisibleProcess),
     ("observation scheduler tick persists fallback state", testObservationSchedulerTickPersistsFallbackState),
     ("observation scheduler reaps immediately when process exits", testObservationSchedulerReapsImmediatelyWhenProcessExits),
     ("observation scheduler coalesces tick bursts", testObservationSchedulerCoalescesTickBursts),

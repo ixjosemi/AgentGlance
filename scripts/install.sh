@@ -42,7 +42,7 @@ step "Installing app to $app_destination"
 /bin/rm -rf "$app_destination"
 /usr/bin/ditto .build/AgentGlance.app "$app_destination"
 
-step "Wiring agent hooks (Claude Code / OpenCode / Codex)"
+step "Wiring agent hooks (Claude Code / OpenCode / Codex / Pi)"
 "$app_destination/Contents/Resources/bin/agentglance" install
 
 step "Launching AgentGlance"
@@ -62,3 +62,5 @@ step "Verifying installation (agentglance doctor)"
 "$app_destination/Contents/Resources/bin/agentglance" doctor
 
 /usr/bin/printf '\nAll good. Agents already running must be restarted to pick up the hooks.\n'
+/usr/bin/printf 'OpenCode loads plugins in its background service: also run\n'
+/usr/bin/printf '  pkill -f "opencode2 serve" (a fresh one starts with the next opencode)\n'
