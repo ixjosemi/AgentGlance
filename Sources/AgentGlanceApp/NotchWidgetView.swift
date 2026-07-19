@@ -410,7 +410,19 @@ private struct SessionRow: View {
                         .font(.system(size: 13, weight: .semibold, design: .rounded))
                         .foregroundStyle(.white.opacity(0.94))
                         .lineLimit(1)
-                    if let branch = branchName {
+                    // A pipeline's current step outranks the branch: convoy
+                    // targets worktrees whose directory name already carries
+                    // the branch, and the step is what changes over time.
+                    if let currentStep = session.currentStep {
+                        HStack(spacing: 3) {
+                            Image(systemName: "point.3.filled.connected.trianglepath.dotted")
+                                .font(.system(size: 8, weight: .semibold))
+                            Text(currentStep)
+                                .font(.system(size: 10, design: .monospaced))
+                        }
+                        .foregroundStyle(.white.opacity(0.55))
+                        .lineLimit(1)
+                    } else if let branch = branchName {
                         HStack(spacing: 3) {
                             Image(systemName: "arrow.triangle.branch")
                                 .font(.system(size: 8, weight: .semibold))

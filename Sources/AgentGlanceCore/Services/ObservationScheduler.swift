@@ -13,6 +13,7 @@ public final class ObservationScheduler {
     private let repository: StateRepository
     private let processScanner: any ProcessScanning
     private let codexSessionsDirectoryURL: URL
+    private let convoyRunsDirectoryURL: URL
     private let heartbeatInterval: TimeInterval
     private let debounceInterval: TimeInterval
     private let workQueue = DispatchQueue(
@@ -23,6 +24,7 @@ public final class ObservationScheduler {
 
     // Only touched on workQueue.
     private var codexWatcher: CodexSessionsWatcher?
+    private var convoyWatcher: ConvoyRunsWatcher?
     private var codexProcessMap: [String: Int32] = [:]
     private var codexDirectorySource: DispatchSourceFileSystemObject?
     private var exitWatchers: [pid_t: DispatchSourceProcess] = [:]
@@ -32,6 +34,7 @@ public final class ObservationScheduler {
         repository: StateRepository,
         processScanner: any ProcessScanning = SystemProcessScanner(),
         codexSessionsDirectoryURL: URL? = nil,
+        convoyRunsDirectoryURL: URL? = nil,
         heartbeatInterval: TimeInterval = 5,
         debounceInterval: TimeInterval = 0.3
     ) {
@@ -40,6 +43,9 @@ public final class ObservationScheduler {
         self.codexSessionsDirectoryURL = codexSessionsDirectoryURL
             ?? FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".codex/sessions", isDirectory: true)
+        self.convoyRunsDirectoryURL = convoyRunsDirectoryURL
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".convoy/runs", isDirectory: true)
         self.heartbeatInterval = heartbeatInterval
         self.debounceInterval = debounceInterval
     }
@@ -105,7 +111,24 @@ public final class ObservationScheduler {
             NSLog("AgentGlance reaper failed: %@", String(describing: error))
         }
         refreshCodexWatcher(detected: detected)
+        scanConvoyRuns(detected: detected)
         refreshExitWatchers(detected: detected)
+    }
+
+    /// Convoy needs no directory event source: its metadata changes on
+    /// phase transitions, minutes apart, so the heartbeat cadence is
+    /// plenty and the watcher's mtime cache keeps each pass cheap.
+    private func scanConvoyRuns(detected: [DetectedAgentProcess]) {
+        let watcher = convoyWatcher ?? ConvoyRunsWatcher(
+            runsDirectoryURL: convoyRunsDirectoryURL,
+            repository: repository
+        )
+        convoyWatcher = watcher
+        do {
+            try watcher.scan(detected: detected)
+        } catch {
+            NSLog("AgentGlance convoy watcher failed: %@", String(describing: error))
+        }
     }
 
     /// Registers a kernel exit notification (EVFILT_PROC) per tracked agent
