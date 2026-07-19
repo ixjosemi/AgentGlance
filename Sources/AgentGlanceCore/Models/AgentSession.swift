@@ -21,7 +21,6 @@ public enum SessionStatus: String, Codable, Sendable {
 
 public enum AttentionReason: String, Codable, Sendable {
     case permission
-    case idlePrompt = "idle_prompt"
     case turnComplete = "turn_complete"
 }
 

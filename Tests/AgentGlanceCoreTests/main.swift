@@ -287,6 +287,22 @@ func testClaudePermissionNotificationRequestsAttention() throws {
     try expect(session.status, equals: .needsAttention, "session status")
     try expect(session.attentionReason, equals: .permission, "attention reason")
     try expect(session.startedAt, equals: Date(timeIntervalSince1970: 100), "original start time")
+
+    let idleNudge = Data(
+        #"{"session_id":"claude-1","cwd":"/tmp/project","notification_type":"idle_prompt"}"#.utf8
+    )
+    try processor.process(
+        event: "Notification",
+        payload: idleNudge,
+        environment: [:],
+        processID: 4321,
+        now: Date(timeIntervalSince1970: 300)
+    )
+
+    let nudged = try StateRepository(directoryURL: directory).loadSessions().first
+        .unwrap(or: "session was not saved")
+    try expect(nudged.status, equals: .needsAttention, "idle nudge keeps pending permission red")
+    try expect(nudged.attentionReason, equals: .permission, "idle nudge keeps permission reason")
 }
 
 func testClaudeLifecycleEventsProduceExpectedStates() throws {
@@ -307,8 +323,8 @@ func testClaudeLifecycleEventsProduceExpectedStates() throws {
         (
             "Notification",
             #"{"session_id":"claude-1","cwd":"/tmp/project","notification_type":"idle_prompt"}"#,
-            .needsAttention,
-            .idlePrompt
+            .idle,
+            nil
         ),
         ("UserPromptSubmit", basePayload, .working, nil),
         ("Stop", basePayload, .idle, nil),

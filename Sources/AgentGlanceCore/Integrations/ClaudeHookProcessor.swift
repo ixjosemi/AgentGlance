@@ -63,7 +63,11 @@ public struct ClaudeHookProcessor: Sendable {
         case "Notification" where notificationType == "permission_prompt":
             return (.needsAttention, .permission)
         case "Notification" where notificationType == "idle_prompt":
-            return (.needsAttention, .idlePrompt)
+            // Claude Code nudges "still waiting for your input" a minute
+            // after the turn ends. The row already shows amber for exactly
+            // that; escalating to red (and chiming) would drown the real
+            // needs-you signal, so the nudge carries no status change.
+            return (existing?.status ?? .idle, existing?.attentionReason)
         case "Notification":
             throw ClaudeHookError.unsupportedNotification(notificationType)
         case "UserPromptSubmit":
