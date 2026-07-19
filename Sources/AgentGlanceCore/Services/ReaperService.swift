@@ -50,6 +50,7 @@ public struct ReaperService: Sendable {
             let processKey = "\(process.tool.rawValue)-\(process.processID)"
             if let existing = tracked[processKey] {
                 try refreshFallback(existing, from: process)
+                try adoptScannedTerminal(existing, from: process)
                 continue
             }
             let sessionID = "reaper-\(process.processID)"
@@ -168,6 +169,45 @@ public struct ReaperService: Sendable {
             updatedAt: Date(),
             terminal: process.terminal,
             source: .reaper
+        ))
+    }
+
+    /// Hook- and plugin-written documents cannot see which Ghostty surface
+    /// hosts their process (hooks capture env, which carries no surface ID;
+    /// plugins run in daemons), so focusing them falls back to title
+    /// heuristics that break as soon as agents rewrite tab titles. The
+    /// process scan resolves the exact surface per process — the document
+    /// adopts its identifier, keeping its own tty/tmux context and its
+    /// updatedAt: enrichment is not activity.
+    private func adoptScannedTerminal(
+        _ session: AgentSession,
+        from process: DetectedAgentProcess
+    ) throws {
+        guard session.source != .reaper,
+              let scannedTerminalID = process.terminal.ghosttyTerminalID,
+              session.terminal.ghosttyTerminalID != scannedTerminalID else {
+            return
+        }
+        try repository.save(AgentSession(
+            tool: session.tool,
+            sessionID: session.sessionID,
+            pid: session.pid,
+            status: session.status,
+            attentionReason: session.attentionReason,
+            cwd: session.cwd,
+            startedAt: session.startedAt,
+            updatedAt: session.updatedAt,
+            terminal: TerminalContext(
+                termProgram: process.terminal.termProgram ?? session.terminal.termProgram,
+                ghosttyTerminalID: scannedTerminalID,
+                itermSessionID: session.terminal.itermSessionID,
+                tmuxPane: session.terminal.tmuxPane ?? process.terminal.tmuxPane,
+                tty: session.terminal.tty ?? process.terminal.tty,
+                windowTitleHint: process.terminal.windowTitleHint
+                    ?? session.terminal.windowTitleHint
+            ),
+            source: session.source,
+            currentStep: session.currentStep
         ))
     }
 

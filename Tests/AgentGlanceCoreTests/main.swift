@@ -463,6 +463,64 @@ func testReaperRebindsDaemonHostedSessionToVisibleProcess() throws {
     try expect(session.pid, equals: Int32(getpid()), "session adopts the visible PID")
 }
 
+func testReaperAdoptsScannedGhosttyTerminalForNativeSession() throws {
+    // Hook- and plugin-written documents cannot know which Ghostty surface
+    // hosts their process, so focusing them falls back to title heuristics
+    // that break as soon as agents rewrite tab titles. The process scan
+    // resolves the exact surface — native documents must adopt it.
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let writtenAt = Date(timeIntervalSince1970: 1_000)
+    try repository.save(AgentSession(
+        tool: .opencode,
+        sessionID: "native-doc",
+        pid: Int32(getpid()),
+        status: .working,
+        cwd: "/tmp/oc-project",
+        startedAt: writtenAt,
+        updatedAt: writtenAt,
+        terminal: TerminalContext(
+            termProgram: "ghostty",
+            tty: "/dev/ttys009",
+            windowTitleHint: "oc-project — opencode"
+        )
+    ))
+    let scannedProcess = DetectedAgentProcess(
+        tool: .opencode,
+        processID: Int32(getpid()),
+        cwd: "/tmp/oc-project",
+        terminal: TerminalContext(
+            termProgram: "ghostty",
+            ghosttyTerminalID: "term-42",
+            windowTitleHint: "🟢 live agent title"
+        )
+    )
+
+    _ = try ReaperService(repository: repository).reap(detected: [scannedProcess])
+
+    let session = try repository.loadSessions().first.unwrap(or: "native session disappeared")
+    try expect(session.terminal.ghosttyTerminalID, equals: "term-42", "adopted terminal ID")
+    try expect(session.terminal.tty, equals: "/dev/ttys009", "document tty preserved")
+    try expect(session.terminal.windowTitleHint, equals: "🟢 live agent title", "live title adopted")
+    try expect(session.updatedAt, equals: writtenAt, "enrichment is not activity")
+
+    // A second pass with the same scan must not rewrite the document.
+    let fileURL = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        .first { $0.pathExtension == "json" }
+        .unwrap(or: "state file missing")
+    let firstPassData = try Data(contentsOf: fileURL)
+    let firstPassModifiedAt = try fileURL.resourceValues(forKeys: [.contentModificationDateKey])
+        .contentModificationDate
+    usleep(100_000)
+    _ = try ReaperService(repository: repository).reap(detected: [scannedProcess])
+    try expect(try Data(contentsOf: fileURL), equals: firstPassData, "document content stable")
+    let secondPassModifiedAt = try fileURL.resourceValues(forKeys: [.contentModificationDateKey])
+        .contentModificationDate
+    try expect(secondPassModifiedAt, equals: firstPassModifiedAt, "document not rewritten")
+}
+
 func testReaperPrunesSupersededSessionsForSameProcess() throws {
     // A terminal shows one session at a time, so several documents pointing
     // at the same process describe at most one visible session — the most
@@ -2436,6 +2494,7 @@ let tests: [(String, () throws -> Void)] = [
     ("reaper creates fallback state for untracked process", testReaperCreatesFallbackStateForUntrackedProcess),
     ("reaper reaps against provided scan", testReaperReapsAgainstProvidedScan),
     ("reaper rebinds daemon-hosted session to visible process", testReaperRebindsDaemonHostedSessionToVisibleProcess),
+    ("reaper adopts scanned Ghostty terminal for native session", testReaperAdoptsScannedGhosttyTerminalForNativeSession),
     ("reaper prunes superseded sessions for same process", testReaperPrunesSupersededSessionsForSameProcess),
     ("reaper prefers native session over newer fallback", testReaperPrefersNativeSessionOverNewerFallback),
     ("observation scheduler tick persists fallback state", testObservationSchedulerTickPersistsFallbackState),
