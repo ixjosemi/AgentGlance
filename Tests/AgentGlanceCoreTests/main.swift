@@ -1669,6 +1669,37 @@ func testInstallerFollowsUserOwnedSymlinkedIntegrationDirectories() throws {
     )
 }
 
+func testInstallerPrependsCodexNotifyBeforeExistingContent() throws {
+    // A multi-line TOML value may continue on a line that begins with "[",
+    // so inserting before the first such line can land inside a value. The
+    // only position that is safe for a root-table key regardless of the
+    // existing content is the top of the file.
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let home = root.appendingPathComponent("home")
+    try FileManager.default.createDirectory(
+        at: home.appendingPathComponent(".codex"),
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    let existingConfig = """
+    targets = [
+        ["a", "b"],
+    ]
+
+    [profiles.fast]
+    model = "gpt-5"
+
+    """
+    let configURL = home.appendingPathComponent(".codex/config.toml")
+    try Data(existingConfig.utf8).write(to: configURL)
+
+    try Installer(homeDirectoryURL: home, executableURL: Bundle.main.executableURL!).install()
+
+    let config = try String(contentsOf: configURL, encoding: .utf8)
+    try expect(config.hasPrefix("notify = "), equals: true, "notify line leads the file")
+    try expect(config.contains(existingConfig), equals: true, "existing content preserved verbatim")
+}
+
 func testInstallationDoctorReportsHealthyInstall() throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     let home = root.appendingPathComponent("home")
@@ -1883,6 +1914,7 @@ let tests: [(String, () throws -> Void)] = [
     ("Claude settings quotes hook paths for the shell", testClaudeSettingsQuotesHookPathsForTheShell),
     ("installer rejects symlinked private directory", testInstallerRejectsSymlinkedPrivateDirectory),
     ("installer follows user-owned symlinked integration directories", testInstallerFollowsUserOwnedSymlinkedIntegrationDirectories),
+    ("installer prepends codex notify before existing content", testInstallerPrependsCodexNotifyBeforeExistingContent),
     ("installation doctor reports healthy install", testInstallationDoctorReportsHealthyInstall),
     ("installation doctor pinpoints broken pieces", testInstallationDoctorPinpointsBrokenPieces),
     ("CLI parses doctor command", testCLIParsesDoctorCommand),

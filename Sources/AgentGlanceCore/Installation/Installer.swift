@@ -157,12 +157,11 @@ public struct Installer {
             let script = hookDirectory.appendingPathComponent("codex-notify.sh").path
                 .replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"")
-            let notificationLine = "notify = [\"\(script)\"]\n\n"
-            if let firstTable = config.range(of: #"(?m)^\s*\["#, options: .regularExpression) {
-                config.insert(contentsOf: notificationLine, at: firstTable.lowerBound)
-            } else {
-                config += "\n\(notificationLine)"
-            }
+            // `notify` must live in the root table, which ends at the first
+            // table header. A multi-line value may continue on a line that
+            // begins with "[", so the top of the file is the only insertion
+            // point that is safe regardless of the existing content.
+            config = "notify = [\"\(script)\"]\n\n" + config
             try Data(config.utf8).write(to: configURL, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
         }
