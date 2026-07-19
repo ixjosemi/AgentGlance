@@ -1357,6 +1357,57 @@ func spawnFakeAgent(
     )
 }
 
+func testGhosttyTerminalQueryCacheAvoidsRedundantQueries() throws {
+    final class QueryCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+
+        func increment() {
+            lock.lock()
+            defer { lock.unlock() }
+            value += 1
+        }
+
+        var count: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+    let counter = QueryCounter()
+    let terminals = [GhosttyTerminal(id: "1", name: "tab", cwd: "/tmp/project")]
+    let cache = GhosttyTerminalQueryCache(timeToLive: 30) {
+        counter.increment()
+        return terminals
+    }
+    let start = Date(timeIntervalSince1970: 1_000_000)
+
+    try expect(
+        cache.terminals(hostingProcessIDs: [100], now: start),
+        equals: terminals,
+        "first query returns terminals"
+    )
+    try expect(
+        cache.terminals(hostingProcessIDs: [100], now: start.addingTimeInterval(5)),
+        equals: terminals,
+        "fresh cache returns terminals"
+    )
+    try expect(counter.count, equals: 1, "fresh same-topology call is served from cache")
+    _ = cache.terminals(hostingProcessIDs: [100, 200], now: start.addingTimeInterval(6))
+    try expect(counter.count, equals: 2, "a topology change refreshes immediately")
+    _ = cache.terminals(hostingProcessIDs: [100, 200], now: start.addingTimeInterval(60))
+    try expect(counter.count, equals: 3, "an expired cache refreshes")
+
+    let failureCounter = QueryCounter()
+    let failingCache = GhosttyTerminalQueryCache(timeToLive: 30) {
+        failureCounter.increment()
+        return nil
+    }
+    _ = failingCache.terminals(hostingProcessIDs: [100], now: start)
+    _ = failingCache.terminals(hostingProcessIDs: [100], now: start.addingTimeInterval(1))
+    try expect(failureCounter.count, equals: 2, "failed queries are never cached")
+}
+
 func testProcessScannerDetectsSpawnedAgentProcessWithinBudget() throws {
     let agent = try spawnFakeAgent(named: "codex")
     defer { agent.tearDown() }
@@ -1903,6 +1954,7 @@ let tests: [(String, () throws -> Void)] = [
     ("focus planner prioritizes tmux then terminal", testFocusPlannerPrioritizesTmuxThenTerminal),
     ("Ghostty matcher excludes orphaned processes and assigns exact terminals", testGhosttyMatcherExcludesOrphanedProcessesAndAssignsExactTerminals),
     ("Ghostty matcher prefers same-directory terminal naming the tool", testGhosttyMatcherPrefersSameDirectoryTerminalNamingTheTool),
+    ("Ghostty terminal query cache avoids redundant queries", testGhosttyTerminalQueryCacheAvoidsRedundantQueries),
     ("process scanner detects spawned agent process within budget", testProcessScannerDetectsSpawnedAgentProcessWithinBudget),
     ("process scanner ignores lookalike process names", testProcessScannerIgnoresLookalikeProcessNames),
     ("process scanner detects script runtime agents", testProcessScannerDetectsScriptRuntimeAgents),

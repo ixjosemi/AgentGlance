@@ -32,14 +32,27 @@ public struct SystemProcessScanner: ProcessScanning {
     /// cannot be queried. Injectable so behavioral tests stay deterministic.
     public typealias GhosttyTerminalSource = @Sendable () -> [GhosttyTerminal]?
 
-    private let ghosttyTerminalSource: GhosttyTerminalSource
+    private let terminalQueryCache: GhosttyTerminalQueryCache
 
     public init() {
-        self.init(ghosttyTerminalSource: { try? SystemProcessScanner.queryGhosttyTerminals() })
+        // 30 s keeps tab titles reasonably fresh while cutting the osascript
+        // spawn from every 5 s tick to twice a minute; a changed process set
+        // still refreshes immediately.
+        self.init(terminalQueryCache: GhosttyTerminalQueryCache(timeToLive: 30) {
+            try? SystemProcessScanner.queryGhosttyTerminals()
+        })
     }
 
+    /// A zero TTL preserves the injected source's call-per-scan semantics.
     public init(ghosttyTerminalSource: @escaping GhosttyTerminalSource) {
-        self.ghosttyTerminalSource = ghosttyTerminalSource
+        self.init(terminalQueryCache: GhosttyTerminalQueryCache(
+            timeToLive: 0,
+            query: ghosttyTerminalSource
+        ))
+    }
+
+    private init(terminalQueryCache: GhosttyTerminalQueryCache) {
+        self.terminalQueryCache = terminalQueryCache
     }
 
     public func activeProcesses() throws -> [DetectedAgentProcess] {
@@ -48,7 +61,9 @@ public struct SystemProcessScanner: ProcessScanning {
         )
         let ghosttyProcesses = detected.filter { $0.terminal.termProgram == "ghostty" }
         guard !ghosttyProcesses.isEmpty,
-              let terminals = ghosttyTerminalSource() else {
+              let terminals = terminalQueryCache.terminals(
+                  hostingProcessIDs: Set(ghosttyProcesses.map(\.processID))
+              ) else {
             return detected
         }
         let nonGhosttyProcesses = detected.filter { $0.terminal.termProgram != "ghostty" }
