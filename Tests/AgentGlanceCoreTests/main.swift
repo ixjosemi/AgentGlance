@@ -1437,6 +1437,37 @@ func testInstallationDoctorPinpointsBrokenPieces() throws {
     )
 }
 
+func testFrontTerminalMatcherMatchesByIDAndFallsBackToWorkingDirectory() throws {
+    func session(_ sessionID: String, terminalID: String?, cwd: String) -> AgentSession {
+        AgentSession(
+            tool: .claude,
+            sessionID: sessionID,
+            pid: 1,
+            status: .idle,
+            cwd: cwd,
+            startedAt: Date(timeIntervalSince1970: 0),
+            updatedAt: Date(timeIntervalSince1970: 0),
+            terminal: TerminalContext(termProgram: "ghostty", ghosttyTerminalID: terminalID)
+        )
+    }
+    let front = GhosttyFrontTerminal(terminalID: "77", workingDirectory: "/Users/me/project/")
+    let exactMatch = session("exact", terminalID: "77", cwd: "/somewhere/else")
+    let cwdFallback = session("fallback", terminalID: nil, cwd: "/Users/me/project")
+    let otherTab = session("other-tab", terminalID: "12", cwd: "/Users/me/project")
+    let otherDirectory = session("other-dir", terminalID: nil, cwd: "/Users/me/elsewhere")
+
+    let focused = FrontTerminalMatcher.sessionsFocused(
+        by: front,
+        among: [exactMatch, cwdFallback, otherTab, otherDirectory]
+    )
+
+    try expect(
+        focused.map(\.sessionID),
+        equals: ["exact", "fallback"],
+        "exact ID wins; missing ID falls back to cwd; a known different tab never matches"
+    )
+}
+
 func testCLIParsesDoctorCommand() throws {
     try expect(try CLICommand.parse(arguments: ["doctor"]), equals: .doctor, "CLI command")
 }
@@ -1549,6 +1580,7 @@ let tests: [(String, () throws -> Void)] = [
     ("installation doctor reports healthy install", testInstallationDoctorReportsHealthyInstall),
     ("installation doctor pinpoints broken pieces", testInstallationDoctorPinpointsBrokenPieces),
     ("CLI parses doctor command", testCLIParsesDoctorCommand),
+    ("front terminal matcher matches by ID and falls back to cwd", testFrontTerminalMatcherMatchesByIDAndFallsBackToWorkingDirectory),
     ("hook input rejects oversized payloads", testHookInputRejectsOversizedPayloads),
     ("Codex notify marks turn complete", testCodexNotifyMarksTurnComplete),
 ]

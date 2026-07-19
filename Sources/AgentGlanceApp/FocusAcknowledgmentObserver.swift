@@ -56,28 +56,35 @@ final class FocusAcknowledgmentObserver {
             (session.status == .idle || session.status == .needsAttention)
                 && !store.acknowledgments.isAcknowledged(session)
                 && session.terminal.termProgram == "ghostty"
-                && session.terminal.ghosttyTerminalID != nil
         }
         guard !waitingSessions.isEmpty else { return }
         queryInFlight = true
         Task.detached(priority: .utility) {
-            let frontTerminalID = Self.queryFrontTerminalID()
+            let frontTerminal = Self.queryFrontTerminal()
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.queryInFlight = false
-                guard let frontTerminalID else { return }
-                for session in waitingSessions
-                where session.terminal.ghosttyTerminalID == frontTerminalID {
+                guard let frontTerminal else { return }
+                for session in FrontTerminalMatcher.sessionsFocused(
+                    by: frontTerminal,
+                    among: waitingSessions
+                ) {
                     self.store.acknowledge(session)
                 }
             }
         }
     }
 
-    private nonisolated static func queryFrontTerminalID() -> String? {
+    private nonisolated static func queryFrontTerminal() -> GhosttyFrontTerminal? {
+        let script = """
+        tell application "Ghostty"
+            set t to front terminal
+            return (id of t as text) & linefeed & (working directory of t)
+        end tell
+        """
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", "tell application \"Ghostty\" to get id of front terminal"]
+        process.arguments = ["-e", script]
         let output = Pipe()
         process.standardOutput = output
         process.standardError = Pipe()
@@ -89,8 +96,15 @@ final class FocusAcknowledgmentObserver {
         process.waitUntilExit()
         guard process.terminationStatus == 0 else { return nil }
         let data = output.fileHandleForReading.readDataToEndOfFile()
-        let identifier = String(decoding: data, as: UTF8.self)
+        let lines = String(decoding: data, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return identifier.isEmpty ? nil : identifier
+            .components(separatedBy: "\n")
+        guard let identifier = lines.first, !identifier.isEmpty else { return nil }
+        let workingDirectory = lines.dropFirst().first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return GhosttyFrontTerminal(
+            terminalID: identifier,
+            workingDirectory: (workingDirectory?.isEmpty ?? true) ? nil : workingDirectory
+        )
     }
 }
