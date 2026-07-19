@@ -41,8 +41,15 @@ public enum GhosttySessionMatcher {
         for process: DetectedAgentProcess,
         in terminals: [GhosttyTerminal]
     ) -> Int? {
-        if let exact = terminals.firstIndex(where: { !$0.cwd.isEmpty && $0.cwd == process.cwd }) {
-            return exact
+        let sameDirectory = terminals.indices.filter {
+            !terminals[$0].cwd.isEmpty && terminals[$0].cwd == process.cwd
+        }
+        if !sameDirectory.isEmpty {
+            // Several tabs can share one project directory; the tab whose
+            // title names the tool is the one hosting this agent.
+            return sameDirectory.first {
+                terminals[$0].name.lowercased().contains(process.tool.rawValue)
+            } ?? sameDirectory.first
         }
         let projectName = URL(fileURLWithPath: process.cwd).lastPathComponent.lowercased()
         guard projectName.count >= 8, projectName != "development" else { return nil }

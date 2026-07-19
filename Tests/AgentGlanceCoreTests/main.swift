@@ -1203,6 +1203,45 @@ func testGhosttyMatcherExcludesOrphanedProcessesAndAssignsExactTerminals() throw
     )
 }
 
+func testGhosttyMatcherPrefersSameDirectoryTerminalNamingTheTool() throws {
+    // Several tabs often share one project directory (claude and opencode
+    // side by side). The tab whose title names the tool must win, so the
+    // session row shows — and focus jumps to — the right tab.
+    let processes = [
+        DetectedAgentProcess(
+            tool: .opencode,
+            processID: 21,
+            cwd: "/tmp/shared-project",
+            terminal: TerminalContext(termProgram: "ghostty"),
+            elapsedSeconds: 10
+        ),
+        DetectedAgentProcess(
+            tool: .claude,
+            processID: 22,
+            cwd: "/tmp/shared-project",
+            terminal: TerminalContext(termProgram: "ghostty"),
+            elapsedSeconds: 20
+        ),
+    ]
+    let terminals = [
+        GhosttyTerminal(id: "claude-tab", name: "shared-project — claude", cwd: "/tmp/shared-project"),
+        GhosttyTerminal(id: "opencode-tab", name: "shared-project — opencode", cwd: "/tmp/shared-project"),
+    ]
+
+    let matched = GhosttySessionMatcher.match(processes: processes, terminals: terminals)
+
+    try expect(
+        matched.first(where: { $0.tool == .opencode })?.terminal.ghosttyTerminalID,
+        equals: "opencode-tab",
+        "opencode terminal"
+    )
+    try expect(
+        matched.first(where: { $0.tool == .claude })?.terminal.ghosttyTerminalID,
+        equals: "claude-tab",
+        "claude terminal"
+    )
+}
+
 func detectedProcess(id: Int32, cwd: String, elapsed: TimeInterval) -> DetectedAgentProcess {
     DetectedAgentProcess(
         tool: .opencode,
@@ -1801,6 +1840,7 @@ let tests: [(String, () throws -> Void)] = [
     ("Codex sessions watcher processes appended lines incrementally", testCodexSessionsWatcherProcessesAppendedLinesIncrementally),
     ("focus planner prioritizes tmux then terminal", testFocusPlannerPrioritizesTmuxThenTerminal),
     ("Ghostty matcher excludes orphaned processes and assigns exact terminals", testGhosttyMatcherExcludesOrphanedProcessesAndAssignsExactTerminals),
+    ("Ghostty matcher prefers same-directory terminal naming the tool", testGhosttyMatcherPrefersSameDirectoryTerminalNamingTheTool),
     ("process scanner detects spawned agent process within budget", testProcessScannerDetectsSpawnedAgentProcessWithinBudget),
     ("process scanner ignores lookalike process names", testProcessScannerIgnoresLookalikeProcessNames),
     ("process scanner detects script runtime agents", testProcessScannerDetectsScriptRuntimeAgents),
