@@ -18,6 +18,10 @@ final class NotchPanel: NSPanel {
 /// pass-through for the transparent strip below the notch is handled here.
 final class NotchHostingView<Content: View>: NSHostingView<Content> {
     var interactiveHeight: CGFloat = 0
+    /// 0 means no horizontal limit. The pill claims only its own silhouette
+    /// so the menu bar beside it keeps receiving clicks; notch mode keeps
+    /// the full wings-and-notch strip interactive.
+    var interactiveWidth: CGFloat = 0
 
     /// The panel never becomes key, so every click arrives as a "first
     /// mouse" while another app is frontmost. Accepting it makes the first
@@ -28,6 +32,9 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
         let local = superview.map { convert(point, from: $0) } ?? point
         let distanceFromTop = isFlipped ? local.y : bounds.height - local.y
         guard distanceFromTop <= interactiveHeight else { return nil }
+        if interactiveWidth > 0 {
+            guard abs(local.x - bounds.midX) <= interactiveWidth / 2 else { return nil }
+        }
         return super.hitTest(point)
     }
 }
@@ -39,6 +46,7 @@ final class NotchPanelController {
     private var layout: NotchLayout
     private var hostingView: NotchHostingView<NotchWidgetView>?
     private var screenObserver: NSObjectProtocol?
+    private var activationObserver: NSObjectProtocol?
 
     init(store: StateStore) {
         self.store = store
@@ -66,9 +74,21 @@ final class NotchPanelController {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self else { return }
-                self.layout = Self.currentLayout()
-                self.applyLayout()
+                self?.relayoutIfScreenChanged()
+            }
+        }
+        // The widget follows the screen the user is working on: activating
+        // an app on another display moves the key window — and NSScreen.main
+        // — there. This panel never activates, so clicking the widget itself
+        // does not trigger a jump; the equality check makes every other
+        // activation a cheap no-op until the active screen actually changes.
+        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.relayoutIfScreenChanged()
             }
         }
     }
@@ -77,21 +97,36 @@ final class NotchPanelController {
         if let screenObserver {
             NotificationCenter.default.removeObserver(screenObserver)
         }
+        if let activationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
+        }
     }
 
     func show() {
         panel.orderFrontRegardless()
     }
 
+    private func relayoutIfScreenChanged() {
+        let current = Self.currentLayout()
+        guard current != layout else { return }
+        layout = current
+        applyLayout()
+    }
+
     private static func currentLayout() -> NotchLayout {
         let screen = NSScreen.main ?? NSScreen.screens.first
+        // frame minus visible frame isolates the menu bar strip: the Dock
+        // can eat into the sides or bottom of a screen, never into the top
+        // edge, so the difference is the real menu bar height.
+        let menuBarHeight = screen.map { $0.frame.maxY - $0.visibleFrame.maxY } ?? 0
         return NotchLayout(
             screenMinX: screen?.frame.minX ?? 0,
             screenWidth: screen?.frame.width ?? 1_512,
             screenMaxY: screen?.frame.maxY ?? 982,
             safeAreaTop: screen?.safeAreaInsets.top ?? 0,
             leftNotchEdgeX: screen?.auxiliaryTopLeftArea?.maxX,
-            rightNotchEdgeX: screen?.auxiliaryTopRightArea?.minX
+            rightNotchEdgeX: screen?.auxiliaryTopRightArea?.minX,
+            menuBarHeight: menuBarHeight
         )
     }
 
@@ -102,11 +137,8 @@ final class NotchPanelController {
         let controller = self
         let hostingView = NotchHostingView(rootView: NotchWidgetView(
             store: store,
-            notchWidth: layout.notchWidth,
-            leftContentWidth: layout.leftContentWidth,
-            rightContentWidth: layout.rightContentWidth,
-            barHeight: layout.height,
-            onMenuVisibilityChange: { controller.setMenuVisible($0) },
+            layout: layout,
+            onInteractiveSizeChange: { controller.setInteractiveSize($0) },
             onKeyboardFocusChange: { controller.setKeyboardFocus($0) }
         ))
         hostingView.interactiveHeight = layout.height
@@ -123,8 +155,9 @@ final class NotchPanelController {
         )
     }
 
-    private func setMenuVisible(_ isVisible: Bool) {
-        hostingView?.interactiveHeight = isVisible ? layout.expandedHeight : layout.height
+    private func setInteractiveSize(_ size: CGSize) {
+        hostingView?.interactiveHeight = size.height
+        hostingView?.interactiveWidth = size.width
     }
 
     private func setKeyboardFocus(_ wantsKeyboard: Bool) {

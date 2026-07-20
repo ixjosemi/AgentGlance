@@ -1088,16 +1088,48 @@ func testNotchWingPlacementSplitsToolsAroundNotch() throws {
 
     try expect(
         placement.leftWing.map(\.tool),
-        equals: [.convoy, .pi, .codex, .opencode],
-        "left wing order"
+        equals: [.convoy, .pi, .codex],
+        "five tools split three left in canonical order"
     )
-    try expect(placement.rightWing.map(\.tool), equals: [.claude], "right wing")
+    try expect(
+        placement.rightWing.map(\.tool),
+        equals: [.opencode, .claude],
+        "five tools split two right"
+    )
 
     let opencodeOnly = NotchWingPlacement.place(
         ToolSummary.active(in: [sessions[1]])
     )
     try expect(opencodeOnly.leftWing.map(\.tool), equals: [.opencode], "left wing solo opencode")
     try expect(opencodeOnly.rightWing.isEmpty, equals: true, "right wing empty")
+}
+
+func testNotchWingPlacementBalancesToolsAcrossWings() throws {
+    func sessions(_ tools: [AgentTool]) throws -> [AgentSession] {
+        try tools.enumerated().map { index, tool in
+            try AgentSession.decode(
+                from: validStateJSON(sessionID: "s\(index)", status: "working", tool: tool.rawValue)
+            )
+        }
+    }
+
+    let two = NotchWingPlacement.place(
+        ToolSummary.active(in: try sessions([.opencode, .convoy]))
+    )
+    try expect(two.leftWing.map(\.tool), equals: [.convoy], "two tools: one per side")
+    try expect(two.rightWing.map(\.tool), equals: [.opencode], "two tools: one per side")
+
+    let three = NotchWingPlacement.place(
+        ToolSummary.active(in: try sessions([.claude, .codex, .convoy]))
+    )
+    try expect(three.leftWing.map(\.tool), equals: [.convoy, .codex], "three tools: two left")
+    try expect(three.rightWing.map(\.tool), equals: [.claude], "three tools: one right")
+
+    let four = NotchWingPlacement.place(
+        ToolSummary.active(in: try sessions([.pi, .claude, .codex, .convoy]))
+    )
+    try expect(four.leftWing.map(\.tool), equals: [.convoy, .pi], "four tools: two and two")
+    try expect(four.rightWing.map(\.tool), equals: [.codex, .claude], "four tools: two and two")
 }
 
 func testAttentionAcknowledgmentsSilenceVisitedSessionsUntilNewActivity() throws {
@@ -1212,17 +1244,112 @@ func testNotchLayoutExtendsFromLeftSideOfHardwareNotch() throws {
         rightNotchEdgeX: 846
     )
 
-    try expect(layout.width, equals: 432, "maximum panel width")
+    try expect(layout.presentation, equals: .notch, "a screen with a camera housing keeps the notch")
+    try expect(layout.width, equals: 449, "maximum panel width")
     try expect(layout.height, equals: 38, "collapsed panel height")
     try expect(layout.expandedHeight, equals: 398, "expanded panel height")
-    try expect(layout.originX, equals: 484, "panel x")
+    try expect(layout.originX, equals: 506, "panel x")
     try expect(layout.originY, equals: 944, "panel y")
-    try expect(layout.leftContentWidth, equals: 182, "maximum left wing width")
-    try expect(layout.rightContentWidth, equals: 70, "maximum right wing width")
+    try expect(layout.leftContentWidth, equals: 160, "maximum left wing width")
+    try expect(layout.rightContentWidth, equals: 109, "balanced wings give the right side two slots")
     try expect(layout.notchWidth, equals: 180, "hardware notch width")
-    try expect(NotchLayout.wingWidth(activeToolCount: 1), equals: 70, "one-tool wing")
-    try expect(NotchLayout.wingWidth(activeToolCount: 2), equals: 126, "two-tool wing")
-    try expect(NotchLayout.wingWidth(activeToolCount: 3), equals: 182, "three-tool wing")
+    try expect(NotchLayout.wingWidth(activeToolCount: 1), equals: 58, "one-tool wing")
+    try expect(NotchLayout.wingWidth(activeToolCount: 2), equals: 109, "two-tool wing")
+    try expect(NotchLayout.wingWidth(activeToolCount: 3), equals: 160, "three-tool wing")
+}
+
+func testNotchLayoutUsesPillStyleOnNotchlessScreen() throws {
+    // A Studio Display: no safe area, no camera housing, a real 24 pt menu
+    // bar. The bar becomes a floating pill instead of a notch-attached bar.
+    let layout = NotchLayout(
+        screenMinX: 0,
+        screenWidth: 2_560,
+        screenMaxY: 1_440,
+        safeAreaTop: 0,
+        leftNotchEdgeX: nil,
+        rightNotchEdgeX: nil,
+        menuBarHeight: 24
+    )
+
+    try expect(layout.presentation, equals: .pill, "notchless screen gets the pill")
+    try expect(layout.notchWidth, equals: 0, "no phantom camera gap")
+    try expect(layout.height, equals: 22, "pill fits inside the real 24 pt menu bar")
+    try expect(layout.originY, equals: 1_417, "floats inside the menu bar, never over windows")
+    try expect(layout.width, equals: 340, "panel wide enough for the session menu card")
+    try expect(layout.originX, equals: 1_110, "centered on screen")
+    try expect(layout.expandedHeight, equals: 382, "menu hangs below the pill")
+}
+
+func testNotchLayoutPillFallsBackToStandardMenuBarHeight() throws {
+    let layout = NotchLayout(
+        screenMinX: 0,
+        screenWidth: 2_560,
+        screenMaxY: 1_440,
+        safeAreaTop: 0,
+        leftNotchEdgeX: nil,
+        rightNotchEdgeX: nil,
+        menuBarHeight: 0
+    )
+
+    try expect(layout.height, equals: 22, "standard 24 pt menu bar minus pill insets")
+}
+
+func testNotchLayoutSidePaddingsCenterThePill() throws {
+    let pill = NotchLayout(
+        screenMinX: 0,
+        screenWidth: 2_560,
+        screenMaxY: 1_440,
+        safeAreaTop: 0,
+        leftNotchEdgeX: nil,
+        rightNotchEdgeX: nil,
+        menuBarHeight: 24
+    )
+
+    let collapsed = pill.sidePaddings(leftWidth: 0, rightWidth: 70, menuVisible: false)
+    try expect(collapsed.leading, equals: 135, "visible bar centered when only Claude is active")
+    try expect(collapsed.trailing, equals: 135, "pill padding stays symmetric")
+    let expanded = pill.sidePaddings(leftWidth: 0, rightWidth: 70, menuVisible: true)
+    try expect(expanded.leading, equals: 0, "expanded menu spans the full panel")
+    try expect(expanded.trailing, equals: 0, "expanded menu spans the full panel")
+
+    let notched = NotchLayout(
+        screenMinX: 0,
+        screenWidth: 1_512,
+        screenMaxY: 982,
+        safeAreaTop: 38,
+        leftNotchEdgeX: 666,
+        rightNotchEdgeX: 846
+    )
+    let pinned = notched.sidePaddings(leftWidth: 109, rightWidth: 58, menuVisible: false)
+    try expect(pinned.leading, equals: 51, "notch pins the left wing against the camera")
+    try expect(pinned.trailing, equals: 51, "notch pins the right wing against the camera")
+    let expandedNotch = notched.sidePaddings(leftWidth: 109, rightWidth: 58, menuVisible: true)
+    try expect(expandedNotch.leading, equals: 51, "menu visibility does not move the wings")
+    try expect(expandedNotch.trailing, equals: 51, "menu visibility does not move the wings")
+}
+
+func testNotchLayoutMenuCardWidthNeverCrampedInPillMode() throws {
+    let pill = NotchLayout(
+        screenMinX: 0,
+        screenWidth: 2_560,
+        screenMaxY: 1_440,
+        safeAreaTop: 0,
+        leftNotchEdgeX: nil,
+        rightNotchEdgeX: nil,
+        menuBarHeight: 24
+    )
+    try expect(pill.menuCardWidth(barWidth: 70), equals: 340, "menu hangs at a readable width")
+    try expect(pill.menuCardWidth(barWidth: 252), equals: 340, "full bar still gets the minimum")
+
+    let notched = NotchLayout(
+        screenMinX: 0,
+        screenWidth: 1_512,
+        screenMaxY: 982,
+        safeAreaTop: 38,
+        leftNotchEdgeX: 666,
+        rightNotchEdgeX: 846
+    )
+    try expect(notched.menuCardWidth(barWidth: 400), equals: 400, "notch menu keeps following the bar")
 }
 
 func testOpenCodePluginWritesSessionState() throws {
@@ -3036,9 +3163,14 @@ let tests: [(String, () throws -> Void)] = [
     ("tool summary counts sessions and attention", testToolSummaryCountsSessionsAndAttention),
     ("tool summary reports worst status for semaphore", testToolSummaryReportsWorstStatusForSemaphore),
     ("notch wing placement splits tools around notch", testNotchWingPlacementSplitsToolsAroundNotch),
+    ("notch wing placement balances tools across wings", testNotchWingPlacementBalancesToolsAcrossWings),
     ("attention acknowledgments silence visited sessions", testAttentionAcknowledgmentsSilenceVisitedSessionsUntilNewActivity),
     ("git workspace inspector resolves branch names", testGitWorkspaceInspectorResolvesBranchNames),
     ("notch layout extends from left side of hardware notch", testNotchLayoutExtendsFromLeftSideOfHardwareNotch),
+    ("notch layout uses pill style on notchless screen", testNotchLayoutUsesPillStyleOnNotchlessScreen),
+    ("notch layout pill falls back to standard menu bar height", testNotchLayoutPillFallsBackToStandardMenuBarHeight),
+    ("notch layout side paddings center the pill", testNotchLayoutSidePaddingsCenterThePill),
+    ("notch layout menu card width never cramped in pill mode", testNotchLayoutMenuCardWidthNeverCrampedInPillMode),
     ("opencode plugin writes session state", testOpenCodePluginWritesSessionState),
     ("opencode plugin maps lifecycle events", testOpenCodePluginMapsLifecycleEvents),
     ("pi extension writes session state", testPiExtensionWritesSessionState),
