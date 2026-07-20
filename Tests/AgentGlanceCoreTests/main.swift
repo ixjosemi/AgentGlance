@@ -421,6 +421,10 @@ func testReaperCreatesFallbackStateForUntrackedProcess() throws {
     let session = try repository.loadSessions().first.unwrap(or: "fallback state was not saved")
     try expect(session.source, equals: .reaper, "session source")
     try expect(session.pid, equals: Int32(getpid()), "session PID")
+    // A freshly-detected process carries no real signal yet — idle (the
+    // silent baseline) beats guessing "working" and lighting the spinner
+    // for a session that may just be sitting at an idle prompt.
+    try expect(session.status, equals: .idle, "fallback status before any plugin/hook signal arrives")
 }
 
 func testReaperReapsAgainstProvidedScan() throws {

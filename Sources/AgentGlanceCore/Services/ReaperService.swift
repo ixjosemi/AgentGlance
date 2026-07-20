@@ -53,12 +53,15 @@ public struct ReaperService: Sendable {
                 try adoptScannedTerminal(existing, from: process)
                 continue
             }
+            // No plugin/hook has spoken for this process yet — idle (the
+            // silent baseline) beats guessing "working" and lighting the
+            // spinner for what may just be a session sitting at a prompt.
             let sessionID = "reaper-\(process.processID)"
             try repository.save(AgentSession(
                 tool: process.tool,
                 sessionID: sessionID,
                 pid: process.processID,
-                status: .working,
+                status: .idle,
                 cwd: process.cwd,
                 startedAt: Date(),
                 updatedAt: Date(),
