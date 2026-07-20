@@ -74,6 +74,13 @@ public struct ClaudeHookProcessor: Sendable {
             throw ClaudeHookError.unsupportedNotification(notificationType)
         case "UserPromptSubmit":
             return (.working, nil)
+        case "PostToolUse":
+            // Answering a permission prompt (or an AskUserQuestion, which
+            // Claude Code notifies about the same way) arrives as a tool
+            // result, not a typed prompt — UserPromptSubmit never fires for
+            // it. The tool call it was blocking cannot complete until the
+            // user responds, so its completion is the resume signal.
+            return (.working, nil)
         case "Stop":
             return (.idle, nil)
         case "SessionEnd":

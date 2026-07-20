@@ -458,6 +458,49 @@ func testClaudePermissionNotificationRequestsAttention() throws {
     try expect(nudged.attentionReason, equals: .permission, "idle nudge keeps permission reason")
 }
 
+/// Live incident 2026-07-20: answering a permission prompt (or an
+/// AskUserQuestion, which Claude Code notifies about the same way) is a
+/// tool result, not a typed prompt — no UserPromptSubmit ever fires for it.
+/// Without a signal tied to the tool call actually completing, the red dot
+/// stays lit through every bit of work Claude does for the rest of the turn.
+func testClaudePostToolUseClearsResolvedPermissionPrompt() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let processor = ClaudeHookProcessor(repository: repository)
+    let payload = Data(#"{"session_id":"claude-1","cwd":"/tmp/project"}"#.utf8)
+    try processor.process(
+        event: "SessionStart",
+        payload: payload,
+        environment: [:],
+        processID: 4321,
+        now: Date(timeIntervalSince1970: 100)
+    )
+    try processor.process(
+        event: "Notification",
+        payload: Data(
+            #"{"session_id":"claude-1","cwd":"/tmp/project","notification_type":"permission_prompt"}"#.utf8
+        ),
+        environment: [:],
+        processID: 4321,
+        now: Date(timeIntervalSince1970: 200)
+    )
+
+    try processor.process(
+        event: "PostToolUse",
+        payload: payload,
+        environment: [:],
+        processID: 4321,
+        now: Date(timeIntervalSince1970: 300)
+    )
+
+    let session = try repository.loadSessions().first.unwrap(or: "session was not saved")
+    try expect(session.status, equals: .working, "resolved permission prompt resumes work")
+    try expect(session.attentionReason, equals: nil, "attention reason clears with the prompt")
+}
+
 func testClaudeLifecycleEventsProduceExpectedStates() throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -7344,6 +7387,7 @@ let tests: [(String, () throws -> Void)] = [
     ("Claude lifecycle update preserves only matching process identity", testClaudeLifecycleUpdatePreservesOnlyMatchingProcessIdentity),
     ("session duration formatter renders compact durations", testSessionDurationFormatterRendersCompactDurations),
     ("Claude permission notification requests attention", testClaudePermissionNotificationRequestsAttention),
+    ("Claude PostToolUse clears resolved permission prompt", testClaudePostToolUseClearsResolvedPermissionPrompt),
     ("Claude lifecycle events produce expected states", testClaudeLifecycleEventsProduceExpectedStates),
     ("reaper deletes state for dead process", testReaperDeletesStateForDeadProcess),
     ("reaper drops stale native state when agent is no longer detected", testReaperDropsStaleNativeStateWhenTheAgentIsNoLongerDetected),

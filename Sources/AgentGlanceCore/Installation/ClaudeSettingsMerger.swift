@@ -11,6 +11,7 @@ public enum ClaudeSettingsMerger {
         ("SessionStart", nil),
         ("Notification", "permission_prompt|idle_prompt"),
         ("UserPromptSubmit", nil),
+        ("PostToolUse", nil),
         ("Stop", nil),
         ("SessionEnd", nil),
     ]
