@@ -113,10 +113,20 @@ async function updateState(client, event, directory) {
     "session.deleted": ["ended", null],
     "message.updated": ["working", null],
   };
-  const transition = event.type === "session.status"
-    && ["busy", "working", "retry"].includes(event.properties.status?.type)
-    ? ["working", null]
-    : transitions[event.type];
+  // session.status carries its own idle signal (properties.status.type ===
+  // "idle") alongside the dedicated session.idle event below — OpenCode
+  // 1.18 emits this one, not the dedicated event, when a turn ends. Treating
+  // only busy/retry as meaningful and falling through to transitions[] (which
+  // has no "session.status" key) silently dropped every idle transition,
+  // leaving the spinner stuck on "working" forever.
+  const statusTransition = event.type === "session.status"
+    ? ["busy", "retry"].includes(event.properties.status?.type)
+      ? ["working", null]
+      : event.properties.status?.type === "idle"
+        ? ["idle", null]
+        : null
+    : null;
+  const transition = statusTransition ?? transitions[event.type];
   if (!transition) return;
   // While a permission is pending, OpenCode keeps emitting session.status
   // "busy" and message.updated noise for the paused turn. Only an explicit
