@@ -1,5 +1,6 @@
 // AgentGlance-managed integration; reinstalls replace this file.
 import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { spawn } from "node:child_process";
@@ -42,7 +43,12 @@ async function writeState(state) {
   if (sessionID.length > 128) throw new Error("AgentGlance session ID exceeds 128 bytes");
   const safeID = sessionID.toString("base64url");
   const destination = join(stateDirectory, `opencode-${safeID}.json`);
-  const temporary = join(stateDirectory, `.${safeID}-${process.pid}.tmp`);
+  // OpenCode does not serialize event delivery: a burst of events for the
+  // same session can call writeState concurrently. A temp name fixed per
+  // session+pid let one call's rename consume another's temp file first,
+  // failing the loser's rename with ENOENT and silently dropping that
+  // status transition. A unique name per call removes the collision.
+  const temporary = join(stateDirectory, `.${safeID}-${process.pid}-${randomUUID()}.tmp`);
   await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
   await chmod(stateDirectory, 0o700);
   await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
@@ -112,6 +118,13 @@ async function updateState(client, event, directory) {
     ? ["working", null]
     : transitions[event.type];
   if (!transition) return;
+  // While a permission is pending, OpenCode keeps emitting session.status
+  // "busy" and message.updated noise for the paused turn. Only an explicit
+  // permission.replied may end the wait — anything else must not downgrade
+  // the red light back to "working".
+  if (state.status === "needs_attention" && transition[0] === "working" && event.type !== "permission.replied") {
+    return;
+  }
   state.status = transition[0];
   state.attention_reason = transition[1];
   state.updated_at = timestamp();
