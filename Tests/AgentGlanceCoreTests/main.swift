@@ -1041,12 +1041,12 @@ func testToolSummaryReportsWorstStatusForSemaphore() throws {
     try expect(
         ToolSummary(tool: .claude, sessions: [working]).worstStatus,
         equals: .working,
-        "all working stays green"
+        "solo working shows the pixel spinner"
     )
     try expect(
         ToolSummary(tool: .claude, sessions: [working, idle]).worstStatus,
-        equals: .idle,
-        "one idle turns yellow"
+        equals: .working,
+        "a working session outranks a quiet idle one"
     )
     try expect(
         ToolSummary(tool: .claude, sessions: [working, idle, attention]).worstStatus,
@@ -1108,7 +1108,7 @@ func testAttentionAcknowledgmentsSilenceVisitedSessionsUntilNewActivity() throws
     acknowledgments.acknowledge(waiting)
     try expect(
         ToolSummary.active(in: acknowledgments.silenced([waiting])).first?.worstStatus,
-        equals: .working,
+        equals: .idle,
         "visited session goes quiet in the bar"
     )
     try expect(

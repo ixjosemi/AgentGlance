@@ -247,20 +247,25 @@ private struct ToolIndicator: View {
                         .font(.system(size: 12, weight: .medium, design: .rounded))
                         .monospacedDigit()
                 }
-                // Working is the default hum of the app — no light. The bar
-                // only signals waiting states: yellow (idle, waiting for a
-                // prompt) and red (waiting on an answer or a permission).
-                if let worstStatus = summary.worstStatus, worstStatus != .working {
+                // Idle is the app's resting state and stays silent — no dot,
+                // no color. Working gets the quiet pixel spinner; only a
+                // session that actually needs you lights up, in red.
+                switch summary.worstStatus {
+                case .needsAttention:
                     Circle()
-                        .fill(semaphoreColor(for: worstStatus))
+                        .fill(.red)
                         .frame(width: 6, height: 6)
-                        .opacity(pulseOpacity(for: worstStatus))
+                        .opacity(attentionOpacity)
                         .onAppear {
                             guard !reduceMotion else { return }
                             withAnimation(.easeInOut(duration: 1).repeatForever(autoreverses: true)) {
                                 attentionIsBright = true
                             }
                         }
+                case .working:
+                    WorkingPixelSpinner()
+                case .idle, .ended, nil:
+                    EmptyView()
                 }
             }
             .frame(minWidth: 50, minHeight: 24)
@@ -280,10 +285,8 @@ private struct ToolIndicator: View {
         .accessibilityLabel(accessibilityLabel)
     }
 
-    /// Only the red light pulses; green and yellow stay steady so the bar
-    /// never draws attention when nothing needs it.
-    private func pulseOpacity(for status: SessionStatus) -> Double {
-        guard status == .needsAttention, !reduceMotion else { return 1 }
+    private var attentionOpacity: Double {
+        guard !reduceMotion else { return 1 }
         return attentionIsBright ? 1 : 0.35
     }
 
@@ -295,41 +298,42 @@ private struct ToolIndicator: View {
 
 private let sessionRowHeight: CGFloat = 46
 
-/// The green light of an actively working session emits a radar-style ping:
-/// continuous activity, in the semaphore's own visual language — a spinner
-/// would wrongly suggest a bounded loading task.
-private struct WorkingIndicator: View {
+/// The classic braille dot-matrix spinner used across CLI tools (ora,
+/// Convoy's own progress indicator) — several dots lit per frame rather
+/// than one pixel chasing itself. Monochrome by design: red stays the only
+/// color with meaning, reserved for needsAttention.
+private struct WorkingPixelSpinner: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isPinging = false
+    private static let stepInterval: TimeInterval = 0.08
+    private static let frames: [Character] = Array("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 
     var body: some View {
-        ZStack {
-            Circle()
-                .fill(.green)
-                .frame(width: 8, height: 8)
-            if !reduceMotion {
-                Circle()
-                    .stroke(.green.opacity(0.7), lineWidth: 1.5)
-                    .frame(width: 8, height: 8)
-                    .scaleEffect(isPinging ? 2.4 : 1)
-                    .opacity(isPinging ? 0 : 0.7)
-                    .onAppear {
-                        withAnimation(.easeOut(duration: 1.5).repeatForever(autoreverses: false)) {
-                            isPinging = true
-                        }
-                    }
+        if reduceMotion {
+            frame(Self.frames[0])
+        } else {
+            TimelineView(.periodic(from: .now, by: Self.stepInterval)) { timeline in
+                let step = Int(timeline.date.timeIntervalSinceReferenceDate / Self.stepInterval)
+                frame(Self.frames[step % Self.frames.count])
             }
         }
-        .frame(width: 8, height: 8)
+    }
+
+    private func frame(_ character: Character) -> some View {
+        Text(String(character))
+            .font(.system(size: 13, weight: .medium, design: .monospaced))
+            .foregroundStyle(.white)
+            .frame(width: 10, height: 10)
     }
 }
 
-/// Traffic-light mapping shared by the bar semaphores and the menu rows:
-/// green = working, yellow = idle, red = waiting on the user.
+/// Shared dot color for the per-session menu rows: red for needsAttention,
+/// a neutral dim white for idle — the resting state carries no color of its
+/// own, only reduced brightness. `.working` rows render a spinner instead
+/// (see `mainRow`) so this branch is unreachable for that case.
 private func semaphoreColor(for status: SessionStatus) -> Color {
     switch status {
-    case .working: .green
-    case .idle: .yellow
+    case .working: .white
+    case .idle: .white.opacity(0.3)
     case .needsAttention: .red
     case .ended: .gray
     }
@@ -589,7 +593,7 @@ private struct SessionRow: View {
     private var mainRow: some View {
         HStack(spacing: 10) {
             if session.status == .working {
-                WorkingIndicator()
+                WorkingPixelSpinner()
             } else {
                 Circle()
                     .fill(semaphoreColor(for: session.status))

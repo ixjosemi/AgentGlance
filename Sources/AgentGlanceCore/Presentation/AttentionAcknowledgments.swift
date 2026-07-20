@@ -19,7 +19,8 @@ public struct AttentionAcknowledgments: Equatable, Sendable {
     }
 
     /// Sessions for the bar semaphore: acknowledged waiting sessions count
-    /// as working. The menu keeps showing the repository's real statuses.
+    /// as idle — the app's silent resting state. The menu keeps showing the
+    /// repository's real statuses.
     public func silenced(_ sessions: [AgentSession]) -> [AgentSession] {
         sessions.map { session in
             guard session.status == .idle || session.status == .needsAttention,
@@ -31,7 +32,7 @@ public struct AttentionAcknowledgments: Equatable, Sendable {
                 tool: session.tool,
                 sessionID: session.sessionID,
                 pid: session.pid,
-                status: .working,
+                status: .idle,
                 attentionReason: nil,
                 cwd: session.cwd,
                 startedAt: session.startedAt,
