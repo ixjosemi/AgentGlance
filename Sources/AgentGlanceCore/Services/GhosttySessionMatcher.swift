@@ -50,7 +50,17 @@ public enum GhosttySessionMatcher {
         }
 
         let blankTerminals = availableTerminals.filter { $0.cwd.isEmpty }
-        let newestUnmatched = unmatchedProcesses.sorted { $0.elapsedSeconds < $1.elapsedSeconds }
+        // A convoy pipeline's embedded `opencode serve` child shares its cwd
+        // and competes for the same leftover slot when Ghostty's scripting
+        // bridge never enumerates their shared tab. The child only becomes
+        // visible once ConvoyRunsWatcher suppresses it in favor of the
+        // pipeline row, so convoy must win this tie-break first.
+        let newestUnmatched = unmatchedProcesses.sorted { lhs, rhs in
+            if (lhs.tool == .convoy) != (rhs.tool == .convoy) {
+                return lhs.tool == .convoy
+            }
+            return lhs.elapsedSeconds < rhs.elapsedSeconds
+        }
         for (process, terminal) in zip(newestUnmatched, blankTerminals) {
             matchedProcesses.append(enrich(process, with: terminal))
         }

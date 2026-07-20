@@ -39,11 +39,21 @@ public final class ConvoyRunsWatcher {
     /// surface as a standalone OpenCode row next to the pipeline it belongs
     /// to. The run metadata names those sessions, so they are removed here —
     /// and again on every scan, which drains any rewrite by the plugin.
+    ///
+    /// The embedded server shares its cwd with the pipeline's target
+    /// directory but is never named by any phase's session ID — Ghostty's
+    /// scripting bridge often cannot enumerate its tab, so before its own
+    /// plugin ever writes a document, the reaper can create a generic
+    /// "reaper-<pid>" fallback for it that sessionID matching would never
+    /// catch. Matching by directory as well as by session ID suppresses
+    /// that fallback too.
     private func suppressPipelineOwnedOpenCodeSessions(of runs: [ConvoyRun]) throws {
         let pipelineSessionIDs = Set(runs.flatMap { $0.phases.compactMap(\.sessionID) })
-        guard !pipelineSessionIDs.isEmpty else { return }
+        let pipelineTargetDirs = Set(runs.map(\.targetDir))
+        guard !pipelineSessionIDs.isEmpty || !pipelineTargetDirs.isEmpty else { return }
         for session in try repository.loadSessions()
-        where session.tool == .opencode && pipelineSessionIDs.contains(session.sessionID) {
+        where session.tool == .opencode
+            && (pipelineSessionIDs.contains(session.sessionID) || pipelineTargetDirs.contains(session.cwd)) {
             try repository.remove(session)
         }
     }

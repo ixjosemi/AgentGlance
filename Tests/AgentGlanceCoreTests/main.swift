@@ -355,9 +355,12 @@ func validStateJSON(
     sessionID: String,
     status: String,
     pid: Int32 = 12345,
-    tool: String = "claude"
+    tool: String = "claude",
+    cwd: String = "/tmp/project",
+    source: String? = nil
 ) -> Data {
-    Data(
+    let sourceField = source.map { ",\n  \"source\": \"\($0)\"" } ?? ""
+    return Data(
         """
         {
           "schema_version": 1,
@@ -366,10 +369,10 @@ func validStateJSON(
           "pid": \(pid),
           "status": "\(status)",
           "attention_reason": null,
-          "cwd": "/tmp/project",
+          "cwd": "\(cwd)",
           "started_at": "2026-07-18T10:00:00Z",
           "updated_at": "2026-07-18T10:00:00Z",
-          "terminal": {}
+          "terminal": {}\(sourceField)
         }
         """.utf8
     )
@@ -1771,6 +1774,42 @@ func testConvoyWatcherSuppressesPipelineOwnedOpenCodeSessions() throws {
     try expect(opencodeSessionIDs, equals: ["ses_unrelated"], "surviving opencode sessions")
 }
 
+func testConvoyWatcherSuppressesEmbeddedServerReaperFallbackByDirectory() throws {
+    // Live incident 2026-07-20: once the embedded opencode-serve child loses
+    // Ghostty's last blank terminal to the convoy process itself, the reaper
+    // may create a generic "reaper-<pid>" fallback for it before its own
+    // plugin ever writes a document carrying the phase's real session ID.
+    // That fallback's session ID never matches a phase's, so sessionID-based
+    // suppression alone lets it survive forever as an unlabeled OpenCode row.
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    let embeddedServerPid: Int32 = 76_552
+    try repository.save(AgentSession.decode(
+        from: validStateJSON(
+            sessionID: "reaper-\(embeddedServerPid)",
+            status: "idle",
+            pid: embeddedServerPid,
+            tool: "opencode",
+            cwd: "/tmp/convoy-target",
+            source: "reaper"
+        )
+    ))
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: "20260720-101044-9zbh",
+        serverPid: Int32(getpid()),
+        serverStartedAt: Date().addingTimeInterval(-300),
+        phases: [("implementer", "running", "ses_impl")]
+    )
+    let watcher = ConvoyRunsWatcher(runsDirectoryURL: runsDirectoryURL, repository: repository)
+
+    try watcher.scan(detected: [detectedConvoyProcess()])
+
+    let survivingOpenCodeSessions = try repository.loadSessions().filter { $0.tool == .opencode }
+    try expect(survivingOpenCodeSessions.isEmpty, equals: true, "embedded server's reaper fallback is suppressed")
+}
+
 func testFocusPlannerPrioritizesTmuxThenTerminal() throws {
     let data = Data(
         #"{"schema_version":1,"tool":"claude","session_id":"focus","pid":1,"status":"working","attention_reason":null,"cwd":"/tmp/project","started_at":"2026-07-18T10:00:00Z","updated_at":"2026-07-18T10:00:00Z","terminal":{"term_program":"ghostty","ghostty_terminal_id":"terminal-123","tmux_pane":"%3","window_title_hint":"project — claude"}}"#.utf8
@@ -1936,6 +1975,47 @@ func testGhosttyMatcherKeepsPreviousAssignmentsAcrossRetitles() throws {
         matched.first(where: { $0.processID == 22 })?.terminal.ghosttyTerminalID,
         equals: "tab-one",
         "claude keeps its tab"
+    )
+}
+
+func testGhosttyMatcherPrefersConvoyOverItsEmbeddedOpenCodeServerForLastTerminal() throws {
+    // Live incident 2026-07-20: a convoy pipeline's embedded `opencode serve`
+    // child shares the pipeline's exact cwd, and Ghostty's own scripting
+    // bridge never enumerates the tab hosting either process. Both land in
+    // unmatchedProcesses competing for the one leftover blank terminal — the
+    // embedded server must not win it, or ConvoyRunsWatcher never sees the
+    // convoy process and the whole pipeline vanishes from the notch.
+    let processes = [
+        DetectedAgentProcess(
+            tool: .opencode,
+            processID: 76_552,
+            cwd: "/tmp/pipeline-worktree",
+            terminal: TerminalContext(termProgram: "ghostty"),
+            elapsedSeconds: 5
+        ),
+        DetectedAgentProcess(
+            tool: .convoy,
+            processID: 76_544,
+            cwd: "/tmp/pipeline-worktree",
+            terminal: TerminalContext(termProgram: "ghostty"),
+            elapsedSeconds: 15
+        ),
+    ]
+    let terminals = [
+        GhosttyTerminal(id: "ghost", name: "👻", cwd: ""),
+    ]
+
+    let matched = GhosttySessionMatcher.match(processes: processes, terminals: terminals)
+
+    try expect(
+        matched.first(where: { $0.tool == .convoy })?.terminal.ghosttyTerminalID,
+        equals: "ghost",
+        "convoy claims the last blank terminal"
+    )
+    try expect(
+        matched.contains(where: { $0.tool == .opencode }),
+        equals: false,
+        "embedded opencode server yields the slot to convoy"
     )
 }
 
@@ -2973,11 +3053,13 @@ let tests: [(String, () throws -> Void)] = [
     ("convoy watcher maps terminal pipeline states", testConvoyWatcherMapsTerminalPipelineStates),
     ("convoy watcher ignores runs not owned by live process", testConvoyWatcherIgnoresRunsNotOwnedByLiveProcess),
     ("convoy watcher suppresses pipeline-owned opencode sessions", testConvoyWatcherSuppressesPipelineOwnedOpenCodeSessions),
+    ("convoy watcher suppresses embedded server reaper fallback by directory", testConvoyWatcherSuppressesEmbeddedServerReaperFallbackByDirectory),
     ("focus planner prioritizes tmux then terminal", testFocusPlannerPrioritizesTmuxThenTerminal),
     ("Ghostty matcher excludes orphaned processes and assigns exact terminals", testGhosttyMatcherExcludesOrphanedProcessesAndAssignsExactTerminals),
     ("Ghostty matcher prefers same-directory terminal naming the tool", testGhosttyMatcherPrefersSameDirectoryTerminalNamingTheTool),
     ("Ghostty matcher resolves retitled tabs by signature and foreign commands", testGhosttyMatcherResolvesRetitledTabsBySignatureAndForeignCommands),
     ("Ghostty matcher keeps previous assignments across retitles", testGhosttyMatcherKeepsPreviousAssignmentsAcrossRetitles),
+    ("Ghostty matcher prefers convoy over its embedded opencode server for last terminal", testGhosttyMatcherPrefersConvoyOverItsEmbeddedOpenCodeServerForLastTerminal),
     ("Ghostty terminal query cache avoids redundant queries", testGhosttyTerminalQueryCacheAvoidsRedundantQueries),
     ("process scanner detects spawned agent process within budget", testProcessScannerDetectsSpawnedAgentProcessWithinBudget),
     ("process scanner ignores lookalike process names", testProcessScannerIgnoresLookalikeProcessNames),
