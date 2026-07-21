@@ -18,14 +18,14 @@ try {
     },
   });
   const event = (type, properties) => plugin.event({ event: { type, properties } });
-  await event("session.created", {
-    info: { id: "regression", directory: "/tmp/project" },
-  });
-
   // OpenCode can deliver a burst without awaiting previous plugin handlers.
+  // The creation event must also be ordered ahead of its status events;
   // message.updated describes persisted message data, not active generation,
   // and must never resurrect a turn after the authoritative idle signal.
   await Promise.all([
+    event("session.created", {
+      info: { id: "regression", directory: "/tmp/project" },
+    }),
     event("session.status", { sessionID: "regression", status: { type: "busy" } }),
     event("session.status", { sessionID: "regression", status: { type: "idle" } }),
     event("message.updated", { sessionID: "regression" }),

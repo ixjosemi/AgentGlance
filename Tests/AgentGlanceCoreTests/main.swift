@@ -1475,6 +1475,36 @@ func testSingleInstanceLockExcludesBundledAndUnbundledProcesses() throws {
     withExtendedLifetime(replacementLock) {}
 }
 
+func testSingleInstanceLockRejectsNonRegularLockPaths() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let target = root.appendingPathComponent("target")
+    try Data("user-owned".utf8).write(to: target)
+    let symlink = root.appendingPathComponent("symlink-lock")
+    try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: target)
+    let directory = root.appendingPathComponent("directory-lock", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+    for unsafePath in [symlink, directory] {
+        do {
+            _ = try SingleInstanceLock.acquire(at: unsafePath)
+            throw TestFailure.expectation("non-regular lock path was accepted: \(unsafePath.lastPathComponent)")
+        } catch is TestFailure {
+            throw TestFailure.expectation("non-regular lock path was accepted: \(unsafePath.lastPathComponent)")
+        } catch {
+            // O_NOFOLLOW and the regular-file check must reject an existing
+            // user-controlled link or directory instead of mutating it.
+        }
+    }
+    try expect(
+        try String(contentsOf: target, encoding: .utf8),
+        equals: "user-owned",
+        "symlink target remains untouched"
+    )
+}
+
 func testNotchLayoutStatusWingWidthHidesZeroCountIndicators() throws {
     try expect(
         NotchLayout.statusWingWidth(visibleIndicatorCount: 0, showsIdleMark: false),
@@ -2714,6 +2744,61 @@ func testConvoyWatcherKeepsFinalReadsInDiscoveredMetadataFile() throws {
         sessions.first(where: { $0.sessionID == metadataRunID })?.status,
         equals: .idle,
         "final state remains sourced from the discovered metadata file"
+    )
+}
+
+func testConvoyWatcherRejectsUnsafeMetadataFileTypesAndSizes() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    let serverStartedAt = Date().addingTimeInterval(-60)
+
+    // A symlink must not let a run redirect the watcher to arbitrary metadata.
+    let externalMetadata = runsDirectoryURL.deletingLastPathComponent()
+        .appendingPathComponent("external-metadata.json")
+    let validMetadata = """
+    {
+      "runID": "redirected-run",
+      "targetDir": "/tmp/redirected",
+      "updatedAt": \(Int(Date().timeIntervalSince1970 * 1000)),
+      "server": {
+        "pid": \(getpid()),
+        "startedAt": \(Int(serverStartedAt.timeIntervalSince1970 * 1000))
+      },
+      "phases": {
+        "implementer": { "status": "running", "startedAt": \(Int(serverStartedAt.timeIntervalSince1970 * 1000)) }
+      }
+    }
+    """
+    try Data(validMetadata.utf8).write(to: externalMetadata)
+    let symlinkedRun = runsDirectoryURL.appendingPathComponent("symlinked", isDirectory: true)
+    try FileManager.default.createDirectory(at: symlinkedRun, withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(
+        at: symlinkedRun.appendingPathComponent("metadata.json"),
+        withDestinationURL: externalMetadata
+    )
+
+    // A directory and an oversized document must also be ignored before JSON
+    // decoding, rather than blocking or publishing malformed run state.
+    let directoryRun = runsDirectoryURL.appendingPathComponent("directory", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: directoryRun.appendingPathComponent("metadata.json", isDirectory: true),
+        withIntermediateDirectories: true
+    )
+    let oversizedRun = runsDirectoryURL.appendingPathComponent("oversized", isDirectory: true)
+    try FileManager.default.createDirectory(at: oversizedRun, withIntermediateDirectories: true)
+    var oversizedMetadata = Data(validMetadata.utf8)
+    oversizedMetadata.append(Data(repeating: 0x20, count: BoundedInput.maximumPayloadSize + 1 - oversizedMetadata.count))
+    try oversizedMetadata.write(to: oversizedRun.appendingPathComponent("metadata.json"))
+
+    try ConvoyRunsWatcher(runsDirectoryURL: runsDirectoryURL, repository: repository).scan(
+        detected: [detectedConvoyProcess(elapsedSeconds: Date().timeIntervalSince(serverStartedAt) + 60)]
+    )
+
+    try expect(
+        try repository.loadSessions().isEmpty,
+        equals: true,
+        "unsafe Convoy metadata cannot publish a session"
     )
 }
 
@@ -4073,6 +4158,7 @@ let tests: [(String, () throws -> Void)] = [
     ("hover interaction uses visible content for hover exit", testHoverInteractionUsesOnlyVisibleContentForHoverExit),
     ("hover interaction does not reexpand from collapsing card", testHoverInteractionDoesNotReexpandFromTheCollapsingCard),
     ("single instance lock excludes bundled and unbundled processes", testSingleInstanceLockExcludesBundledAndUnbundledProcesses),
+    ("single instance lock rejects non-regular lock paths", testSingleInstanceLockRejectsNonRegularLockPaths),
     ("notch layout status wing width hides zero count indicators", testNotchLayoutStatusWingWidthHidesZeroCountIndicators),
     ("screen selection follows pointer and falls back to focused display", testScreenSelectionFollowsThePointerAndFallsBackToFocusedDisplay),
     ("screen selection returns every display when configured for all displays", testScreenSelectionReturnsEveryDisplayWhenConfiguredForAllDisplays),
@@ -4107,6 +4193,7 @@ let tests: [(String, () throws -> Void)] = [
     ("convoy watcher maps thinking and uses project name", testConvoyWatcherMapsThinkingAndUsesProjectName),
     ("convoy final transition survives immediate process exit once", testConvoyFinalTransitionSurvivesImmediateProcessExitOnce),
     ("convoy watcher keeps final reads in discovered metadata file", testConvoyWatcherKeepsFinalReadsInDiscoveredMetadataFile),
+    ("convoy watcher rejects unsafe metadata file types and sizes", testConvoyWatcherRejectsUnsafeMetadataFileTypesAndSizes),
     ("convoy watcher ignores runs not owned by live process", testConvoyWatcherIgnoresRunsNotOwnedByLiveProcess),
     ("convoy watcher suppresses pipeline-owned opencode sessions", testConvoyWatcherSuppressesPipelineOwnedOpenCodeSessions),
     ("convoy watcher suppresses embedded server reaper fallback by directory", testConvoyWatcherSuppressesEmbeddedServerReaperFallbackByDirectory),
