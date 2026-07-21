@@ -1371,8 +1371,8 @@ func testHoverInteractionDoesNotReexpandFromTheCollapsingCard() throws {
             panelOriginX: 100,
             panelTopY: 900,
             isExpanded: false,
-            topShoulderRadius: HangingNotchMetrics.compactTopShoulderRadius,
-            bottomCornerRadius: HangingNotchMetrics.compactPillBottomCornerRadius
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
         ),
         equals: false,
         "the transparent concave shoulder cannot trigger expansion"
@@ -1427,10 +1427,10 @@ func testNotchLayoutStatusWingWidthHidesZeroCountIndicators() throws {
     )
     try expect(
         NotchLayout.statusWingWidth(visibleIndicatorCount: 0, showsIdleMark: true),
-        equals: 52,
-        "the quiet idle drop stays wide enough for its rounded base"
+        equals: 64,
+        "the quiet idle drop retains the same relaxed horizontal padding"
     )
-    try expect(NotchLayout.statusWingEdgePadding, equals: 12, "compact drops gain side breathing room")
+    try expect(NotchLayout.statusWingEdgePadding, equals: 18, "compact drops leave generous horizontal breathing room")
     let one = NotchLayout.statusWingWidth(visibleIndicatorCount: 1, showsIdleMark: false)
     let two = NotchLayout.statusWingWidth(visibleIndicatorCount: 2, showsIdleMark: false)
     try expect(
@@ -1695,12 +1695,12 @@ func testNotchLayoutUsesPillStyleOnNotchlessScreen() throws {
 
     try expect(layout.presentation, equals: .pill, "notchless screen gets the pill")
     try expect(layout.notchWidth, equals: 0, "no phantom camera gap")
-    try expect(layout.height, equals: 24, "pill uses the real menu bar height for a rounder drop")
-    try expect(layout.originY, equals: 1_416, "pill attaches to the screen top without overlapping windows")
+    try expect(layout.height, equals: 38, "pill is tall enough to match the hardware-notch curves")
+    try expect(layout.originY, equals: 1_402, "pill attaches to the screen top while hanging below the menu bar")
     try expect(layout.originY + layout.height, equals: 1_440, "pill and notch share the top edge")
     try expect(layout.width, equals: 800, "panel wide enough for session details and side curves")
     try expect(layout.originX, equals: 880, "centered on screen")
-    try expect(layout.expandedHeight, equals: 384, "menu hangs below the pill")
+    try expect(layout.expandedHeight, equals: 398, "menu hangs below the pill")
 }
 
 func testNotchLayoutPillFallsBackToStandardMenuBarHeight() throws {
@@ -1714,7 +1714,7 @@ func testNotchLayoutPillFallsBackToStandardMenuBarHeight() throws {
         menuBarHeight: 0
     )
 
-    try expect(layout.height, equals: 24, "standard menu bar gives the drop its full rounded height")
+    try expect(layout.height, equals: 38, "standard menu bar still receives the hardware-notch profile")
 }
 
 func testHangingNotchGeometryCreatesConcaveShouldersAndRoundedBase() throws {
@@ -1722,20 +1722,20 @@ func testHangingNotchGeometryCreatesConcaveShouldersAndRoundedBase() throws {
         HangingNotchGeometry.contains(
             DisplayPoint(x: 1, y: 7),
             width: 102,
-            height: 24,
-            topShoulderRadius: HangingNotchMetrics.compactTopShoulderRadius,
-            bottomCornerRadius: HangingNotchMetrics.compactPillBottomCornerRadius
+            height: 38,
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
         ),
         equals: false,
         "compact drop cuts out the upper-left shoulder"
     )
     try expect(
         HangingNotchGeometry.contains(
-            DisplayPoint(x: 11, y: 7),
+            DisplayPoint(x: 16, y: 7),
             width: 102,
-            height: 24,
-            topShoulderRadius: HangingNotchMetrics.compactTopShoulderRadius,
-            bottomCornerRadius: HangingNotchMetrics.compactPillBottomCornerRadius
+            height: 38,
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
         ),
         equals: true,
         "compact drop keeps the body beside the concave shoulder"
@@ -1744,20 +1744,20 @@ func testHangingNotchGeometryCreatesConcaveShouldersAndRoundedBase() throws {
         HangingNotchGeometry.contains(
             DisplayPoint(x: 101, y: 7),
             width: 102,
-            height: 24,
-            topShoulderRadius: HangingNotchMetrics.compactTopShoulderRadius,
-            bottomCornerRadius: HangingNotchMetrics.compactPillBottomCornerRadius
+            height: 38,
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
         ),
         equals: false,
         "upper shoulders stay symmetric"
     )
     try expect(
         HangingNotchGeometry.contains(
-            DisplayPoint(x: 11, y: 23),
+            DisplayPoint(x: 11, y: 37),
             width: 102,
-            height: 24,
-            topShoulderRadius: HangingNotchMetrics.compactTopShoulderRadius,
-            bottomCornerRadius: HangingNotchMetrics.compactPillBottomCornerRadius
+            height: 38,
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
         ),
         equals: false,
         "compact drop rounds away the lower-left corner"
@@ -1767,54 +1767,76 @@ func testHangingNotchGeometryCreatesConcaveShouldersAndRoundedBase() throws {
             DisplayPoint(x: 400, y: 119),
             width: 800,
             height: 120,
-            topShoulderRadius: HangingNotchMetrics.expandedTopShoulderRadius,
-            bottomCornerRadius: HangingNotchMetrics.expandedBottomCornerRadius
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
         ),
         equals: true,
         "expanded drop preserves its broad rounded body"
     )
 }
 
-func testHangingNotchGeometryJoinsBothCurvesIntoAContinuousS() throws {
+func testHangingNotchGeometryKeepsExpandedSidesStraightWithCircularCorners() throws {
     try expect(
         HangingNotchGeometry.contains(
-            DisplayPoint(x: 49, y: 200),
+            DisplayPoint(x: 13, y: 150),
             width: 800,
             height: 300,
-            topShoulderRadius: HangingNotchMetrics.expandedTopShoulderRadius,
-            bottomCornerRadius: HangingNotchMetrics.expandedBottomCornerRadius
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
         ),
         equals: false,
-        "lower curve begins at the upper curve instead of leaving a straight side"
+        "the expanded side begins just inside the shallow top shoulder"
     )
     try expect(
         HangingNotchGeometry.contains(
-            DisplayPoint(x: 52, y: 200),
+            DisplayPoint(x: 15, y: 150),
             width: 800,
             height: 300,
-            topShoulderRadius: HangingNotchMetrics.expandedTopShoulderRadius,
-            bottomCornerRadius: HangingNotchMetrics.expandedBottomCornerRadius
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
         ),
         equals: true,
-        "continuous S keeps the rounded body immediately inside its curve"
+        "the expanded side remains a vertical line between its corners"
+    )
+    try expect(
+        HangingNotchGeometry.contains(
+            DisplayPoint(x: 17, y: 291),
+            width: 800,
+            height: 300,
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
+        ),
+        equals: false,
+        "the lower corner follows a true rounded arc instead of an S sweep"
+    )
+    try expect(
+        HangingNotchGeometry.contains(
+            DisplayPoint(x: 19, y: 291),
+            width: 800,
+            height: 300,
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
+        ),
+        equals: true,
+        "the lower corner retains the visible interior of its circular arc"
     )
 }
 
-func testHangingNotchMetricsCreateARounderRoomierDrop() throws {
+func testHangingNotchMetricsShareOneCornerProfileAcrossModes() throws {
     try expect(
-        HangingNotchMetrics.compactTopShoulderRadius,
-        equals: 10,
-        "compact drop has pronounced inverted shoulders"
+        HangingNotchMetrics.topShoulderRadius,
+        equals: 14,
+        "one shoulder gives physical and virtual notches the same curve"
     )
     try expect(
-        HangingNotchMetrics.expandedTopShoulderRadius,
-        equals: 48,
-        "expanded drop increases the upper curve"
+        HangingNotchMetrics.bottomCornerRadius,
+        equals: 20,
+        "one generous lower radius serves compact and expanded alike"
     )
     try expect(
-        HangingNotchMetrics.expandedBottomCornerRadius,
-        equals: 56,
-        "expanded drop has a substantially rounder base"
+        HangingNotchMetrics.topShoulderRadius + HangingNotchMetrics.bottomCornerRadius,
+        equals: 34,
+        "both curves fit the shared compact-notch height without being distorted"
     )
     try expect(
         SessionMenuLayout.contentHorizontalInset,
@@ -1840,9 +1862,9 @@ func testHangingNotchMetricsCreateARounderRoomierDrop() throws {
 
 func testHangingNotchInteractionRegionPassesTransparentCornersThrough() throws {
     let region = HangingNotchInteractionRegion(
-        frame: DisplayFrame(minX: 309, minY: 0, width: 102, height: 24),
-        topShoulderRadius: HangingNotchMetrics.compactTopShoulderRadius,
-        bottomCornerRadius: HangingNotchMetrics.compactPillBottomCornerRadius
+        frame: DisplayFrame(minX: 309, minY: 0, width: 102, height: 38),
+        topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+        bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
     )
 
     try expect(
@@ -1851,12 +1873,12 @@ func testHangingNotchInteractionRegionPassesTransparentCornersThrough() throws {
         "AppKit gate passes the concave shoulder through"
     )
     try expect(
-        region.contains(DisplayPoint(x: 320, y: 7)),
+        region.contains(DisplayPoint(x: 325, y: 7)),
         equals: true,
         "AppKit gate accepts the visible drop body"
     )
     try expect(
-        region.contains(DisplayPoint(x: 360, y: 25)),
+        region.contains(DisplayPoint(x: 360, y: 39)),
         equals: false,
         "AppKit gate passes space below the compact drop through"
     )
@@ -3718,8 +3740,8 @@ let tests: [(String, () throws -> Void)] = [
     ("notch layout uses pill style on notchless screen", testNotchLayoutUsesPillStyleOnNotchlessScreen),
     ("notch layout pill falls back to standard menu bar height", testNotchLayoutPillFallsBackToStandardMenuBarHeight),
     ("hanging notch geometry creates concave shoulders and rounded base", testHangingNotchGeometryCreatesConcaveShouldersAndRoundedBase),
-    ("hanging notch geometry joins both curves into a continuous S", testHangingNotchGeometryJoinsBothCurvesIntoAContinuousS),
-    ("hanging notch metrics create a rounder roomier drop", testHangingNotchMetricsCreateARounderRoomierDrop),
+    ("hanging notch geometry keeps expanded sides straight with circular corners", testHangingNotchGeometryKeepsExpandedSidesStraightWithCircularCorners),
+    ("hanging notch metrics share one corner profile across modes", testHangingNotchMetricsShareOneCornerProfileAcrossModes),
     ("hanging notch interaction region passes transparent corners through", testHangingNotchInteractionRegionPassesTransparentCornersThrough),
     ("notch layout menu card width never cramped in pill mode", testNotchLayoutMenuCardWidthNeverCrampedInPillMode),
     ("opencode plugin writes session state", testOpenCodePluginWritesSessionState),

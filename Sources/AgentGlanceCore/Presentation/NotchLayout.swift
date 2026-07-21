@@ -36,8 +36,11 @@ public struct NotchLayout: Equatable, Sendable {
     }
 
     public static let menuMaxHeight: CGFloat = 360
-    /// The notchless drop stays attached to the top and uses the complete menu
-    /// bar strip without extending into the windows beneath.
+    /// A virtual notch needs the same vertical room as a physical housing so
+    /// both use the identical shoulder and lower-corner curves.
+    public static let minimumCompactHeight: CGFloat = 38
+    /// An optional amount to remove from the menu-bar contribution to the
+    /// virtual-notch height.
     public static let pillBottomInset: CGFloat = 0
     /// A screen without a menu bar reports zero height; use the standard.
     public static let fallbackMenuBarHeight: CGFloat = 24
@@ -58,7 +61,7 @@ public struct NotchLayout: Equatable, Sendable {
         if safeAreaTop > 0, let leftNotchEdgeX, let rightNotchEdgeX {
             presentation = .notch
             notchLeadingX = leftNotchEdgeX
-            height = safeAreaTop
+            height = max(safeAreaTop, Self.minimumCompactHeight)
             notchWidth = max(rightNotchEdgeX - leftNotchEdgeX, 168)
             width = expandedWidth
             // Centre the broad expanded card on the physical camera housing,
@@ -73,10 +76,10 @@ public struct NotchLayout: Equatable, Sendable {
         } else {
             presentation = .pill
             notchLeadingX = nil
-            // The notchless drop respects the real menu bar height and hangs
-            // directly from the screen top without crossing into content.
+            // The virtual notch is allowed to hang beneath the menu bar: its
+            // extra depth is what lets it match the physical-notch curves.
             let menuBar = menuBarHeight > 0 ? menuBarHeight : Self.fallbackMenuBarHeight
-            height = max(1, menuBar - Self.pillBottomInset)
+            height = max(Self.minimumCompactHeight, menuBar - Self.pillBottomInset)
             notchWidth = 0
             width = expandedWidth
             originX = centerX - width / 2
@@ -94,14 +97,14 @@ public struct NotchLayout: Equatable, Sendable {
     /// view so both always agree.
     public static let statusIndicatorSpacing: CGFloat = 6
     /// Breathing room at each end of a status wing — equal on both sides so
-    /// pill and notch bars keep symmetric outer padding.
-    public static let statusWingEdgePadding: CGFloat = 12
+    /// compact virtual and physical notches keep the same relaxed padding.
+    public static let statusWingEdgePadding: CGFloat = 18
 
     /// Compact status-bar wing sizing: one slot per *visible* indicator —
     /// zero-count kinds claim nothing — plus equal padding on both ends.
-    /// A completely quiet bar keeps a minimal footprint for its idle mark.
+    /// A completely quiet bar keeps a relaxed footprint for its idle mark.
     public static func statusWingWidth(visibleIndicatorCount: Int, showsIdleMark: Bool) -> CGFloat {
-        guard visibleIndicatorCount > 0 else { return showsIdleMark ? 52 : 0 }
+        guard visibleIndicatorCount > 0 else { return showsIdleMark ? 64 : 0 }
         return CGFloat(visibleIndicatorCount) * statusIndicatorSlotWidth
             + CGFloat(max(visibleIndicatorCount - 1, 0)) * statusIndicatorSpacing
             + 2 * statusWingEdgePadding

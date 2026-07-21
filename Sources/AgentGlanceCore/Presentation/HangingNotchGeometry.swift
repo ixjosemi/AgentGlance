@@ -1,14 +1,11 @@
 import CoreGraphics
 
-/// Visual metrics shared by rendering and hit testing. Compact mode already
-/// uses most of the menu-bar height for the two opposing curves; expansion
-/// exaggerates both radii so the broad card still reads as a hanging drop.
+/// Visual metrics shared by rendering and hit testing. Every display uses the
+/// same compact-notch profile; expansion preserves those curves and inserts a
+/// straight side between them instead of stretching them into an S shape.
 public enum HangingNotchMetrics {
-    public static let compactTopShoulderRadius: CGFloat = 10
-    public static let expandedTopShoulderRadius: CGFloat = 48
-    public static let compactNotchBottomCornerRadius: CGFloat = 16
-    public static let compactPillBottomCornerRadius: CGFloat = 14
-    public static let expandedBottomCornerRadius: CGFloat = 56
+    public static let topShoulderRadius: CGFloat = 14
+    public static let bottomCornerRadius: CGFloat = 20
 }
 
 /// Shared path geometry for the top-attached notch/drop silhouette. The top
@@ -28,42 +25,55 @@ public enum HangingNotchGeometry {
             return path
         }
 
-        let topRadius = min(
+        let constrainedTopRadius = min(
             sanitizedRadius(requestedTopRadius),
             rect.width / 2
         )
-        let bottomRadius = min(
+        let constrainedBottomRadius = min(
             sanitizedRadius(requestedBottomRadius),
-            max(0, (rect.width - 2 * topRadius) / 2)
+            max(0, (rect.width - 2 * constrainedTopRadius) / 2)
         )
-        // Stretch both curves vertically until they meet. Their horizontal
-        // depths stay modest, but the complete side becomes one continuous S
-        // with no straight segment at any expanded height.
-        let totalRadius = topRadius + bottomRadius
-        let topCurveHeight = totalRadius > 0
-            ? rect.height * topRadius / totalRadius
-            : 0
-        let curveJoinY = rect.minY + topCurveHeight
+        // Keep the shoulder and lower corner as matching circular arcs. A
+        // caller may supply an unusually short rectangle, so shrink both
+        // evenly there rather than letting their vertical spans overlap.
+        let totalRadius = constrainedTopRadius + constrainedBottomRadius
+        let scale = totalRadius > 0 ? min(1, rect.height / totalRadius) : 1
+        let topRadius = constrainedTopRadius * scale
+        let bottomRadius = constrainedBottomRadius * scale
         let leftBodyX = rect.minX + topRadius
         let rightBodyX = rect.maxX - topRadius
+        let upperSideY = rect.minY + topRadius
+        let lowerSideY = rect.maxY - bottomRadius
+        let circleControlOffset: (CGFloat) -> CGFloat = { $0 * 0.552_284_75 }
 
         path.move(to: CGPoint(x: rect.minX, y: rect.minY))
-        path.addQuadCurve(
-            to: CGPoint(x: leftBodyX, y: curveJoinY),
-            control: CGPoint(x: leftBodyX, y: rect.minY)
+        // The cubic control offset is the standard quarter-circle constant.
+        // It leaves a clean vertical side between the shallow shoulder and
+        // the generous lower corner at every expanded height.
+        let topControl = circleControlOffset(topRadius)
+        path.addCurve(
+            to: CGPoint(x: leftBodyX, y: upperSideY),
+            control1: CGPoint(x: rect.minX + topControl, y: rect.minY),
+            control2: CGPoint(x: leftBodyX, y: upperSideY - topControl)
         )
-        path.addQuadCurve(
+        path.addLine(to: CGPoint(x: leftBodyX, y: lowerSideY))
+        let bottomControl = circleControlOffset(bottomRadius)
+        path.addCurve(
             to: CGPoint(x: leftBodyX + bottomRadius, y: rect.maxY),
-            control: CGPoint(x: leftBodyX, y: rect.maxY)
+            control1: CGPoint(x: leftBodyX, y: lowerSideY + bottomControl),
+            control2: CGPoint(x: leftBodyX + bottomRadius - bottomControl, y: rect.maxY)
         )
         path.addLine(to: CGPoint(x: rightBodyX - bottomRadius, y: rect.maxY))
-        path.addQuadCurve(
-            to: CGPoint(x: rightBodyX, y: curveJoinY),
-            control: CGPoint(x: rightBodyX, y: rect.maxY)
+        path.addCurve(
+            to: CGPoint(x: rightBodyX, y: lowerSideY),
+            control1: CGPoint(x: rightBodyX - bottomRadius + bottomControl, y: rect.maxY),
+            control2: CGPoint(x: rightBodyX, y: lowerSideY + bottomControl)
         )
-        path.addQuadCurve(
+        path.addLine(to: CGPoint(x: rightBodyX, y: upperSideY))
+        path.addCurve(
             to: CGPoint(x: rect.maxX, y: rect.minY),
-            control: CGPoint(x: rightBodyX, y: rect.minY)
+            control1: CGPoint(x: rightBodyX, y: upperSideY - topControl),
+            control2: CGPoint(x: rect.maxX - topControl, y: rect.minY)
         )
         path.closeSubpath()
         return path

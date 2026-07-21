@@ -77,7 +77,7 @@ struct NotchWidgetView: View {
                             leftWidth: leftWidth,
                             rightWidth: rightWidth
                         )
-                        .contentShape(silhouette(isExpanded: false))
+                        .contentShape(silhouette)
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Show active sessions")
@@ -104,16 +104,16 @@ struct NotchWidgetView: View {
                 }
                 .frame(width: isExpanded ? menuWidth : barWidth, alignment: .topLeading)
                 .background(
-                    silhouette(isExpanded: isExpanded)
+                    silhouette
                         // Explicit pure black: the notchless drop should read
                         // as part of the screen edge, and any gray breaks that
                         // continuous silhouette.
                         .fill(Color(white: 0))
                 )
-                // The side is now one continuous S. Clip row hover fills and
-                // inline-action backgrounds to the same path so they cannot
+                // Clip row hover fills and inline-action backgrounds to the
+                // same straight-sided, rounded-corner path so they cannot
                 // leak into its transparent lower pockets.
-                .clipShape(silhouette(isExpanded: isExpanded))
+                .clipShape(silhouette)
                 .background {
                     GeometryReader { geometry in
                         Color.clear.preference(
@@ -125,7 +125,7 @@ struct NotchWidgetView: View {
                 // Gestures live on the silhouette, not the outer frame: the
                 // panel is always expanded-height, so the outer frame covers
                 // transparent dead space below the visible shape.
-                .contentShape(silhouette(isExpanded: isExpanded))
+                .contentShape(silhouette)
                 .onContinuousHover(coordinateSpace: .local) { phase in
                     switch phase {
                     case .active:
@@ -144,8 +144,8 @@ struct NotchWidgetView: View {
                             localTopLeadingFrame: visibleFrame,
                             panelOriginX: layout.originX,
                             panelTopY: layout.originY + layout.height,
-                            topShoulderRadius: topShoulderRadius(isExpanded: isExpanded),
-                            bottomCornerRadius: bottomCornerRadius(isExpanded: isExpanded)
+                            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+                            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
                         ) else {
                             isHoveringPanel = false
                             hoverExpandWorkItem?.cancel()
@@ -164,8 +164,8 @@ struct NotchWidgetView: View {
                             panelOriginX: layout.originX,
                             panelTopY: layout.originY + layout.height,
                             isExpanded: isExpanded,
-                            topShoulderRadius: topShoulderRadius(isExpanded: false),
-                            bottomCornerRadius: bottomCornerRadius(isExpanded: false)
+                            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+                            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
                         ) else { return }
                         if allowHoverExpansion(pointer) { scheduleExpansion() }
                     case .ended:
@@ -314,27 +314,14 @@ struct NotchWidgetView: View {
     }
 
     /// Bar and menu share one hanging-drop silhouette: the top shoulders
-    /// curve inward from the screen edge while the lower corners stay softly
-    /// rounded. This gives notch and pill modes the same attached shape.
-    private func silhouette(isExpanded: Bool) -> HangingNotchShape {
+    /// curve inward from the screen edge while the lower corners remain
+    /// circular. Compact and expanded use identical radii; expansion only
+    /// adds the straight vertical side between those fixed curves.
+    private var silhouette: HangingNotchShape {
         HangingNotchShape(
-            topShoulderRadius: topShoulderRadius(isExpanded: isExpanded),
-            bottomCornerRadius: bottomCornerRadius(isExpanded: isExpanded)
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
         )
-    }
-
-    private func topShoulderRadius(isExpanded: Bool) -> CGFloat {
-        isExpanded
-            ? HangingNotchMetrics.expandedTopShoulderRadius
-            : HangingNotchMetrics.compactTopShoulderRadius
-    }
-
-    private func bottomCornerRadius(isExpanded: Bool) -> CGFloat {
-        if isExpanded { return HangingNotchMetrics.expandedBottomCornerRadius }
-        switch layout.presentation {
-        case .notch: return HangingNotchMetrics.compactNotchBottomCornerRadius
-        case .pill: return HangingNotchMetrics.compactPillBottomCornerRadius
-        }
     }
 
     // MARK: Menu visibility
@@ -374,8 +361,8 @@ struct NotchWidgetView: View {
         )
         let region = HangingNotchInteractionRegion(
             frame: frame,
-            topShoulderRadius: topShoulderRadius(isExpanded: isExpanded),
-            bottomCornerRadius: bottomCornerRadius(isExpanded: isExpanded)
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
         )
         onInteractiveRegionChange(region)
     }
@@ -426,8 +413,8 @@ struct NotchWidgetView: View {
                 localTopLeadingFrame: frame,
                 panelOriginX: layout.originX,
                 panelTopY: layout.originY + layout.height,
-                topShoulderRadius: topShoulderRadius(isExpanded: isExpanded),
-                bottomCornerRadius: bottomCornerRadius(isExpanded: isExpanded)
+                topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+                bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
             )
             isHoveringPanel = isInside
             if isInside {
