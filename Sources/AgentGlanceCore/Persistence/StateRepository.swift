@@ -107,6 +107,7 @@ public struct StateRepository: Sendable {
         } catch CocoaError.fileNoSuchFile {
             return
         }
+        StateChangeNotifier.post()
     }
 
     private func fileName(for session: AgentSession) throws -> String {

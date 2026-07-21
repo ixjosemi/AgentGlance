@@ -4,30 +4,31 @@
 
 **Know when your coding agents need you—without leaving the notch.**
 
-AgentGlance is a quiet, native macOS indicator for Claude Code, OpenCode, Codex CLI, [Pi](https://github.com/badlogic/pi-mono), and [Convoy](https://github.com/Inakitajes/convoy) pipeline sessions. It lives around the MacBook notch — Convoy, Pi, Codex, and OpenCode on the left wing, Claude on the right — and returns you to the exact terminal tab or tmux pane with one click.
+AgentGlance is a quiet, native macOS indicator for Claude Code, OpenCode, Codex CLI, [Pi](https://github.com/badlogic/pi-mono), and [Convoy](https://github.com/Inakitajes/convoy) pipeline sessions. It lives around the MacBook notch (or as a pill on displays without one) and returns you to the exact terminal tab or tmux pane with one click.
 
 > **Preview status:** AgentGlance is pre-1.0 and currently distributed as source. The local build is ad-hoc signed; signed and notarized downloads will follow once the release pipeline is ready.
 
 ## Why AgentGlance?
 
-- See only tools that currently have visible sessions, with official tool marks and session counts.
-- Click a tool and its session menu grows out of the notch itself: status light, session title taken from the live terminal tab, project directory, git branch (worktrees included) or Convoy pipeline step, and elapsed time.
+- See global counts for running, waiting, and blocked sessions without having to infer them from provider icons.
+- Click the status summary and its wide session menu grows out of the notch itself: provider, status light, session title taken from the live terminal tab, project directory, git branch (worktrees included) or Convoy pipeline step, and elapsed time.
 - Focus the recorded Ghostty, iTerm2, Terminal, or tmux session with one click.
 - Expand any row (chevron or right click) for inline actions: rename the session, copy the project path, reveal it in Finder, or kill the process — SIGTERM with SIGKILL escalation — and close its exact tmux pane or Ghostty tab.
 - Watch Convoy pipeline runs as first-class sessions: the current step in the row, red light on human gates, and no duplicate rows for the OpenCode sessions a pipeline owns.
-- Closed terminals disappear immediately — kernel exit notifications, not polling.
+- Closed terminals disappear immediately through kernel exit notifications, with a five-second scanner/reaper backstop for missed hooks and stale state.
+- Follow the screen with the pointer by default, or choose the screen with the focused window in Settings.
 - Keep all observation and state on your Mac.
 - Run without telemetry, accounts, servers, or third-party Swift dependencies, at ~1% CPU and ~16 MB of memory.
 
-## The traffic light
+## Session states
 
-| Light | Meaning |
+| State | Meaning |
 | --- | --- |
-| 🟢 Green (menu only, radar ping) | Working — the agent is processing. The bar stays silent: working is the default hum, not an alert. |
-| 🟡 Yellow, steady | Idle — the session waits at the prompt for your next input. |
-| 🔴 Red, pulsing | Needs you — a question, a permission ask, or a failed pipeline step is waiting. |
+| Running | The agent is processing. |
+| Waiting | The session waits at the prompt for your next input. |
+| Blocked | A question, permission ask, or failed pipeline step needs you. |
 
-The bar shows a dot only for waiting states; the menu always shows the real status per session. Visiting a waiting session — from the menu or by switching to its tab yourself — quiets its bar light until the session shows new activity.
+The compact bar shows a count for each state that actually exists right now — zero-count states leave no slot behind; the menu always shows the real status and provider per session.
 
 ## Requirements
 
@@ -114,7 +115,7 @@ macOS asks for Automation access the first time AgentGlance controls a terminal.
 
 Claude hooks, an OpenCode plugin, a Pi extension, the Codex rollout watcher, the Convoy runs watcher, and a process fallback produce versioned session documents under `~/.agentglance/state`. The app observes that directory and renders active sessions. State is written atomically with user-only permissions. Convoy needs no hook at all: its run metadata under `~/.convoy/runs` is read directly, and a run is only shown while its recorded server process is verifiably alive.
 
-Everything is event-driven and off the main thread: a libproc-based scanner (no subprocesses, ~2 ms per full sweep) runs on a 5-second heartbeat, kernel `EVFILT_PROC` exit watchers reap closed sessions instantly, and directory observation with debounce delivers state changes to the UI. Claude and OpenCode status changes land in well under a second; Codex and Convoy ride the heartbeat. Session titles follow the live Ghostty tab title — cleaned of status decorations and capped at 20 characters — and a manual rename (persisted in `~/.agentglance/session-names.json`) always wins. Agent matching accepts either the kernel-resolved executable path or `argv[0]`, so versioned symlink installs like `~/.local/bin/claude → …/versions/x.y.z` are detected correctly.
+Everything is event-driven and off the main thread: a libproc-based scanner (no subprocesses, ~2 ms per full sweep) runs on a 5-second heartbeat, kernel `EVFILT_PROC` exit watchers reap closed sessions instantly, and directory observation with debounce delivers state changes to the UI. A native session that has been quiet for a full scan interval is also checked against the detected agent set; removal requires two consecutive misses, so one transient metadata-read failure cannot hide a live session. Terminal identity disambiguates agents sharing a project directory. Claude and OpenCode status changes land in well under a second; Codex and Convoy ride the heartbeat. Session titles follow the live Ghostty tab title — cleaned of status decorations and capped at 20 characters — and a manual rename (persisted in `~/.agentglance/session-names.json`) always wins. Agent matching accepts either the kernel-resolved executable path or `argv[0]`, so versioned symlink installs like `~/.local/bin/claude → …/versions/x.y.z` are detected correctly.
 
 See [Architecture](docs/ARCHITECTURE.md) for the full data flow and trust boundaries.
 

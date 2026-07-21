@@ -7,15 +7,25 @@ public struct ReaperResult: Equatable, Sendable {
 }
 
 public struct ReaperService: Sendable {
+    /// The observation scheduler runs at this cadence. A native hook document
+    /// that has been quiet for at least one full pass is verified against the
+    /// detected agent set; two consecutive misses distinguish stale state
+    /// from one transient per-process metadata read failure.
+    public static let staleSessionInterval: TimeInterval = 5
+
     private let repository: StateRepository
     private let processScanner: any ProcessScanning
+    private let now: @Sendable () -> Date
+    private let nativeMisses = NativeSessionMissTracker()
 
     public init(
         repository: StateRepository,
-        processScanner: any ProcessScanning = SystemProcessScanner()
+        processScanner: any ProcessScanning = SystemProcessScanner(),
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.repository = repository
         self.processScanner = processScanner
+        self.now = now
     }
 
     public func reap() throws -> ReaperResult {
@@ -27,13 +37,18 @@ public struct ReaperService: Sendable {
     /// trigger a rescan per consumer.
     public func reap(detected activeProcesses: [DetectedAgentProcess]) throws -> ReaperResult {
         let sessions = try repository.loadSessions()
+        nativeMisses.retain(sessionIDs: Set(sessions.map(\.id)))
         let activeProcessKeys = Set(activeProcesses.map {
             "\($0.tool.rawValue)-\($0.processID)"
         })
         var removedSessionIDs: [String] = []
         var survivors: [AgentSession] = []
         for session in sessions {
-            if shouldRemove(session, activeProcessKeys: activeProcessKeys) {
+            if shouldRemove(
+                session,
+                activeProcessKeys: activeProcessKeys,
+                activeProcesses: activeProcesses
+            ) {
                 try repository.remove(session)
                 removedSessionIDs.append(session.sessionID)
             } else {
@@ -120,13 +135,38 @@ public struct ReaperService: Sendable {
 
     private func shouldRemove(
         _ session: AgentSession,
-        activeProcessKeys: Set<String>
+        activeProcessKeys: Set<String>,
+        activeProcesses: [DetectedAgentProcess]
     ) -> Bool {
         if session.status == .ended || !isAlive(session.pid) {
+            nativeMisses.clear(sessionID: session.id)
             return true
         }
         let key = "\(session.tool.rawValue)-\(session.pid)"
-        return session.source == .reaper && !activeProcessKeys.contains(key)
+        if session.source == .reaper {
+            return !activeProcessKeys.contains(key)
+        }
+        // A freshly written native document gets one full scheduler interval
+        // to be correlated with its terminal. Hooks/plugins can write before
+        // the scanner observes the process, so removing it earlier races a
+        // legitimate startup.
+        guard now().timeIntervalSince(session.updatedAt) >= Self.staleSessionInterval,
+              !activeProcessKeys.contains(key) else {
+            nativeMisses.clear(sessionID: session.id)
+            return false
+        }
+        // OpenCode plugins can be hosted by a daemon rather than the visible
+        // terminal process. Keep the document only when it can be rebound to
+        // exactly one live same-tool process in its working directory.
+        let rebindCandidates = candidatesForRebinding(session, to: activeProcesses)
+        guard rebindCandidates.count != 1 else {
+            nativeMisses.clear(sessionID: session.id)
+            return false
+        }
+        // One per-process metadata read can fail while the process table is
+        // changing. Require the same old native document to miss two complete
+        // scans before treating its still-live PID as unrelated.
+        return nativeMisses.recordMiss(sessionID: session.id) >= 2
     }
 
     /// Sessions written by a plugin hosted in a shared daemon (OpenCode's
@@ -145,7 +185,7 @@ public struct ReaperService: Sendable {
                   !sameToolProcesses.contains(where: { $0.processID == session.pid }) else {
                 return session
             }
-            let candidates = sameToolProcesses.filter { $0.cwd == session.cwd }
+            let candidates = candidatesForRebinding(session, to: sameToolProcesses)
             guard candidates.count == 1 else { return session }
             let rebound = session.replacingProcessID(candidates[0].processID)
             try repository.save(rebound)
@@ -236,5 +276,76 @@ public struct ReaperService: Sendable {
             return true
         }
         return errno == EPERM
+    }
+
+    /// Prefer a terminal identity over cwd when several agents of the same
+    /// kind run in one repository. Cwd remains the fallback for daemon-hosted
+    /// plugins that cannot report a tty or terminal surface.
+    private func candidatesForRebinding(
+        _ session: AgentSession,
+        to activeProcesses: [DetectedAgentProcess]
+    ) -> [DetectedAgentProcess] {
+        let sameDirectory = activeProcesses.filter {
+            $0.tool == session.tool && $0.cwd == session.cwd
+        }
+        let relationships = sameDirectory.map { process in
+            (process, terminalRelationship(session.terminal, process.terminal))
+        }
+        let terminalMatches = relationships.compactMap { process, relationship in
+            relationship == .match ? process : nil
+        }
+        if !terminalMatches.isEmpty { return terminalMatches }
+        // A known-but-different tty or terminal surface is positive evidence
+        // that cwd alone refers to another session. Fall back to cwd only
+        // when neither side exposes a comparable identity.
+        if relationships.contains(where: { $0.1 == .conflict }) { return [] }
+        return sameDirectory
+    }
+
+    private enum TerminalRelationship {
+        case match
+        case conflict
+        case unavailable
+    }
+
+    private func terminalRelationship(
+        _ lhs: TerminalContext,
+        _ rhs: TerminalContext
+    ) -> TerminalRelationship {
+        let identities: [(String?, String?)] = [
+            (lhs.ghosttyTerminalID, rhs.ghosttyTerminalID),
+            (lhs.itermSessionID, rhs.itermSessionID),
+            (lhs.tmuxPane, rhs.tmuxPane),
+            (lhs.tty, rhs.tty),
+        ]
+        for (left, right) in identities {
+            guard let left, let right else { continue }
+            return left == right ? .match : .conflict
+        }
+        return .unavailable
+    }
+}
+
+private final class NativeSessionMissTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var counts: [String: Int] = [:]
+
+    func recordMiss(sessionID: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        counts[sessionID, default: 0] += 1
+        return counts[sessionID, default: 0]
+    }
+
+    func clear(sessionID: String) {
+        lock.lock()
+        counts[sessionID] = nil
+        lock.unlock()
+    }
+
+    func retain(sessionIDs: Set<String>) {
+        lock.lock()
+        counts = counts.filter { sessionIDs.contains($0.key) }
+        lock.unlock()
     }
 }

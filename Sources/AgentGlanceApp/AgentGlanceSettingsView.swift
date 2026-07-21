@@ -8,6 +8,7 @@ struct AgentGlanceSettingsView: View {
     @AppStorage("hideWhenEmpty") private var hideWhenEmpty = false
     @AppStorage("attentionSoundEnabled") private var attentionSoundEnabled = true
     @AppStorage("turnCompleteSoundEnabled") private var turnCompleteSoundEnabled = true
+    @AppStorage("screenSelectionMode") private var screenSelectionMode = ScreenSelectionMode.pointer.rawValue
     @State private var loginItemEnabled = SMAppService.mainApp.status == .enabled
     @State private var errorMessage: String?
 
@@ -21,6 +22,10 @@ struct AgentGlanceSettingsView: View {
                 Toggle("Hide when no sessions are active", isOn: $hideWhenEmpty)
                 Toggle("Play the alert sound when a session needs you", isOn: $attentionSoundEnabled)
                 Toggle("Play a soft sound when a session finishes its turn", isOn: $turnCompleteSoundEnabled)
+                Picker("Show the notch on", selection: $screenSelectionMode) {
+                    Text("Screen with pointer").tag(ScreenSelectionMode.pointer.rawValue)
+                    Text("Screen with focused window").tag(ScreenSelectionMode.focusedWindow.rawValue)
+                }
             }
             Section {
                 Button("Reset custom session names") {
@@ -43,7 +48,7 @@ struct AgentGlanceSettingsView: View {
         }
         .formStyle(.grouped)
         .padding()
-        .frame(width: 390)
+        .frame(width: 420)
     }
 
     /// `swift run` executes outside the app bundle, where no Info.plist

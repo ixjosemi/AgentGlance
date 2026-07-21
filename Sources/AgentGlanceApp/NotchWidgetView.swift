@@ -7,55 +7,85 @@ struct NotchWidgetView: View {
     @Bindable var store: StateStore
     @AppStorage("hideWhenEmpty") private var hideWhenEmpty = false
     let layout: NotchLayout
-    let onInteractiveSizeChange: (CGSize) -> Void
+    /// After a screen jump the controller keeps hover-expansion locked until
+    /// the pointer actually moves; this closure answers whether a hover at
+    /// the given global position may open the menu. Clicks bypass it.
+    let allowHoverExpansion: (DisplayPoint) -> Bool
+    let onInteractiveRegionChange: (HangingNotchInteractionRegion) -> Void
     let onKeyboardFocusChange: (Bool) -> Void
+    let onMenuVisibilityChange: (Bool) -> Void
 
-    @State private var expandedTool: AgentTool?
+    @State private var isExpanded = false
     @State private var collapseWorkItem: DispatchWorkItem?
     @State private var hoverExpandWorkItem: DispatchWorkItem?
-    @State private var hoverExpandCandidate: AgentTool?
     @State private var isHoveringPanel = false
     @State private var openMenuTrackingCount = 0
     @State private var rowInteractionActive = false
     @State private var outsideClickMonitor: Any?
+    @State private var latestMeasuredContentHeight: CGFloat = 0
 
     var body: some View {
-        // The bar semaphore ignores waiting sessions the user has already
-        // visited; the menu below keeps showing their real status.
-        let placement = NotchWingPlacement.place(
-            ToolSummary.active(in: store.acknowledgments.silenced(store.sessions))
+        let summary = SessionStatusSummary(
+            sessions: store.sessions,
+            acknowledgments: store.acknowledgments
         )
-        let isEmpty = placement.leftWing.isEmpty && placement.rightWing.isEmpty
-        let shouldHide = isEmpty && hideWhenEmpty
-        let leftWidth = wingWidth(placement.leftWing, idleDot: isEmpty)
-        let rightWidth = wingWidth(placement.rightWing, idleDot: false)
-
+        let shouldHide = summary.activeSessionCount == 0 && hideWhenEmpty
+        let leftEntries = summary.visibleEntries.filter { $0.kind != .blocked }
+        let rightEntries = summary.visibleEntries.filter { $0.kind == .blocked }
+        let showsIdleMark = summary.activeSessionCount == 0
+        let naturalLeftWidth = NotchLayout.statusWingWidth(
+            visibleIndicatorCount: leftEntries.count,
+            showsIdleMark: showsIdleMark
+        )
+        let naturalRightWidth = NotchLayout.statusWingWidth(
+            visibleIndicatorCount: rightEntries.count,
+            showsIdleMark: false
+        )
+        let wingWidths = layout.balancedStatusWingWidths(
+            leftWidth: naturalLeftWidth,
+            rightWidth: naturalRightWidth
+        )
+        let leftWidth = wingWidths.left
+        let rightWidth = wingWidths.right
         let barWidth = leftWidth + layout.notchWidth + rightWidth
-        let isExpanded = expandedTool != nil
-        let paddings = layout.sidePaddings(
+        let barLeadingOffset = layout.barLeadingOffset(
             leftWidth: leftWidth,
-            rightWidth: rightWidth,
-            menuVisible: isExpanded
+            rightWidth: rightWidth
         )
-        let interactiveSize = Self.interactiveSize(
-            layout: layout,
-            barWidth: barWidth,
-            isExpanded: isExpanded,
-            isHidden: shouldHide
+        let menuWidth = layout.width
+        let menuContentWidth = NotchLayout.contentWidth(forExpandedPanelWidth: menuWidth)
+        let compactInteractiveFrame = DisplayFrame(
+            minX: barLeadingOffset,
+            minY: 0,
+            width: barWidth,
+            height: layout.height
         )
 
-        // Bar and menu share one background silhouette so the expanded menu
-        // grows out of the notch as a single continuous shape — no seam, no
-        // overlap tricks.
-        ZStack(alignment: .top) {
+        // One view tree for both presentations: the bar never leaves the
+        // hierarchy, so expanding animates the shared silhouette growing out
+        // of the notch instead of cross-fading between two layouts. The bar
+        // stays pinned to the camera housing the whole time: the outer offset
+        // and the row's inner offset always sum to barLeadingOffset.
+        ZStack(alignment: .topLeading) {
             if !shouldHide {
-                VStack(spacing: 0) {
-                    barRow(placement: placement, isEmpty: isEmpty, leftWidth: leftWidth, rightWidth: rightWidth)
-                        .frame(width: barWidth, height: layout.height, alignment: .top)
-                    if let expandedTool {
+                VStack(alignment: .leading, spacing: 0) {
+                    Button(action: openMenu) {
+                        barRow(
+                            leftEntries: leftEntries,
+                            rightEntries: rightEntries,
+                            showsIdleMark: showsIdleMark,
+                            leftWidth: leftWidth,
+                            rightWidth: rightWidth
+                        )
+                        .contentShape(silhouette(isExpanded: false))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Show active sessions")
+                    .frame(width: barWidth, height: layout.height)
+                    .offset(x: isExpanded ? barLeadingOffset : 0)
+                    if isExpanded {
                         SessionMenuCard(
-                            tool: expandedTool,
-                            sessions: store.sessions(for: expandedTool),
+                            sessions: store.sessions,
                             dismiss: collapseMenu,
                             acknowledge: { store.acknowledge($0) },
                             sessionTitle: { store.displayName(for: $0) },
@@ -67,21 +97,81 @@ struct NotchWidgetView: View {
                                 if !isActive { settleAfterDetachedInteraction() }
                             }
                         )
-                        .frame(width: layout.menuCardWidth(barWidth: barWidth))
+                        .frame(width: menuContentWidth)
+                        .frame(width: menuWidth, alignment: .center)
                         .transition(.opacity)
                     }
                 }
+                .frame(width: isExpanded ? menuWidth : barWidth, alignment: .topLeading)
                 .background(
                     silhouette(isExpanded: isExpanded)
-                        // Explicit pure black: on a notchless display the pill
-                        // stands alone instead of blending into a bezel, and
-                        // any gray read breaks the Dynamic-Island effect.
+                        // Explicit pure black: the notchless drop should read
+                        // as part of the screen edge, and any gray breaks that
+                        // continuous silhouette.
                         .fill(Color(white: 0))
-                        .shadow(color: .black.opacity(isExpanded ? 0.45 : 0), radius: 18, y: 8)
                 )
-                // Hover and the context menu belong to the silhouette, not
-                // the outer frame: the panel is always expanded-height, so
-                // the outer frame covers transparent dead space below.
+                // The side is now one continuous S. Clip row hover fills and
+                // inline-action backgrounds to the same path so they cannot
+                // leak into its transparent lower pockets.
+                .clipShape(silhouette(isExpanded: isExpanded))
+                .background {
+                    GeometryReader { geometry in
+                        Color.clear.preference(
+                            key: InteractiveHeightPreferenceKey.self,
+                            value: geometry.size.height
+                        )
+                    }
+                }
+                // Gestures live on the silhouette, not the outer frame: the
+                // panel is always expanded-height, so the outer frame covers
+                // transparent dead space below the visible shape.
+                .contentShape(silhouette(isExpanded: isExpanded))
+                .onContinuousHover(coordinateSpace: .local) { phase in
+                    switch phase {
+                    case .active:
+                        let mouse = NSEvent.mouseLocation
+                        let pointer = DisplayPoint(x: mouse.x, y: mouse.y)
+                        let visibleFrame = HoverInteraction.visibleHoverFrame(
+                            compactFrame: compactInteractiveFrame,
+                            expandedPanelWidth: layout.width,
+                            expandedMaximumHeight: layout.expandedHeight,
+                            measuredContentHeight: latestMeasuredContentHeight,
+                            isExpanded: isExpanded,
+                            isHidden: false
+                        )
+                        guard HoverInteraction.pointerIsInsideHangingSilhouette(
+                            pointer,
+                            localTopLeadingFrame: visibleFrame,
+                            panelOriginX: layout.originX,
+                            panelTopY: layout.originY + layout.height,
+                            topShoulderRadius: topShoulderRadius(isExpanded: isExpanded),
+                            bottomCornerRadius: bottomCornerRadius(isExpanded: isExpanded)
+                        ) else {
+                            isHoveringPanel = false
+                            hoverExpandWorkItem?.cancel()
+                            hoverExpandWorkItem = nil
+                            scheduleCollapseOnHoverExit()
+                            return
+                        }
+                        isHoveringPanel = true
+                        collapseWorkItem?.cancel()
+                        // After a screen jump the bar appears under an
+                        // unmoving pointer; only real travel unlocks
+                        // hover-expansion. Clicks stay always allowed.
+                        guard HoverInteraction.shouldScheduleExpansion(
+                            pointer: pointer,
+                            compactFrame: compactInteractiveFrame,
+                            panelOriginX: layout.originX,
+                            panelTopY: layout.originY + layout.height,
+                            isExpanded: isExpanded,
+                            topShoulderRadius: topShoulderRadius(isExpanded: false),
+                            bottomCornerRadius: bottomCornerRadius(isExpanded: false)
+                        ) else { return }
+                        if allowHoverExpansion(pointer) { scheduleExpansion() }
+                    case .ended:
+                        reconcileHoverExit(compactFrame: compactInteractiveFrame)
+                    }
+                }
                 .contextMenu {
                     SettingsLink {
                         Label("AgentGlance Settings", systemImage: "gearshape")
@@ -92,10 +182,6 @@ struct NotchWidgetView: View {
                     } label: {
                         Label("Quit AgentGlance", systemImage: "power")
                     }
-                }
-                .onHover { isHovering in
-                    isHoveringPanel = isHovering
-                    scheduleCollapseOnHoverExit(isHovering)
                 }
                 // A session row's context menu is an NSMenu window outside
                 // this view: opening it fires a hover exit that would
@@ -112,24 +198,65 @@ struct NotchWidgetView: View {
                     openMenuTrackingCount = max(0, openMenuTrackingCount - 1)
                     settleAfterDetachedInteraction()
                 }
-                .padding(.leading, paddings.leading)
-                .padding(.trailing, paddings.trailing)
+                // Offset the rendered surface *after* attaching its shape and
+                // hover tracking. Applying offset first leaves those later
+                // modifiers at the unshifted 720-point panel origin: pill
+                // hover then misses entirely and notch hover lands in empty
+                // space to the left of the visible bar.
+                .offset(x: isExpanded ? 0 : barLeadingOffset)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: expandedTool)
-        .onAppear { onInteractiveSizeChange(interactiveSize) }
-        .onChange(of: interactiveSize) { _, newSize in
-            onInteractiveSizeChange(newSize)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: isExpanded)
+        .onAppear {
+            publishInteractiveRegion(
+                compactFrame: compactInteractiveFrame,
+                measuredContentHeight: latestMeasuredContentHeight,
+                isExpanded: isExpanded,
+                isHidden: shouldHide
+            )
+            onMenuVisibilityChange(isExpanded)
         }
-        .onChange(of: expandedTool != nil) { _, isVisible in
+        .onPreferenceChange(InteractiveHeightPreferenceKey.self) { measuredHeight in
+            latestMeasuredContentHeight = measuredHeight
+            publishInteractiveRegion(
+                compactFrame: compactInteractiveFrame,
+                measuredContentHeight: measuredHeight,
+                isExpanded: isExpanded,
+                isHidden: shouldHide
+            )
+        }
+        .onChange(of: isExpanded) { _, isVisible in
+            publishInteractiveRegion(
+                compactFrame: compactInteractiveFrame,
+                measuredContentHeight: latestMeasuredContentHeight,
+                isExpanded: isVisible,
+                isHidden: shouldHide
+            )
             updateOutsideClickMonitor(menuIsVisible: isVisible)
+            onMenuVisibilityChange(isVisible)
         }
-        .onDisappear { updateOutsideClickMonitor(menuIsVisible: false) }
-        // Killing or losing the last session of the expanded tool leaves
-        // nothing to show — and the tool's own bar icon disappears with it —
-        // so the menu closes itself instead of floating over an empty list.
-        .onChange(of: expandedTool.map { store.sessions(for: $0).isEmpty } ?? false) { _, isNowEmpty in
+        .onChange(of: compactInteractiveFrame) { _, newFrame in
+            publishInteractiveRegion(
+                compactFrame: newFrame,
+                measuredContentHeight: latestMeasuredContentHeight,
+                isExpanded: isExpanded,
+                isHidden: shouldHide
+            )
+        }
+        .onChange(of: shouldHide) { _, isHidden in
+            publishInteractiveRegion(
+                compactFrame: compactInteractiveFrame,
+                measuredContentHeight: latestMeasuredContentHeight,
+                isExpanded: isExpanded,
+                isHidden: isHidden
+            )
+        }
+        .onDisappear {
+            updateOutsideClickMonitor(menuIsVisible: false)
+            onMenuVisibilityChange(false)
+        }
+        .onChange(of: store.sessions.isEmpty) { _, isNowEmpty in
             if isNowEmpty { collapseMenu() }
         }
     }
@@ -137,199 +264,180 @@ struct NotchWidgetView: View {
     // MARK: Bar
 
     private func barRow(
-        placement: NotchWingPlacement,
-        isEmpty: Bool,
+        leftEntries: [SessionStatusSummary.StatusEntry],
+        rightEntries: [SessionStatusSummary.StatusEntry],
+        showsIdleMark: Bool,
         leftWidth: CGFloat,
         rightWidth: CGFloat
     ) -> some View {
         // Wings span the full bar height so the click targets reach the top
-        // edge of the screen — the natural place to slam the pointer.
+        // edge of the screen — the natural place to slam the pointer. Only
+        // states with a nonzero count take up a slot. Every indicator is a
+        // fixed slot and wing widths add up exactly, so padding stays
+        // symmetric on both pill and notch — no slack parked at either end.
         HStack(spacing: 0) {
-            wingContent(placement.leftWing, idleDot: isEmpty)
-                .frame(width: leftWidth, height: layout.height)
-            Color.clear
-                .frame(width: layout.notchWidth, height: layout.height)
-            wingContent(placement.rightWing, idleDot: false)
-                .frame(width: rightWidth, height: layout.height)
-        }
-    }
-
-    private func wingWidth(_ wing: [ToolSummary], idleDot: Bool) -> CGFloat {
-        if wing.isEmpty {
-            return idleDot ? 30 : 0
-        }
-        return NotchLayout.wingWidth(activeToolCount: wing.count)
-    }
-
-    /// Bar and menu share one background shape so the expanded menu grows
-    /// out of the bar as a single continuous silhouette — no seam, no
-    /// overlap tricks. Collapsed, the pill keeps its full capsule caps.
-    private func silhouette(isExpanded: Bool) -> UnevenRoundedRectangle {
-        switch layout.presentation {
-        case .notch:
-            UnevenRoundedRectangle(
-                topLeadingRadius: 0,
-                bottomLeadingRadius: isExpanded ? 20 : 12,
-                bottomTrailingRadius: isExpanded ? 20 : 12,
-                topTrailingRadius: 0,
-                style: .continuous
-            )
-        case .pill:
-            UnevenRoundedRectangle(
-                topLeadingRadius: layout.height / 2,
-                bottomLeadingRadius: isExpanded ? 20 : layout.height / 2,
-                bottomTrailingRadius: isExpanded ? 20 : layout.height / 2,
-                topTrailingRadius: layout.height / 2,
-                style: .continuous
-            )
-        }
-    }
-
-    /// The strip of the panel that should accept mouse events. Width 0 means
-    /// "unrestricted" — notch mode keeps the full wings-and-notch strip
-    /// interactive; the pill claims only its own silhouette so the menu bar
-    /// beside it keeps receiving clicks. A hidden bar claims nothing.
-    private static func interactiveSize(
-        layout: NotchLayout,
-        barWidth: CGFloat,
-        isExpanded: Bool,
-        isHidden: Bool
-    ) -> CGSize {
-        guard !isHidden else { return .zero }
-        let height = isExpanded ? layout.expandedHeight : layout.height
-        switch layout.presentation {
-        case .notch:
-            return CGSize(width: 0, height: height)
-        case .pill:
-            return CGSize(
-                width: isExpanded ? layout.menuCardWidth(barWidth: barWidth) : barWidth,
-                height: height
-            )
-        }
-    }
-
-    @ViewBuilder
-    private func wingContent(_ wing: [ToolSummary], idleDot: Bool) -> some View {
-        if wing.isEmpty {
-            if idleDot {
-                // Quiet empty state: the app is awake but no agent is running.
-                Image(systemName: "moon.zzz.fill")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.32))
-                    .accessibilityLabel("No active agents")
-            }
-        } else {
-            HStack(spacing: 5) {
-                ForEach(wing, id: \.tool) { summary in
-                    ToolIndicator(
-                        summary: summary,
-                        isExpanded: expandedTool == summary.tool,
-                        barHeight: layout.height,
-                        onHoverChange: { hovering in
-                            if hovering {
-                                scheduleExpansion(for: summary.tool)
-                            } else {
-                                cancelScheduledExpansion(for: summary.tool)
-                            }
-                        },
-                        select: { openMenu(for: summary.tool) }
-                    )
+            Group {
+                if leftEntries.isEmpty {
+                    if showsIdleMark {
+                        // Quiet empty state: the app is awake but no agent
+                        // is running.
+                        Image(systemName: "moon.zzz.fill")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.32))
+                            .frame(maxWidth: .infinity)
+                            .accessibilityLabel("No active agents")
+                    }
+                } else {
+                    HStack(spacing: NotchLayout.statusIndicatorSpacing) {
+                        ForEach(leftEntries) { entry in
+                            StatusSummaryIndicator(kind: entry.kind, count: entry.count)
+                        }
+                    }
+                    .padding(.horizontal, NotchLayout.statusWingEdgePadding)
                 }
             }
-            .padding(.horizontal, 6)
+            .frame(width: leftWidth, height: layout.height, alignment: .trailing)
+            Color.clear
+                .frame(width: layout.notchWidth, height: layout.height)
+            Group {
+                if !rightEntries.isEmpty {
+                    HStack(spacing: NotchLayout.statusIndicatorSpacing) {
+                        ForEach(rightEntries) { entry in
+                            StatusSummaryIndicator(kind: entry.kind, count: entry.count)
+                        }
+                    }
+                    .padding(.horizontal, NotchLayout.statusWingEdgePadding)
+                }
+            }
+            .frame(width: rightWidth, height: layout.height, alignment: .leading)
+        }
+    }
+
+    /// Bar and menu share one hanging-drop silhouette: the top shoulders
+    /// curve inward from the screen edge while the lower corners stay softly
+    /// rounded. This gives notch and pill modes the same attached shape.
+    private func silhouette(isExpanded: Bool) -> HangingNotchShape {
+        HangingNotchShape(
+            topShoulderRadius: topShoulderRadius(isExpanded: isExpanded),
+            bottomCornerRadius: bottomCornerRadius(isExpanded: isExpanded)
+        )
+    }
+
+    private func topShoulderRadius(isExpanded: Bool) -> CGFloat {
+        isExpanded
+            ? HangingNotchMetrics.expandedTopShoulderRadius
+            : HangingNotchMetrics.compactTopShoulderRadius
+    }
+
+    private func bottomCornerRadius(isExpanded: Bool) -> CGFloat {
+        if isExpanded { return HangingNotchMetrics.expandedBottomCornerRadius }
+        switch layout.presentation {
+        case .notch: return HangingNotchMetrics.compactNotchBottomCornerRadius
+        case .pill: return HangingNotchMetrics.compactPillBottomCornerRadius
         }
     }
 
     // MARK: Menu visibility
 
-    /// How long the pointer must rest on a tool before its menu opens on
-    /// its own — long enough that crossing the bar on the way elsewhere
-    /// never pops a menu, short enough to feel immediate on a stop.
     private static let hoverExpandDelay: TimeInterval = 0.15
 
-    /// Hover opens menus the way the Dynamic Island and menu-bar tracking
-    /// behave: the first opening waits out the delay, but once a menu is
-    /// open, sliding sideways to another tool switches immediately.
-    private func scheduleExpansion(for tool: AgentTool) {
-        if expandedTool != nil {
-            hoverExpandWorkItem?.cancel()
-            hoverExpandCandidate = nil
-            if expandedTool != tool { expandedTool = tool }
-            return
-        }
-        guard hoverExpandCandidate != tool else { return }
-        hoverExpandWorkItem?.cancel()
-        hoverExpandCandidate = tool
+    private func scheduleExpansion() {
+        guard !isExpanded, hoverExpandWorkItem == nil else { return }
         let workItem = DispatchWorkItem {
-            expandedTool = tool
-            hoverExpandCandidate = nil
+            isExpanded = true
+            hoverExpandWorkItem = nil
         }
         hoverExpandWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.hoverExpandDelay, execute: workItem)
     }
 
-    /// The pointer left a tool before the delay elapsed — cancel only if
-    /// the pending opening is still that tool's, never a newer one.
-    private func cancelScheduledExpansion(for tool: AgentTool) {
-        guard hoverExpandCandidate == tool else { return }
+    private func openMenu() {
         hoverExpandWorkItem?.cancel()
-        hoverExpandCandidate = nil
+        hoverExpandWorkItem = nil
+        collapseWorkItem?.cancel()
+        isExpanded = true
     }
 
-    /// Click opens — or switches to — a tool's menu, but never closes the
-    /// one already showing. Clicking the indicator of the expanded tool is
-    /// redundant, and swallowing it also kills the contradictory flash when
-    /// the hover expansion fires mid-click, between mouse-down and mouse-up:
-    /// without this, the late click would toggle shut what hover just opened.
-    private func openMenu(for tool: AgentTool) {
-        hoverExpandWorkItem?.cancel()
-        hoverExpandCandidate = nil
-        collapseWorkItem?.cancel()
-        guard expandedTool != tool else { return }
-        expandedTool = tool
+    private func publishInteractiveRegion(
+        compactFrame: DisplayFrame,
+        measuredContentHeight: CGFloat,
+        isExpanded: Bool,
+        isHidden: Bool
+    ) {
+        let frame = HoverInteraction.interactiveFrame(
+            compactFrame: compactFrame,
+            expandedPanelWidth: layout.width,
+            expandedMaximumHeight: layout.expandedHeight,
+            measuredContentHeight: measuredContentHeight,
+            isExpanded: isExpanded,
+            isHidden: isHidden
+        )
+        let region = HangingNotchInteractionRegion(
+            frame: frame,
+            topShoulderRadius: topShoulderRadius(isExpanded: isExpanded),
+            bottomCornerRadius: bottomCornerRadius(isExpanded: isExpanded)
+        )
+        onInteractiveRegionChange(region)
     }
 
     private func collapseMenu() {
         hoverExpandWorkItem?.cancel()
-        hoverExpandCandidate = nil
+        hoverExpandWorkItem = nil
         collapseWorkItem?.cancel()
-        expandedTool = nil
+        isExpanded = false
     }
 
-    /// Collapse shortly after the pointer leaves the notch surface, mirroring
-    /// how notch utilities dismiss; the grace period tolerates brief exits.
-    /// While a menu is open or a row interaction — inline rename, kill
-    /// confirmation — is underway, collapsing is deferred until it ends.
-    private func scheduleCollapseOnHoverExit(_ isHovering: Bool) {
+    /// Collapse shortly after the pointer leaves the panel, mirroring how
+    /// notch utilities dismiss. Inline row interactions keep it open.
+    private func scheduleCollapseOnHoverExit() {
         collapseWorkItem?.cancel()
-        if !isHovering {
-            // Leaving the whole panel also abandons any opening the hover
-            // delay had armed but not yet fired.
-            hoverExpandWorkItem?.cancel()
-            hoverExpandCandidate = nil
-        }
-        guard !isHovering,
-              expandedTool != nil,
+        hoverExpandWorkItem?.cancel()
+        hoverExpandWorkItem = nil
+        guard isExpanded,
               openMenuTrackingCount == 0,
               !rowInteractionActive else { return }
-        let workItem = DispatchWorkItem { expandedTool = nil }
+        let workItem = DispatchWorkItem { isExpanded = false }
         collapseWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: workItem)
     }
 
-    /// After a menu or modal dialog closes, no hover event fires if the
-    /// pointer already sits outside the panel — re-arm the collapse manually
-    /// so the panel never sticks open.
     private func settleAfterDetachedInteraction() {
         guard !isHoveringPanel else { return }
-        scheduleCollapseOnHoverExit(false)
+        scheduleCollapseOnHoverExit()
     }
 
-    /// A click anywhere outside the app dismisses the open menu immediately,
-    /// the way any system menu behaves. Global monitors never see events in
-    /// our own windows, so clicks inside the panel are unaffected; they also
-    /// bypass the hover grace period and the row-interaction lock — clicking
-    /// elsewhere is an unambiguous "I am done here".
+    /// SwiftUI replaces the tracking area when the silhouette grows from the
+    /// compact bar to the menu. AppKit reports an exit from the old area even
+    /// when the pointer is still inside the new one; defer one run-loop turn
+    /// and compare against the real global pointer position before collapsing.
+    private func reconcileHoverExit(compactFrame: DisplayFrame) {
+        DispatchQueue.main.async {
+            let frame = HoverInteraction.visibleHoverFrame(
+                compactFrame: compactFrame,
+                expandedPanelWidth: layout.width,
+                expandedMaximumHeight: layout.expandedHeight,
+                measuredContentHeight: latestMeasuredContentHeight,
+                isExpanded: isExpanded,
+                isHidden: false
+            )
+            let mouse = NSEvent.mouseLocation
+            let isInside = HoverInteraction.pointerIsInsideHangingSilhouette(
+                DisplayPoint(x: mouse.x, y: mouse.y),
+                localTopLeadingFrame: frame,
+                panelOriginX: layout.originX,
+                panelTopY: layout.originY + layout.height,
+                topShoulderRadius: topShoulderRadius(isExpanded: isExpanded),
+                bottomCornerRadius: bottomCornerRadius(isExpanded: isExpanded)
+            )
+            isHoveringPanel = isInside
+            if isInside {
+                collapseWorkItem?.cancel()
+            } else {
+                scheduleCollapseOnHoverExit()
+            }
+        }
+    }
+
     private func updateOutsideClickMonitor(menuIsVisible: Bool) {
         if let outsideClickMonitor {
             NSEvent.removeMonitor(outsideClickMonitor)
@@ -342,87 +450,84 @@ struct NotchWidgetView: View {
             collapseMenu()
         }
     }
+
 }
 
-// MARK: - Tool indicator
+private struct HangingNotchShape: Shape {
+    var topShoulderRadius: CGFloat
+    var bottomCornerRadius: CGFloat
 
-private struct ToolIndicator: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    let summary: ToolSummary
-    let isExpanded: Bool
-    /// The bar the indicator sits in: the pill presentation is slimmer
-    /// than a notch bar, so the highlight shrinks to fit instead of
-    /// spilling past the capsule.
-    let barHeight: CGFloat
-    let onHoverChange: (Bool) -> Void
-    let select: () -> Void
-    @State private var attentionIsBright = false
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { AnimatablePair(topShoulderRadius, bottomCornerRadius) }
+        set {
+            topShoulderRadius = newValue.first
+            bottomCornerRadius = newValue.second
+        }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        Path(HangingNotchGeometry.path(
+            in: rect,
+            topShoulderRadius: topShoulderRadius,
+            bottomCornerRadius: bottomCornerRadius
+        ))
+    }
+}
+
+private struct InteractiveHeightPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+// MARK: - Status indicators
+
+private extension SessionStatusSummary.StatusEntry.Kind {
+    var accessibilityName: String {
+        switch self {
+        case .running: "running"
+        case .waiting: "waiting"
+        case .blocked: "blocked"
+        }
+    }
+}
+
+/// One compact status counter. Zero-count states never reach this view —
+/// the summary filters them out — so every glyph on the bar earns its
+/// space. Waiting and blocked share the same dot size: state reads through
+/// color alone, keeping red as the only hue with meaning.
+private struct StatusSummaryIndicator: View {
+    let kind: SessionStatusSummary.StatusEntry.Kind
+    let count: Int
 
     var body: some View {
-        Button(action: select) {
-            HStack(spacing: 5) {
-                AgentIconView(tool: summary.tool)
-                if summary.sessionCount > 0 {
-                    Text(summary.sessionCount, format: .number)
-                        .font(.system(size: 13, weight: .medium, design: .rounded))
-                        .monospacedDigit()
-                }
-                // Idle is the app's resting state and stays silent — no dot,
-                // no color. Working gets the quiet pixel spinner; only a
-                // session that actually needs you lights up, in red.
-                switch summary.worstStatus {
-                case .needsAttention:
-                    Circle()
-                        .fill(.red)
-                        .frame(width: 6, height: 6)
-                        .opacity(attentionOpacity)
-                        .onAppear {
-                            guard !reduceMotion else { return }
-                            withAnimation(.easeInOut(duration: 1).repeatForever(autoreverses: true)) {
-                                attentionIsBright = true
-                            }
-                        }
-                case .working:
-                    WorkingPixelSpinner()
-                case .idle, .ended, nil:
-                    EmptyView()
-                }
+        HStack(spacing: 3) {
+            switch kind {
+            case .running:
+                WorkingPixelSpinner()
+            case .waiting:
+                Circle()
+                    .fill(.white.opacity(0.45))
+                    .frame(width: 8, height: 8)
+            case .blocked:
+                Circle()
+                    .fill(.red)
+                    .frame(width: 8, height: 8)
             }
-            .frame(minWidth: 46, minHeight: min(24, barHeight - 4))
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(.white.opacity(isExpanded ? 0.12 : 0))
-                    // Slots hug their content so the bar stays compact; the
-                    // highlight only appears on expansion, where a slot-wide
-                    // pill reads cramped — let it bleed past the slot instead
-                    // of widening the whole bar for a transient state.
-                    .padding(.horizontal, isExpanded ? -6 : 0)
-            )
-            // The visible highlight stays small, but the tappable area
-            // covers the whole bar strip — no dead pixels between the pill
-            // and the screen edge.
-            .frame(maxHeight: .infinity)
-            .contentShape(Rectangle())
+            Text(count, format: .number)
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .monospacedDigit()
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(.white.opacity(summary.sessionCount == 0 ? 0.3 : 0.92))
-        .onHover(perform: onHoverChange)
+        .foregroundStyle(.white.opacity(0.94))
+        // Fixed slot: the wing-width formula in NotchLayout adds up to
+        // exactly the rendered bar, keeping outer padding symmetric.
+        .frame(width: NotchLayout.statusIndicatorSlotWidth)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityLabel)
-    }
-
-    private var attentionOpacity: Double {
-        guard !reduceMotion else { return 1 }
-        return attentionIsBright ? 1 : 0.35
-    }
-
-    private var accessibilityLabel: String {
-        let attention = summary.needsAttention ? ", needs attention" : ""
-        return "\(summary.tool.rawValue), \(summary.sessionCount) sessions\(attention)"
+        .accessibilityLabel("\(count) \(kind.accessibilityName) sessions")
     }
 }
-
-private let sessionRowHeight: CGFloat = 48
 
 /// The classic braille dot-matrix spinner used across CLI tools (ora,
 /// Convoy's own progress indicator) — several dots lit per frame rather
@@ -501,7 +606,6 @@ private struct AgentIconView: View {
 // MARK: - Session menu
 
 private struct SessionMenuCard: View {
-    let tool: AgentTool
     let sessions: [AgentSession]
     let dismiss: () -> Void
     let acknowledge: (AgentSession) -> Void
@@ -518,8 +622,10 @@ private struct SessionMenuCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
-                AgentIconView(tool: tool)
-                Text(displayName)
+                Image(systemName: "rectangle.stack.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.55))
+                Text("Active sessions")
                     .font(.system(size: 12.5, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.55))
                 Spacer()
@@ -537,8 +643,8 @@ private struct SessionMenuCard: View {
                 }
             }
             .padding(.horizontal, 14)
-            .padding(.top, 12)
-            .padding(.bottom, 4)
+            .padding(.top, SessionMenuLayout.headerTopPadding)
+            .padding(.bottom, SessionMenuLayout.headerBottomPadding)
 
             if sessions.isEmpty {
                 Text("No active sessions")
@@ -546,23 +652,32 @@ private struct SessionMenuCard: View {
                     .foregroundStyle(.white.opacity(0.45))
                     .padding(.horizontal, 14)
                     .padding(.bottom, 12)
-            } else if sessions.count <= 5 {
-                VStack(spacing: 0) {
-                    ForEach(sessions) { session in
-                        row(for: session)
-                    }
-                }
-                .padding(.bottom, 8)
             } else {
-                // Half a row peeks out at the cutoff to hint at the scroll.
-                ScrollView(showsIndicators: false) {
-                    VStack(spacing: 0) {
-                        ForEach(sessions) { session in
-                            row(for: session)
+                // The list owns the extra height from inline actions. Once
+                // several sessions are visible it scrolls instead of growing
+                // past the panel and clipping the lower controls.
+                ScrollViewReader { proxy in
+                    ScrollView(showsIndicators: sessions.count > 5 || actionsSessionID != nil) {
+                        VStack(spacing: 0) {
+                            ForEach(sessions) { session in
+                                row(for: session)
+                                    .id(session.id)
+                            }
+                        }
+                    }
+                    .frame(height: SessionMenuLayout.sessionListHeight(
+                        sessionCount: sessions.count,
+                        hasExpandedActions: actionsSessionID != nil
+                    ))
+                    .onChange(of: actionsSessionID) { _, sessionID in
+                        guard let sessionID else { return }
+                        DispatchQueue.main.async {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.9)) {
+                                proxy.scrollTo(sessionID, anchor: .bottom)
+                            }
                         }
                     }
                 }
-                .frame(height: 5.5 * sessionRowHeight)
                 .padding(.bottom, 8)
             }
 
@@ -574,8 +689,9 @@ private struct SessionMenuCard: View {
                     .padding(.bottom, 10)
             }
         }
+        .padding(.horizontal, SessionMenuLayout.contentHorizontalInset)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.bottom, 6)
+        .padding(.bottom, SessionMenuLayout.cardBottomPadding)
         // The whole panel can collapse while a row interaction is open;
         // the interaction lock must not outlive the card.
         .onDisappear { onRowInteractionChange(false) }
@@ -600,16 +716,6 @@ private struct SessionMenuCard: View {
             actionsSessionID = actionsSessionID == session.id ? nil : session.id
         }
         onRowInteractionChange(actionsSessionID != nil)
-    }
-
-    private var displayName: String {
-        switch tool {
-        case .claude: "Claude Code"
-        case .convoy: "Convoy"
-        case .opencode: "OpenCode"
-        case .codex: "Codex"
-        case .pi: "Pi"
-        }
     }
 
     /// The kill waits up to two grace periods; keep it off the main thread.
@@ -681,21 +787,21 @@ private struct SessionRow: View {
                 // The chevron sits beside — not inside — the focus button,
                 // so each click has exactly one unambiguous target.
                 chevronButton
-                    .padding(.trailing, 10)
+                    .padding(.trailing, 12)
             }
             // A right (or control) click also expands the actions inline;
             // the catcher passes every other event through.
             .overlay(RightClickCatcher(onRightClick: toggleActions))
             if isActionsExpanded {
                 actionArea
-                    .padding(.horizontal, 6)
-                    .padding(.top, 2)
-                    .padding(.bottom, 4)
+                    .padding(.horizontal, 8)
+                    .padding(.top, 4)
+                    .padding(.bottom, 8)
                     .transition(.opacity)
             }
         }
         .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(.white.opacity(isActionsExpanded ? 0.06 : (isHovered ? 0.08 : 0)))
                 .padding(.horizontal, 6)
         )
@@ -718,7 +824,8 @@ private struct SessionRow: View {
     }
 
     private var mainRow: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 12) {
+            AgentIconView(tool: session.tool)
             if session.status == .working {
                 WorkingPixelSpinner()
             } else {
@@ -738,7 +845,7 @@ private struct SessionRow: View {
                 HStack(spacing: 3) {
                     Image(systemName: "folder")
                         .font(.system(size: 9, weight: .semibold))
-                    Text(SessionTitleFormatter.truncate(session.projectName, to: 14))
+                    Text(SessionTitleFormatter.truncate(session.projectName, to: 30))
                         .font(.system(size: 11, design: .monospaced))
                     if let currentStep = session.currentStep {
                         Text("·")
@@ -767,9 +874,9 @@ private struct SessionRow: View {
                     .foregroundStyle(.white.opacity(0.45))
             }
         }
-        .padding(.leading, 14)
-        .padding(.trailing, 8)
-        .frame(height: sessionRowHeight)
+        .padding(.leading, 16)
+        .padding(.trailing, 10)
+        .frame(height: SessionMenuLayout.sessionRowHeight)
     }
 
     private var chevronButton: some View {
@@ -778,7 +885,7 @@ private struct SessionRow: View {
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.white.opacity(isHovered || isActionsExpanded ? 0.65 : 0.3))
                 .rotationEffect(.degrees(isActionsExpanded ? 180 : 0))
-                .frame(width: 20, height: 20)
+                .frame(width: 24, height: 24)
                 .background(Circle().fill(.white.opacity(isActionsExpanded ? 0.1 : 0)))
                 .contentShape(Circle())
         }
@@ -863,7 +970,7 @@ private struct SessionRow: View {
             Image(systemName: systemImage)
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.75))
-                .frame(width: 20, height: 20)
+                .frame(width: 22, height: 22)
                 .background(Circle().fill(.white.opacity(0.08)))
                 .contentShape(Circle())
         }
@@ -910,7 +1017,7 @@ private struct SettingsGearButton: View {
             Image(systemName: "gearshape")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.white.opacity(isHovered ? 0.75 : 0.35))
-                .frame(width: 18, height: 18)
+                .frame(width: 22, height: 22)
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
@@ -921,9 +1028,8 @@ private struct SettingsGearButton: View {
 
 /// One entry of the inline action list: icon, label, hover highlight — the
 /// look of a menu item, rendered inside the row instead of a floating menu.
-/// The metrics line up optically with the session row above: the icon
-/// starts where the status dot starts (14 pt) and the label where the
-/// session title starts (32 pt), so nothing reads as over-padded.
+/// The metrics line up optically with the roomier session row above while
+/// preserving a broad click target and rounded hover treatment.
 private struct ActionListRow: View {
     let label: String
     let systemImage: String
@@ -951,14 +1057,14 @@ private struct ActionListRow: View {
                     ? Color.red.opacity(isHovered ? 1 : 0.85)
                     : Color.white.opacity(isHovered ? 0.95 : 0.8)
             )
-            .padding(.horizontal, 8)
-            .frame(height: 28)
+            .padding(.horizontal, 10)
+            .frame(height: 32)
             .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
             .background(
-                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(backgroundOpacity)
             )
-            .contentShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }

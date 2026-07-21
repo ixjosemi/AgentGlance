@@ -16,6 +16,7 @@ public final class ObservationScheduler {
     private let convoyRunsDirectoryURL: URL
     private let heartbeatInterval: TimeInterval
     private let debounceInterval: TimeInterval
+    private let reaper: ReaperService
     private let workQueue = DispatchQueue(
         label: "com.agentglance.observation",
         qos: .utility
@@ -48,6 +49,7 @@ public final class ObservationScheduler {
                 .appendingPathComponent(".convoy/runs", isDirectory: true)
         self.heartbeatInterval = heartbeatInterval
         self.debounceInterval = debounceInterval
+        reaper = ReaperService(repository: repository, processScanner: processScanner)
     }
 
     public func start() {
@@ -105,8 +107,7 @@ public final class ObservationScheduler {
             return
         }
         do {
-            _ = try ReaperService(repository: repository, processScanner: processScanner)
-                .reap(detected: detected)
+            _ = try reaper.reap(detected: detected)
         } catch {
             NSLog("AgentGlance reaper failed: %@", String(describing: error))
         }

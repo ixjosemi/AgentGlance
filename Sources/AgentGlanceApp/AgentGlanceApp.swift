@@ -20,13 +20,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var store: StateStore?
     private var observationScheduler: ObservationScheduler?
     private var focusAcknowledgmentObserver: FocusAcknowledgmentObserver?
+    private var instanceLock: SingleInstanceLock?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        guard terminateBecauseAnotherInstanceRuns() == false else { return }
         NSApp.setActivationPolicy(.accessory)
         let stateDirectory = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".agentglance/state", isDirectory: true)
         let repository = StateRepository(directoryURL: stateDirectory)
+        // Two live instances fight over state and stack duplicate panels.
+        // The file lock is atomic across bundled and `swift run` launches;
+        // unlike an NSRunningApplication preflight, simultaneous starts
+        // cannot both decide that the other process should exit.
+        do {
+            try repository.prepareDirectory()
+            guard let lock = try SingleInstanceLock.acquire(
+                at: stateDirectory.appendingPathComponent(".app.lock")
+            ) else {
+                NSLog("AgentGlance: another instance owns the application lock; exiting.")
+                NSApp.terminate(nil)
+                return
+            }
+            instanceLock = lock
+        } catch {
+            NSLog("AgentGlance failed to acquire its application lock: %@", String(describing: error))
+            NSApp.terminate(nil)
+            return
+        }
         // Session names live next to — never inside — the state directory:
         // the store watches that directory and decode-attempts every .json.
         let store = StateStore(
@@ -41,6 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.register(defaults: [
             "attentionSoundEnabled": true,
             "turnCompleteSoundEnabled": true,
+            "screenSelectionMode": ScreenSelectionMode.pointer.rawValue,
         ])
         store.onAttentionRaised = { _ in
             guard UserDefaults.standard.bool(forKey: "attentionSoundEnabled") else { return }
@@ -68,24 +88,4 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         focusObserver.start()
     }
 
-    /// Two live instances fight over `~/.agentglance/state`: each reaper
-    /// rewrites sessions with its own view of the process table and the
-    /// write ping-pong storms both apps (observed 2026-07-18 at ~100% CPU).
-    /// The newest instance defers to the one already running.
-    private func terminateBecauseAnotherInstanceRuns() -> Bool {
-        guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return false }
-        let others = NSRunningApplication
-            .runningApplications(withBundleIdentifier: bundleIdentifier)
-            .filter {
-                $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
-                    && !$0.isTerminated // a just-killed instance can linger in the list
-            }
-        guard let existing = others.first else { return false }
-        NSLog(
-            "AgentGlance: another instance (pid %d) is already running; exiting.",
-            existing.processIdentifier
-        )
-        NSApp.terminate(nil)
-        return true
-    }
 }

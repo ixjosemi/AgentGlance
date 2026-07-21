@@ -394,6 +394,119 @@ func testReaperDeletesStateForDeadProcess() throws {
     try expect(try repository.loadSessions().isEmpty, equals: true, "remaining sessions")
 }
 
+func testReaperDropsStaleNativeStateWhenTheAgentIsNoLongerDetected() throws {
+    // A hook can miss its shutdown event when its terminal is killed. Once a
+    // document has been quiet for a full reaper interval, a live but unrelated
+    // PID must not keep that stale native session visible forever.
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let now = Date(timeIntervalSince1970: 10_000)
+    try repository.save(AgentSession(
+        tool: .claude,
+        sessionID: "stale-native",
+        pid: Int32(getpid()),
+        status: .working,
+        cwd: "/tmp/stale-native",
+        startedAt: now.addingTimeInterval(-120),
+        updatedAt: now.addingTimeInterval(-6)
+    ))
+
+    let reaper = ReaperService(repository: repository, now: { now })
+
+    let firstResult = try reaper.reap(detected: [])
+
+    try expect(
+        firstResult.removedSessionIDs,
+        equals: [],
+        "one scanner miss does not delete a live native session"
+    )
+    try expect(
+        try repository.loadSessions().map(\.sessionID),
+        equals: ["stale-native"],
+        "native document survives the first scanner miss"
+    )
+
+    let result = try reaper.reap(detected: [])
+
+    try expect(result.removedSessionIDs, equals: ["stale-native"], "stale native session removed")
+    try expect(try repository.loadSessions().isEmpty, equals: true, "stale document removed")
+}
+
+func testReaperRebindsByTerminalWhenSeveralProcessesShareADirectory() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let now = Date(timeIntervalSince1970: 10_000)
+    try repository.save(AgentSession(
+        tool: .opencode,
+        sessionID: "terminal-specific",
+        pid: 1,
+        status: .needsAttention,
+        cwd: "/tmp/shared-project",
+        startedAt: now.addingTimeInterval(-120),
+        updatedAt: now.addingTimeInterval(-30),
+        terminal: TerminalContext(tty: "/dev/ttys001")
+    ))
+    let matchingProcess = DetectedAgentProcess(
+        tool: .opencode,
+        processID: Int32(getpid()),
+        cwd: "/tmp/shared-project",
+        terminal: TerminalContext(tty: "/dev/ttys001")
+    )
+    let otherProcess = DetectedAgentProcess(
+        tool: .opencode,
+        processID: Int32(getppid()),
+        cwd: "/tmp/shared-project",
+        terminal: TerminalContext(tty: "/dev/ttys002")
+    )
+
+    _ = try ReaperService(repository: repository, now: { now }).reap(
+        detected: [matchingProcess, otherProcess]
+    )
+
+    let rebound = try repository.loadSessions().first {
+        $0.sessionID == "terminal-specific"
+    }.unwrap(or: "terminal-specific native session disappeared")
+    try expect(rebound.pid, equals: matchingProcess.processID, "terminal identity selects the right process")
+    try expect(rebound.status, equals: .needsAttention, "native status survives an unambiguous terminal rebind")
+}
+
+func testReaperDoesNotRebindAcrossConflictingTerminalIdentities() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let now = Date(timeIntervalSince1970: 10_000)
+    try repository.save(AgentSession(
+        tool: .opencode,
+        sessionID: "stale-terminal",
+        pid: 1,
+        status: .needsAttention,
+        cwd: "/tmp/shared-project",
+        startedAt: now.addingTimeInterval(-120),
+        updatedAt: now.addingTimeInterval(-30),
+        terminal: TerminalContext(tty: "/dev/ttys001")
+    ))
+    let differentTerminal = DetectedAgentProcess(
+        tool: .opencode,
+        processID: Int32(getpid()),
+        cwd: "/tmp/shared-project",
+        terminal: TerminalContext(tty: "/dev/ttys002")
+    )
+
+    _ = try ReaperService(repository: repository, now: { now }).reap(
+        detected: [differentTerminal]
+    )
+
+    let original = try repository.loadSessions().first {
+        $0.sessionID == "stale-terminal"
+    }.unwrap(or: "native session was rebound across conflicting terminal identities")
+    try expect(original.pid, equals: 1, "different tty must not be treated as the same session")
+}
+
 struct TestProcessScanner: ProcessScanning {
     let processes: [DetectedAgentProcess]
 
@@ -1021,115 +1134,358 @@ func testStateStoreDarwinNotificationObservesNewStateFiles() throws {
     try expect(store.sessions.map(\.sessionID), equals: ["notified"], "observed sessions")
 }
 
-func testToolSummaryCountsSessionsAndAttention() throws {
-    let sessions = [
-        try AgentSession.decode(from: validStateJSON(sessionID: "one", status: "working")),
-        try AgentSession.decode(from: validStateJSON(sessionID: "two", status: "needs_attention")),
-    ]
-
-    let summary = ToolSummary(tool: .claude, sessions: sessions)
-
-    try expect(summary.sessionCount, equals: 2, "session count")
-    try expect(summary.needsAttention, equals: true, "attention state")
-    try expect(
-        ToolSummary.active(in: sessions).map(\.tool),
-        equals: [.claude],
-        "active tools"
+func testStateStoreDarwinNotificationObservesRemovedStateFiles() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let session = try AgentSession.decode(
+        from: validStateJSON(sessionID: "removed", status: "working", pid: Int32(getpid()))
     )
-}
+    try repository.save(session)
+    let store = StateStore(repository: repository)
+    try store.startObserving(pollInterval: nil, layers: .darwinNotification)
+    defer { store.stopObserving() }
+    try expect(store.sessions.map(\.sessionID), equals: ["removed"], "baseline session")
 
-func testToolSummaryReportsWorstStatusForSemaphore() throws {
-    let working = try AgentSession.decode(from: validStateJSON(sessionID: "w", status: "working"))
-    let idle = try AgentSession.decode(from: validStateJSON(sessionID: "i", status: "idle"))
-    let attention = try AgentSession.decode(
-        from: validStateJSON(sessionID: "a", status: "needs_attention")
-    )
+    try repository.remove(session)
 
-    try expect(
-        ToolSummary(tool: .claude, sessions: [working]).worstStatus,
-        equals: .working,
-        "solo working shows the pixel spinner"
-    )
-    try expect(
-        ToolSummary(tool: .claude, sessions: [working, idle]).worstStatus,
-        equals: .working,
-        "a working session outranks a quiet idle one"
-    )
-    try expect(
-        ToolSummary(tool: .claude, sessions: [working, idle, attention]).worstStatus,
-        equals: .needsAttention,
-        "one attention turns red"
-    )
-    try expect(
-        ToolSummary(tool: .claude, sessions: []).worstStatus,
-        equals: nil,
-        "no sessions, no semaphore"
-    )
-}
-
-func testNotchWingPlacementSplitsToolsAroundNotch() throws {
-    let sessions = [
-        try AgentSession.decode(from: validStateJSON(sessionID: "c1", status: "working")),
-        try AgentSession.decode(
-            from: validStateJSON(sessionID: "o1", status: "idle", tool: "opencode")
-        ),
-        try AgentSession.decode(
-            from: validStateJSON(sessionID: "x1", status: "working", tool: "codex")
-        ),
-        try AgentSession.decode(
-            from: validStateJSON(sessionID: "p1", status: "working", tool: "pi")
-        ),
-        try AgentSession.decode(
-            from: validStateJSON(sessionID: "v1", status: "working", tool: "convoy")
-        ),
-    ]
-
-    let placement = NotchWingPlacement.place(ToolSummary.active(in: sessions))
-
-    try expect(
-        placement.leftWing.map(\.tool),
-        equals: [.convoy, .pi, .codex],
-        "five tools split three left in canonical order"
-    )
-    try expect(
-        placement.rightWing.map(\.tool),
-        equals: [.opencode, .claude],
-        "five tools split two right"
-    )
-
-    let opencodeOnly = NotchWingPlacement.place(
-        ToolSummary.active(in: [sessions[1]])
-    )
-    try expect(opencodeOnly.leftWing.map(\.tool), equals: [.opencode], "left wing solo opencode")
-    try expect(opencodeOnly.rightWing.isEmpty, equals: true, "right wing empty")
-}
-
-func testNotchWingPlacementBalancesToolsAcrossWings() throws {
-    func sessions(_ tools: [AgentTool]) throws -> [AgentSession] {
-        try tools.enumerated().map { index, tool in
-            try AgentSession.decode(
-                from: validStateJSON(sessionID: "s\(index)", status: "working", tool: tool.rawValue)
-            )
-        }
+    let deadline = Date().addingTimeInterval(1)
+    while !store.sessions.isEmpty, Date() < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.02))
     }
+    try expect(store.sessions.isEmpty, equals: true, "removed session observed through Darwin notification")
+}
 
-    let two = NotchWingPlacement.place(
-        ToolSummary.active(in: try sessions([.opencode, .convoy]))
-    )
-    try expect(two.leftWing.map(\.tool), equals: [.convoy], "two tools: one per side")
-    try expect(two.rightWing.map(\.tool), equals: [.opencode], "two tools: one per side")
+func testSessionStatusSummaryCountsGlobalRunningWaitingAndBlockedSessions() throws {
+    let sessions = [
+        try AgentSession.decode(from: validStateJSON(sessionID: "running", status: "working")),
+        try AgentSession.decode(from: validStateJSON(sessionID: "waiting", status: "idle")),
+        try AgentSession.decode(from: validStateJSON(sessionID: "blocked", status: "needs_attention")),
+        try AgentSession.decode(from: validStateJSON(sessionID: "ended", status: "ended")),
+    ]
 
-    let three = NotchWingPlacement.place(
-        ToolSummary.active(in: try sessions([.claude, .codex, .convoy]))
-    )
-    try expect(three.leftWing.map(\.tool), equals: [.convoy, .codex], "three tools: two left")
-    try expect(three.rightWing.map(\.tool), equals: [.claude], "three tools: one right")
+    let summary = SessionStatusSummary(sessions: sessions)
 
-    let four = NotchWingPlacement.place(
-        ToolSummary.active(in: try sessions([.pi, .claude, .codex, .convoy]))
+    try expect(summary.runningCount, equals: 1, "running count")
+    try expect(summary.waitingCount, equals: 1, "waiting count")
+    try expect(summary.blockedCount, equals: 1, "blocked count")
+    try expect(summary.activeSessionCount, equals: 3, "ended sessions excluded")
+}
+
+func testSessionStatusSummaryVisibleEntriesOmitsZeroCounts() throws {
+    let sessions = [
+        try AgentSession.decode(from: validStateJSON(sessionID: "running", status: "working")),
+        try AgentSession.decode(from: validStateJSON(sessionID: "blocked", status: "needs_attention")),
+    ]
+
+    let summary = SessionStatusSummary(sessions: sessions)
+
+    try expect(
+        summary.visibleEntries,
+        equals: [
+            SessionStatusSummary.StatusEntry(kind: .running, count: 1),
+            SessionStatusSummary.StatusEntry(kind: .blocked, count: 1),
+        ],
+        "zero-count kinds disappear from the bar instead of rendering dimmed"
     )
-    try expect(four.leftWing.map(\.tool), equals: [.convoy, .pi], "four tools: two and two")
-    try expect(four.rightWing.map(\.tool), equals: [.codex, .claude], "four tools: two and two")
+    try expect(
+        SessionStatusSummary(sessions: []).visibleEntries,
+        equals: [],
+        "an empty summary renders no indicators at all"
+    )
+}
+
+func testSessionStatusSummarySilencesAcknowledgedBlockedSessions() throws {
+    let blocked = try AgentSession.decode(
+        from: validStateJSON(sessionID: "acknowledged", status: "needs_attention")
+    )
+    var acknowledgments = AttentionAcknowledgments()
+    acknowledgments.acknowledge(blocked)
+
+    let summary = SessionStatusSummary(
+        sessions: [blocked],
+        acknowledgments: acknowledgments
+    )
+
+    try expect(summary.blockedCount, equals: 0, "visited session no longer keeps the bar red")
+    try expect(summary.waitingCount, equals: 1, "visited session remains visible as a quiet wait")
+}
+
+func testPointerMovementGateStaysLockedUntilPointerMoves() throws {
+    var gate = PointerMovementGate()
+
+    try expect(gate.isUnlocked, equals: true, "a fresh gate starts unlocked")
+
+    gate.lock(at: DisplayPoint(x: 100, y: 100))
+
+    try expect(gate.isUnlocked, equals: false, "locking arms the gate")
+    try expect(
+        gate.update(pointerLocation: DisplayPoint(x: 102, y: 101)),
+        equals: false,
+        "a stationary pointer stays locked"
+    )
+    try expect(
+        gate.update(pointerLocation: DisplayPoint(x: 140, y: 100)),
+        equals: true,
+        "real movement unlocks hover expansion"
+    )
+    try expect(
+        gate.update(pointerLocation: DisplayPoint(x: 140, y: 100)),
+        equals: true,
+        "once unlocked the gate stays open"
+    )
+}
+
+func testHoverInteractionIgnoresSyntheticExitWhilePointerRemainsInside() throws {
+    let compactFrame = DisplayFrame(minX: 20, minY: 0, width: 100, height: 30)
+
+    try expect(
+        HoverInteraction.pointerIsInside(
+            DisplayPoint(x: 150, y: 885),
+            localTopLeadingFrame: compactFrame,
+            panelOriginX: 100,
+            panelTopY: 900
+        ),
+        equals: true,
+        "tracking-area replacement does not turn an inside pointer into a real exit"
+    )
+    try expect(
+        HoverInteraction.pointerIsInside(
+            DisplayPoint(x: 150, y: 850),
+            localTopLeadingFrame: compactFrame,
+            panelOriginX: 100,
+            panelTopY: 900
+        ),
+        equals: false,
+        "a pointer below the interactive frame is a real exit"
+    )
+}
+
+func testHoverInteractionKeepsCompactTargetOnTheVisibleBar() throws {
+    let compactFrame = DisplayFrame(minX: 192, minY: 0, width: 300, height: 38)
+
+    let frame = HoverInteraction.interactiveFrame(
+        compactFrame: compactFrame,
+        expandedPanelWidth: 800,
+        expandedMaximumHeight: 398,
+        measuredContentHeight: 240,
+        isExpanded: false,
+        isHidden: false
+    )
+
+    try expect(
+        frame,
+        equals: compactFrame,
+        "stale broad-panel geometry cannot offset the collapsed hover target"
+    )
+}
+
+func testHoverInteractionOpensTheWholeExpandedSurfaceToClicks() throws {
+    let compactFrame = DisplayFrame(minX: 309, minY: 0, width: 102, height: 24)
+
+    try expect(
+        HoverInteraction.interactiveFrame(
+            compactFrame: compactFrame,
+            expandedPanelWidth: 800,
+            expandedMaximumHeight: 384,
+            measuredContentHeight: 210,
+            isExpanded: true,
+            isHidden: false
+        ),
+        equals: DisplayFrame(minX: 0, minY: 0, width: 800, height: 210),
+        "settings, rows, and chevrons across the expanded card all receive clicks"
+    )
+    try expect(
+        HoverInteraction.interactiveFrame(
+            compactFrame: compactFrame,
+            expandedPanelWidth: 800,
+            expandedMaximumHeight: 384,
+            measuredContentHeight: compactFrame.height,
+            isExpanded: true,
+            isHidden: false
+        ),
+        equals: DisplayFrame(minX: 0, minY: 0, width: 800, height: 384),
+        "expansion accepts the full destination while SwiftUI is still measuring it"
+    )
+}
+
+func testHoverInteractionUsesOnlyVisibleContentForHoverExit() throws {
+    let compactFrame = DisplayFrame(minX: 309, minY: 0, width: 102, height: 24)
+
+    try expect(
+        HoverInteraction.visibleHoverFrame(
+            compactFrame: compactFrame,
+            expandedPanelWidth: 800,
+            expandedMaximumHeight: 384,
+            measuredContentHeight: 120,
+            isExpanded: true,
+            isHidden: false
+        ),
+        equals: DisplayFrame(minX: 0, minY: 0, width: 800, height: 120),
+        "transparent space below the measured card does not keep hover alive"
+    )
+    try expect(
+        HoverInteraction.visibleHoverFrame(
+            compactFrame: compactFrame,
+            expandedPanelWidth: 800,
+            expandedMaximumHeight: 384,
+            measuredContentHeight: compactFrame.height,
+            isExpanded: true,
+            isHidden: false
+        ),
+        equals: DisplayFrame(minX: 0, minY: 0, width: 800, height: 24),
+        "the compact bar keeps a synthetic expansion exit inside before measurement"
+    )
+}
+
+func testHoverInteractionDoesNotReexpandFromTheCollapsingCard() throws {
+    let compactFrame = DisplayFrame(minX: 309, minY: 0, width: 102, height: 24)
+
+    try expect(
+        HoverInteraction.shouldScheduleExpansion(
+            pointer: DisplayPoint(x: 460, y: 750),
+            compactFrame: compactFrame,
+            panelOriginX: 100,
+            panelTopY: 900,
+            isExpanded: false
+        ),
+        equals: false,
+        "an active event from the former session-card area cannot reverse collapse"
+    )
+    try expect(
+        HoverInteraction.shouldScheduleExpansion(
+            pointer: DisplayPoint(x: 460, y: 890),
+            compactFrame: compactFrame,
+            panelOriginX: 100,
+            panelTopY: 900,
+            isExpanded: false
+        ),
+        equals: true,
+        "a real hover over the final compact pill still expands"
+    )
+    try expect(
+        HoverInteraction.shouldScheduleExpansion(
+            pointer: DisplayPoint(x: 410, y: 895),
+            compactFrame: compactFrame,
+            panelOriginX: 100,
+            panelTopY: 900,
+            isExpanded: false,
+            topShoulderRadius: HangingNotchMetrics.compactTopShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.compactPillBottomCornerRadius
+        ),
+        equals: false,
+        "the transparent concave shoulder cannot trigger expansion"
+    )
+}
+
+func testSingleInstanceLockExcludesBundledAndUnbundledProcesses() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let lockURL = directory.appendingPathComponent(".app.lock")
+
+    var firstLock = try SingleInstanceLock.acquire(at: lockURL)
+    try expect(firstLock != nil, equals: true, "first app instance acquires the lock")
+    try expect(
+        try SingleInstanceLock.acquire(at: lockURL) == nil,
+        equals: true,
+        "a second process identity cannot acquire the same lock"
+    )
+    let permissions = try FileManager.default.attributesOfItem(atPath: lockURL.path)[.posixPermissions]
+        as? NSNumber
+    try expect(permissions?.intValue, equals: 0o600, "instance lock is user-private")
+
+    func externalLockAttemptStatus() throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/lockf")
+        process.arguments = ["-t", "0", lockURL.path, "/usr/bin/true"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+    try expect(
+        try externalLockAttemptStatus() == 0,
+        equals: false,
+        "a separate process cannot acquire the application lock"
+    )
+
+    firstLock = nil
+    let replacementLock = try SingleInstanceLock.acquire(at: lockURL)
+    try expect(replacementLock != nil, equals: true, "lock is released when the first instance exits")
+    withExtendedLifetime(replacementLock) {}
+}
+
+func testNotchLayoutStatusWingWidthHidesZeroCountIndicators() throws {
+    try expect(
+        NotchLayout.statusWingWidth(visibleIndicatorCount: 0, showsIdleMark: false),
+        equals: 0,
+        "an empty wing claims no width"
+    )
+    try expect(
+        NotchLayout.statusWingWidth(visibleIndicatorCount: 0, showsIdleMark: true),
+        equals: 52,
+        "the quiet idle drop stays wide enough for its rounded base"
+    )
+    try expect(NotchLayout.statusWingEdgePadding, equals: 12, "compact drops gain side breathing room")
+    let one = NotchLayout.statusWingWidth(visibleIndicatorCount: 1, showsIdleMark: false)
+    let two = NotchLayout.statusWingWidth(visibleIndicatorCount: 2, showsIdleMark: false)
+    try expect(
+        one,
+        equals: NotchLayout.statusIndicatorSlotWidth + 2 * NotchLayout.statusWingEdgePadding,
+        "one visible indicator: slot plus symmetric edge padding"
+    )
+    try expect(
+        two,
+        equals: 2 * NotchLayout.statusIndicatorSlotWidth
+            + NotchLayout.statusIndicatorSpacing
+            + 2 * NotchLayout.statusWingEdgePadding,
+        "two visible indicators: slots, one gap, symmetric edge padding"
+    )
+}
+
+func testScreenSelectionFollowsThePointerAndFallsBackToFocusedDisplay() throws {
+    let displays = [
+        DisplaySnapshot(id: 11, frame: DisplayFrame(minX: 0, minY: 0, width: 1_512, height: 982)),
+        DisplaySnapshot(id: 22, frame: DisplayFrame(minX: 1_512, minY: 0, width: 2_560, height: 1_440)),
+    ]
+
+    try expect(
+        ScreenSelection.selectDisplayID(
+            mode: .pointer,
+            pointerLocation: DisplayPoint(x: 2_000, y: 400),
+            focusedDisplayID: 11,
+            lastSelectedDisplayID: nil,
+            displays: displays
+        ),
+        equals: 22,
+        "pointer display wins over focused display"
+    )
+    try expect(
+        ScreenSelection.selectDisplayID(
+            mode: .pointer,
+            pointerLocation: DisplayPoint(x: -10, y: 400),
+            focusedDisplayID: 22,
+            lastSelectedDisplayID: 11,
+            displays: displays
+        ),
+        equals: 22,
+        "pointer gap falls back to focused display"
+    )
+    try expect(
+        ScreenSelection.selectDisplayID(
+            mode: .focusedWindow,
+            pointerLocation: DisplayPoint(x: 2_000, y: 400),
+            focusedDisplayID: 11,
+            lastSelectedDisplayID: 22,
+            displays: displays
+        ),
+        equals: 11,
+        "focused-window mode ignores pointer when a focused display exists"
+    )
 }
 
 func testAttentionAcknowledgmentsSilenceVisitedSessionsUntilNewActivity() throws {
@@ -1139,15 +1495,15 @@ func testAttentionAcknowledgmentsSilenceVisitedSessionsUntilNewActivity() throws
     var acknowledgments = AttentionAcknowledgments()
 
     try expect(
-        ToolSummary.active(in: acknowledgments.silenced([waiting])).first?.worstStatus,
-        equals: .needsAttention,
+        SessionStatusSummary(sessions: [waiting], acknowledgments: acknowledgments).blockedCount,
+        equals: 1,
         "unvisited session keeps its red light"
     )
 
     acknowledgments.acknowledge(waiting)
     try expect(
-        ToolSummary.active(in: acknowledgments.silenced([waiting])).first?.worstStatus,
-        equals: .idle,
+        SessionStatusSummary(sessions: [waiting], acknowledgments: acknowledgments).blockedCount,
+        equals: 0,
         "visited session goes quiet in the bar"
     )
     try expect(
@@ -1167,8 +1523,8 @@ func testAttentionAcknowledgmentsSilenceVisitedSessionsUntilNewActivity() throws
         terminal: waiting.terminal
     )
     try expect(
-        ToolSummary.active(in: acknowledgments.silenced([reraised])).first?.worstStatus,
-        equals: .needsAttention,
+        SessionStatusSummary(sessions: [reraised], acknowledgments: acknowledgments).blockedCount,
+        equals: 1,
         "new activity re-arms the light"
     )
 }
@@ -1245,22 +1601,88 @@ func testNotchLayoutExtendsFromLeftSideOfHardwareNotch() throws {
     )
 
     try expect(layout.presentation, equals: .notch, "a screen with a camera housing keeps the notch")
-    try expect(layout.width, equals: 449, "maximum panel width")
+    try expect(layout.width, equals: 800, "wide expanded panel leaves room for smooth side curves")
     try expect(layout.height, equals: 38, "collapsed panel height")
     try expect(layout.expandedHeight, equals: 398, "expanded panel height")
-    try expect(layout.originX, equals: 506, "panel x")
+    try expect(layout.originX, equals: 356, "expanded panel x")
     try expect(layout.originY, equals: 944, "panel y")
-    try expect(layout.leftContentWidth, equals: 160, "maximum left wing width")
-    try expect(layout.rightContentWidth, equals: 109, "balanced wings give the right side two slots")
     try expect(layout.notchWidth, equals: 180, "hardware notch width")
-    try expect(NotchLayout.wingWidth(activeToolCount: 1), equals: 58, "one-tool wing")
-    try expect(NotchLayout.wingWidth(activeToolCount: 2), equals: 109, "two-tool wing")
-    try expect(NotchLayout.wingWidth(activeToolCount: 3), equals: 160, "three-tool wing")
+}
+
+func testNotchLayoutDoublesTheExpandedPanelWidthForSessionDetails() throws {
+    let layout = NotchLayout(
+        screenMinX: 0,
+        screenWidth: 1_512,
+        screenMaxY: 982,
+        safeAreaTop: 38,
+        leftNotchEdgeX: 666,
+        rightNotchEdgeX: 846
+    )
+
+    try expect(layout.width, equals: 800, "outer panel adds lateral room for the corner curves")
+    try expect(NotchLayout.expandedContentWidth, equals: 720, "session content keeps its readable width")
+    try expect(
+        NotchLayout.contentWidth(forExpandedPanelWidth: 600),
+        equals: 520,
+        "narrow screens preserve curve gutters instead of clipping content"
+    )
+}
+
+func testNotchLayoutPinsCompactBarToPhysicalNotchWhenExpandedPanelIsClamped() throws {
+    let layout = NotchLayout(
+        screenMinX: 0,
+        screenWidth: 600,
+        screenMaxY: 900,
+        safeAreaTop: 32,
+        leftNotchEdgeX: 350,
+        rightNotchEdgeX: 430
+    )
+
+    try expect(layout.originX, equals: 0, "expanded panel is clamped to the narrow display")
+    try expect(
+        layout.barLeadingOffset(leftWidth: 42, rightWidth: 0),
+        equals: 308,
+        "compact left wing remains attached to the physical notch edge"
+    )
+    try expect(
+        layout.barLeadingOffset(leftWidth: 0, rightWidth: 42),
+        equals: 350,
+        "same-width status transition still moves the interactive origin"
+    )
+}
+
+func testNotchLayoutFakesTheEmptyWingToStaySymmetric() throws {
+    let notched = NotchLayout(
+        screenMinX: 0,
+        screenWidth: 1_512,
+        screenMaxY: 982,
+        safeAreaTop: 38,
+        leftNotchEdgeX: 666,
+        rightNotchEdgeX: 846
+    )
+    let balanced = notched.balancedStatusWingWidths(leftWidth: 54, rightWidth: 0)
+
+    try expect(balanced.left, equals: 54, "visible left wing keeps its width")
+    try expect(balanced.right, equals: 54, "empty right wing mirrors the left around the hardware notch")
+
+    let pill = NotchLayout(
+        screenMinX: 0,
+        screenWidth: 2_560,
+        screenMaxY: 1_440,
+        safeAreaTop: 0,
+        leftNotchEdgeX: nil,
+        rightNotchEdgeX: nil,
+        menuBarHeight: 24
+    )
+    let unbalanced = pill.balancedStatusWingWidths(leftWidth: 54, rightWidth: 0)
+    try expect(unbalanced.left, equals: 54, "notchless drop preserves its real left content")
+    try expect(unbalanced.right, equals: 0, "notchless drop adds no phantom status wing")
 }
 
 func testNotchLayoutUsesPillStyleOnNotchlessScreen() throws {
     // A Studio Display: no safe area, no camera housing, a real 24 pt menu
-    // bar. The bar becomes a floating pill instead of a notch-attached bar.
+    // bar. The compact surface hangs from the top like a notch instead of
+    // floating as a detached capsule.
     let layout = NotchLayout(
         screenMinX: 0,
         screenWidth: 2_560,
@@ -1273,11 +1695,12 @@ func testNotchLayoutUsesPillStyleOnNotchlessScreen() throws {
 
     try expect(layout.presentation, equals: .pill, "notchless screen gets the pill")
     try expect(layout.notchWidth, equals: 0, "no phantom camera gap")
-    try expect(layout.height, equals: 22, "pill fits inside the real 24 pt menu bar")
-    try expect(layout.originY, equals: 1_417, "floats inside the menu bar, never over windows")
-    try expect(layout.width, equals: 340, "panel wide enough for the session menu card")
-    try expect(layout.originX, equals: 1_110, "centered on screen")
-    try expect(layout.expandedHeight, equals: 382, "menu hangs below the pill")
+    try expect(layout.height, equals: 24, "pill uses the real menu bar height for a rounder drop")
+    try expect(layout.originY, equals: 1_416, "pill attaches to the screen top without overlapping windows")
+    try expect(layout.originY + layout.height, equals: 1_440, "pill and notch share the top edge")
+    try expect(layout.width, equals: 800, "panel wide enough for session details and side curves")
+    try expect(layout.originX, equals: 880, "centered on screen")
+    try expect(layout.expandedHeight, equals: 384, "menu hangs below the pill")
 }
 
 func testNotchLayoutPillFallsBackToStandardMenuBarHeight() throws {
@@ -1291,41 +1714,152 @@ func testNotchLayoutPillFallsBackToStandardMenuBarHeight() throws {
         menuBarHeight: 0
     )
 
-    try expect(layout.height, equals: 22, "standard 24 pt menu bar minus pill insets")
+    try expect(layout.height, equals: 24, "standard menu bar gives the drop its full rounded height")
 }
 
-func testNotchLayoutSidePaddingsCenterThePill() throws {
-    let pill = NotchLayout(
-        screenMinX: 0,
-        screenWidth: 2_560,
-        screenMaxY: 1_440,
-        safeAreaTop: 0,
-        leftNotchEdgeX: nil,
-        rightNotchEdgeX: nil,
-        menuBarHeight: 24
+func testHangingNotchGeometryCreatesConcaveShouldersAndRoundedBase() throws {
+    try expect(
+        HangingNotchGeometry.contains(
+            DisplayPoint(x: 1, y: 7),
+            width: 102,
+            height: 24,
+            topShoulderRadius: HangingNotchMetrics.compactTopShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.compactPillBottomCornerRadius
+        ),
+        equals: false,
+        "compact drop cuts out the upper-left shoulder"
+    )
+    try expect(
+        HangingNotchGeometry.contains(
+            DisplayPoint(x: 11, y: 7),
+            width: 102,
+            height: 24,
+            topShoulderRadius: HangingNotchMetrics.compactTopShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.compactPillBottomCornerRadius
+        ),
+        equals: true,
+        "compact drop keeps the body beside the concave shoulder"
+    )
+    try expect(
+        HangingNotchGeometry.contains(
+            DisplayPoint(x: 101, y: 7),
+            width: 102,
+            height: 24,
+            topShoulderRadius: HangingNotchMetrics.compactTopShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.compactPillBottomCornerRadius
+        ),
+        equals: false,
+        "upper shoulders stay symmetric"
+    )
+    try expect(
+        HangingNotchGeometry.contains(
+            DisplayPoint(x: 11, y: 23),
+            width: 102,
+            height: 24,
+            topShoulderRadius: HangingNotchMetrics.compactTopShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.compactPillBottomCornerRadius
+        ),
+        equals: false,
+        "compact drop rounds away the lower-left corner"
+    )
+    try expect(
+        HangingNotchGeometry.contains(
+            DisplayPoint(x: 400, y: 119),
+            width: 800,
+            height: 120,
+            topShoulderRadius: HangingNotchMetrics.expandedTopShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.expandedBottomCornerRadius
+        ),
+        equals: true,
+        "expanded drop preserves its broad rounded body"
+    )
+}
+
+func testHangingNotchGeometryJoinsBothCurvesIntoAContinuousS() throws {
+    try expect(
+        HangingNotchGeometry.contains(
+            DisplayPoint(x: 49, y: 200),
+            width: 800,
+            height: 300,
+            topShoulderRadius: HangingNotchMetrics.expandedTopShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.expandedBottomCornerRadius
+        ),
+        equals: false,
+        "lower curve begins at the upper curve instead of leaving a straight side"
+    )
+    try expect(
+        HangingNotchGeometry.contains(
+            DisplayPoint(x: 52, y: 200),
+            width: 800,
+            height: 300,
+            topShoulderRadius: HangingNotchMetrics.expandedTopShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.expandedBottomCornerRadius
+        ),
+        equals: true,
+        "continuous S keeps the rounded body immediately inside its curve"
+    )
+}
+
+func testHangingNotchMetricsCreateARounderRoomierDrop() throws {
+    try expect(
+        HangingNotchMetrics.compactTopShoulderRadius,
+        equals: 10,
+        "compact drop has pronounced inverted shoulders"
+    )
+    try expect(
+        HangingNotchMetrics.expandedTopShoulderRadius,
+        equals: 48,
+        "expanded drop increases the upper curve"
+    )
+    try expect(
+        HangingNotchMetrics.expandedBottomCornerRadius,
+        equals: 56,
+        "expanded drop has a substantially rounder base"
+    )
+    try expect(
+        SessionMenuLayout.contentHorizontalInset,
+        equals: 18,
+        "expanded content stays clear of the rounded shoulders"
+    )
+    try expect(
+        SessionMenuLayout.sessionRowHeight,
+        equals: 52,
+        "session rows gain vertical breathing room"
+    )
+    try expect(
+        SessionMenuLayout.sessionListHeight(sessionCount: 1, hasExpandedActions: true),
+        equals: 196,
+        "one row grows to reveal its roomier action list"
+    )
+    try expect(
+        SessionMenuLayout.sessionListHeight(sessionCount: 5, hasExpandedActions: true),
+        equals: 260,
+        "several rows scroll instead of escaping the panel"
+    )
+}
+
+func testHangingNotchInteractionRegionPassesTransparentCornersThrough() throws {
+    let region = HangingNotchInteractionRegion(
+        frame: DisplayFrame(minX: 309, minY: 0, width: 102, height: 24),
+        topShoulderRadius: HangingNotchMetrics.compactTopShoulderRadius,
+        bottomCornerRadius: HangingNotchMetrics.compactPillBottomCornerRadius
     )
 
-    let collapsed = pill.sidePaddings(leftWidth: 0, rightWidth: 70, menuVisible: false)
-    try expect(collapsed.leading, equals: 135, "visible bar centered when only Claude is active")
-    try expect(collapsed.trailing, equals: 135, "pill padding stays symmetric")
-    let expanded = pill.sidePaddings(leftWidth: 0, rightWidth: 70, menuVisible: true)
-    try expect(expanded.leading, equals: 0, "expanded menu spans the full panel")
-    try expect(expanded.trailing, equals: 0, "expanded menu spans the full panel")
-
-    let notched = NotchLayout(
-        screenMinX: 0,
-        screenWidth: 1_512,
-        screenMaxY: 982,
-        safeAreaTop: 38,
-        leftNotchEdgeX: 666,
-        rightNotchEdgeX: 846
+    try expect(
+        region.contains(DisplayPoint(x: 310, y: 7)),
+        equals: false,
+        "AppKit gate passes the concave shoulder through"
     )
-    let pinned = notched.sidePaddings(leftWidth: 109, rightWidth: 58, menuVisible: false)
-    try expect(pinned.leading, equals: 51, "notch pins the left wing against the camera")
-    try expect(pinned.trailing, equals: 51, "notch pins the right wing against the camera")
-    let expandedNotch = notched.sidePaddings(leftWidth: 109, rightWidth: 58, menuVisible: true)
-    try expect(expandedNotch.leading, equals: 51, "menu visibility does not move the wings")
-    try expect(expandedNotch.trailing, equals: 51, "menu visibility does not move the wings")
+    try expect(
+        region.contains(DisplayPoint(x: 320, y: 7)),
+        equals: true,
+        "AppKit gate accepts the visible drop body"
+    )
+    try expect(
+        region.contains(DisplayPoint(x: 360, y: 25)),
+        equals: false,
+        "AppKit gate passes space below the compact drop through"
+    )
 }
 
 func testNotchLayoutMenuCardWidthNeverCrampedInPillMode() throws {
@@ -1338,8 +1872,7 @@ func testNotchLayoutMenuCardWidthNeverCrampedInPillMode() throws {
         rightNotchEdgeX: nil,
         menuBarHeight: 24
     )
-    try expect(pill.menuCardWidth(barWidth: 70), equals: 340, "menu hangs at a readable width")
-    try expect(pill.menuCardWidth(barWidth: 252), equals: 340, "full bar still gets the minimum")
+    try expect(pill.width, equals: 800, "outer pill panel gives its curves lateral room")
 
     let notched = NotchLayout(
         screenMinX: 0,
@@ -1349,7 +1882,7 @@ func testNotchLayoutMenuCardWidthNeverCrampedInPillMode() throws {
         leftNotchEdgeX: 666,
         rightNotchEdgeX: 846
     )
-    try expect(notched.menuCardWidth(barWidth: 400), equals: 400, "notch menu keeps following the bar")
+    try expect(notched.width, equals: 800, "outer notch panel gives its curves lateral room")
 }
 
 func testOpenCodePluginWritesSessionState() throws {
@@ -3139,6 +3672,9 @@ let tests: [(String, () throws -> Void)] = [
     ("Claude permission notification requests attention", testClaudePermissionNotificationRequestsAttention),
     ("Claude lifecycle events produce expected states", testClaudeLifecycleEventsProduceExpectedStates),
     ("reaper deletes state for dead process", testReaperDeletesStateForDeadProcess),
+    ("reaper drops stale native state when agent is no longer detected", testReaperDropsStaleNativeStateWhenTheAgentIsNoLongerDetected),
+    ("reaper rebinds by terminal when several processes share a directory", testReaperRebindsByTerminalWhenSeveralProcessesShareADirectory),
+    ("reaper does not rebind across conflicting terminal identities", testReaperDoesNotRebindAcrossConflictingTerminalIdentities),
     ("reaper creates fallback state for untracked process", testReaperCreatesFallbackStateForUntrackedProcess),
     ("reaper reaps against provided scan", testReaperReapsAgainstProvidedScan),
     ("reaper rebinds daemon-hosted session to visible process", testReaperRebindsDaemonHostedSessionToVisibleProcess),
@@ -3160,16 +3696,31 @@ let tests: [(String, () throws -> Void)] = [
     ("state store polling observes new state files", testStateStorePollingObservesNewStateFiles),
     ("state store file events observe new state files without polling", testStateStoreFileEventsObserveNewStateFilesWithoutPolling),
     ("state store Darwin notification observes new state files", testStateStoreDarwinNotificationObservesNewStateFiles),
-    ("tool summary counts sessions and attention", testToolSummaryCountsSessionsAndAttention),
-    ("tool summary reports worst status for semaphore", testToolSummaryReportsWorstStatusForSemaphore),
-    ("notch wing placement splits tools around notch", testNotchWingPlacementSplitsToolsAroundNotch),
-    ("notch wing placement balances tools across wings", testNotchWingPlacementBalancesToolsAcrossWings),
+    ("state store Darwin notification observes removed state files", testStateStoreDarwinNotificationObservesRemovedStateFiles),
+    ("session status summary counts global running waiting and blocked sessions", testSessionStatusSummaryCountsGlobalRunningWaitingAndBlockedSessions),
+    ("session status summary visible entries omit zero counts", testSessionStatusSummaryVisibleEntriesOmitsZeroCounts),
+    ("session status summary silences acknowledged blocked sessions", testSessionStatusSummarySilencesAcknowledgedBlockedSessions),
+    ("pointer movement gate stays locked until pointer moves", testPointerMovementGateStaysLockedUntilPointerMoves),
+    ("hover interaction ignores synthetic exit while pointer remains inside", testHoverInteractionIgnoresSyntheticExitWhilePointerRemainsInside),
+    ("hover interaction keeps compact target on visible bar", testHoverInteractionKeepsCompactTargetOnTheVisibleBar),
+    ("hover interaction opens whole expanded surface to clicks", testHoverInteractionOpensTheWholeExpandedSurfaceToClicks),
+    ("hover interaction uses visible content for hover exit", testHoverInteractionUsesOnlyVisibleContentForHoverExit),
+    ("hover interaction does not reexpand from collapsing card", testHoverInteractionDoesNotReexpandFromTheCollapsingCard),
+    ("single instance lock excludes bundled and unbundled processes", testSingleInstanceLockExcludesBundledAndUnbundledProcesses),
+    ("notch layout status wing width hides zero count indicators", testNotchLayoutStatusWingWidthHidesZeroCountIndicators),
+    ("screen selection follows pointer and falls back to focused display", testScreenSelectionFollowsThePointerAndFallsBackToFocusedDisplay),
     ("attention acknowledgments silence visited sessions", testAttentionAcknowledgmentsSilenceVisitedSessionsUntilNewActivity),
     ("git workspace inspector resolves branch names", testGitWorkspaceInspectorResolvesBranchNames),
     ("notch layout extends from left side of hardware notch", testNotchLayoutExtendsFromLeftSideOfHardwareNotch),
+    ("notch layout doubles the expanded panel width for session details", testNotchLayoutDoublesTheExpandedPanelWidthForSessionDetails),
+    ("notch layout pins compact bar to physical notch when panel is clamped", testNotchLayoutPinsCompactBarToPhysicalNotchWhenExpandedPanelIsClamped),
+    ("notch layout fakes empty wing to stay symmetric", testNotchLayoutFakesTheEmptyWingToStaySymmetric),
     ("notch layout uses pill style on notchless screen", testNotchLayoutUsesPillStyleOnNotchlessScreen),
     ("notch layout pill falls back to standard menu bar height", testNotchLayoutPillFallsBackToStandardMenuBarHeight),
-    ("notch layout side paddings center the pill", testNotchLayoutSidePaddingsCenterThePill),
+    ("hanging notch geometry creates concave shoulders and rounded base", testHangingNotchGeometryCreatesConcaveShouldersAndRoundedBase),
+    ("hanging notch geometry joins both curves into a continuous S", testHangingNotchGeometryJoinsBothCurvesIntoAContinuousS),
+    ("hanging notch metrics create a rounder roomier drop", testHangingNotchMetricsCreateARounderRoomierDrop),
+    ("hanging notch interaction region passes transparent corners through", testHangingNotchInteractionRegionPassesTransparentCornersThrough),
     ("notch layout menu card width never cramped in pill mode", testNotchLayoutMenuCardWidthNeverCrampedInPillMode),
     ("opencode plugin writes session state", testOpenCodePluginWritesSessionState),
     ("opencode plugin maps lifecycle events", testOpenCodePluginMapsLifecycleEvents),
