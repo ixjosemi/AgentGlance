@@ -4,6 +4,7 @@ import Foundation
 public struct DetectedAgentProcess: Equatable, Sendable {
     public let tool: AgentTool
     public let processID: Int32
+    public let processIdentity: ProcessIdentity?
     public let cwd: String
     public let terminal: TerminalContext
     public let elapsedSeconds: TimeInterval
@@ -11,12 +12,14 @@ public struct DetectedAgentProcess: Equatable, Sendable {
     public init(
         tool: AgentTool,
         processID: Int32,
+        processIdentity: ProcessIdentity? = nil,
         cwd: String,
         terminal: TerminalContext,
         elapsedSeconds: TimeInterval = .greatestFiniteMagnitude
     ) {
         self.tool = tool
         self.processID = processID
+        self.processIdentity = processIdentity
         self.cwd = cwd
         self.terminal = terminal
         self.elapsedSeconds = elapsedSeconds
@@ -25,6 +28,13 @@ public struct DetectedAgentProcess: Equatable, Sendable {
 
 public protocol ProcessScanning: Sendable {
     func activeProcesses() throws -> [DetectedAgentProcess]
+    func basicActiveProcesses() throws -> [DetectedAgentProcess]
+    func enrichTerminalContexts(in processes: [DetectedAgentProcess]) -> [DetectedAgentProcess]
+}
+
+public extension ProcessScanning {
+    func basicActiveProcesses() throws -> [DetectedAgentProcess] { try activeProcesses() }
+    func enrichTerminalContexts(in processes: [DetectedAgentProcess]) -> [DetectedAgentProcess] { processes }
 }
 
 public struct SystemProcessScanner: ProcessScanning {
@@ -57,14 +67,22 @@ public struct SystemProcessScanner: ProcessScanning {
     }
 
     public func activeProcesses() throws -> [DetectedAgentProcess] {
-        let detected = Self.droppingRuntimeLaunchers(
+        enrichTerminalContexts(in: try basicActiveProcesses())
+    }
+
+    public func basicActiveProcesses() throws -> [DetectedAgentProcess] {
+        Self.droppingRuntimeLaunchers(
             try Self.allProcessIDs().compactMap(Self.detectAgentProcess)
         )
+    }
+
+    public func enrichTerminalContexts(in detected: [DetectedAgentProcess]) -> [DetectedAgentProcess] {
         let ghosttyProcesses = detected.filter { $0.terminal.termProgram == "ghostty" }
         guard !ghosttyProcesses.isEmpty,
-              let terminals = terminalQueryCache.terminals(
-                  hostingProcessIDs: Set(ghosttyProcesses.map(\.processID))
-              ) else {
+               let terminals = terminalQueryCache.terminals(
+                   hostingProcessIDs: Set(ghosttyProcesses.map(\.processID)),
+                   processGenerationKeys: Set(ghosttyProcesses.map(GhosttySessionMatcher.assignmentKey))
+               ) else {
             return detected
         }
         let nonGhosttyProcesses = detected.filter { $0.terminal.termProgram != "ghostty" }
@@ -106,16 +124,23 @@ public struct SystemProcessScanner: ProcessScanning {
     /// whose metadata is fully readable. Processes that exit mid-scan simply
     /// disappear from the result instead of failing the whole scan.
     private static func detectAgentProcess(_ processID: pid_t) -> ClassifiedAgentProcess? {
-        guard let classification = agentTool(processID: processID),
+        guard let initialInfo = bsdInfo(processID: processID),
+              initialInfo.pbi_status != UInt32(SZOMB),
+              let classification = agentTool(processID: processID),
               let cwd = workingDirectory(processID: processID),
-              let bsdInfo = bsdInfo(processID: processID) else {
+              let bsdInfo = bsdInfo(processID: processID),
+              bsdInfo.pbi_status != UInt32(SZOMB),
+              processIdentity(from: initialInfo, processID: processID)
+                == processIdentity(from: bsdInfo, processID: processID) else {
             return nil
         }
-        let startedAt = TimeInterval(bsdInfo.pbi_start_tvsec)
+        let identity = processIdentity(from: bsdInfo, processID: processID)
+        let startedAt = TimeInterval(identity.kernelStartTimeMicroseconds) / 1_000_000
         return ClassifiedAgentProcess(
             process: DetectedAgentProcess(
                 tool: classification.tool,
                 processID: processID,
+                processIdentity: identity,
                 cwd: cwd,
                 terminal: TerminalContext(
                     termProgram: hostTerminalProgram(descendant: bsdInfo),
@@ -295,6 +320,21 @@ public struct SystemProcessScanner: ProcessScanning {
         return info
     }
 
+    public static func processIdentity(of processID: pid_t) -> ProcessIdentity? {
+        guard let info = bsdInfo(processID: processID), info.pbi_status != UInt32(SZOMB) else {
+            return nil
+        }
+        return processIdentity(from: info, processID: processID)
+    }
+
+    private static func processIdentity(from info: proc_bsdinfo, processID: pid_t) -> ProcessIdentity {
+        ProcessIdentity(
+            processID: processID,
+            kernelStartTimeMicroseconds: UInt64(info.pbi_start_tvsec) * 1_000_000
+                + UInt64(info.pbi_start_tvusec)
+        )
+    }
+
     private static func argumentZero(processID: pid_t) -> String? {
         firstArguments(processID: processID, count: 1).first.flatMap {
             $0.isEmpty ? nil : $0
@@ -335,21 +375,38 @@ public struct SystemProcessScanner: ProcessScanning {
           id: t.id(), name: t.name(), cwd: t.workingDirectory()
         })))
         """
-        let result = try Self.run("/usr/bin/osascript", arguments: ["-l", "JavaScript", "-e", script])
+        let result = try Self.run(
+            "/usr/bin/osascript",
+            arguments: ["-l", "JavaScript", "-e", script],
+            timeout: 2
+        )
         guard result.status == 0, let data = result.output.data(using: .utf8) else { return [] }
         return try JSONDecoder().decode([GhosttyTerminal].self, from: data)
     }
 
-    private static func run(_ executable: String, arguments: [String]) throws -> (status: Int32, output: String) {
+    private static func run(
+        _ executable: String,
+        arguments: [String],
+        timeout: TimeInterval
+    ) throws -> (status: Int32, output: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         let output = Pipe()
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
         try process.run()
+        guard exited.wait(timeout: .now() + timeout) == .success else {
+            process.terminate()
+            if exited.wait(timeout: .now() + 0.25) == .timedOut {
+                Darwin.kill(process.processIdentifier, SIGKILL)
+                _ = exited.wait(timeout: .now() + 0.25)
+            }
+            throw POSIXError(.ETIMEDOUT)
+        }
         let data = output.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
         return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
     }
 }

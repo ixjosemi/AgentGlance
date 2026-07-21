@@ -32,6 +32,7 @@ public struct AttentionAcknowledgments: Equatable, Sendable {
                 tool: session.tool,
                 sessionID: session.sessionID,
                 pid: session.pid,
+                processIdentity: session.processIdentity,
                 status: .idle,
                 attentionReason: nil,
                 cwd: session.cwd,

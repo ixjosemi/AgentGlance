@@ -43,7 +43,7 @@ public final class GhosttyTerminalQueryCache: @unchecked Sendable {
     private let query: @Sendable () -> [GhosttyTerminal]?
     private let lock = NSLock()
     private var cachedTerminals: [GhosttyTerminal]?
-    private var cachedProcessIDs: Set<pid_t> = []
+    private var cachedProcessKeys: Set<String> = []
     private var refreshedAt: Date = .distantPast
 
     public init(
@@ -56,11 +56,15 @@ public final class GhosttyTerminalQueryCache: @unchecked Sendable {
 
     public func terminals(
         hostingProcessIDs processIDs: Set<pid_t>,
+        processGenerationKeys: Set<String> = [],
         now: Date = Date()
     ) -> [GhosttyTerminal]? {
+        let processKeys = processGenerationKeys.isEmpty
+            ? Set(processIDs.map(String.init))
+            : processGenerationKeys
         lock.lock()
         if let cachedTerminals,
-           processIDs == cachedProcessIDs,
+           processKeys == cachedProcessKeys,
            now.timeIntervalSince(refreshedAt) < timeToLive {
             lock.unlock()
             return cachedTerminals
@@ -69,7 +73,7 @@ public final class GhosttyTerminalQueryCache: @unchecked Sendable {
         guard let refreshed = query() else { return nil }
         lock.lock()
         cachedTerminals = refreshed
-        cachedProcessIDs = processIDs
+        cachedProcessKeys = processKeys
         refreshedAt = now
         lock.unlock()
         return refreshed

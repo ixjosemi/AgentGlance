@@ -68,7 +68,10 @@ public enum GhosttySessionMatcher {
     }
 
     public static func assignmentKey(for process: DetectedAgentProcess) -> String {
-        "\(process.tool.rawValue)-\(process.processID)"
+        if let identity = process.processIdentity {
+            return "\(process.tool.rawValue)-\(identity.processID)-\(identity.kernelStartTimeMicroseconds)"
+        }
+        return "\(process.tool.rawValue)-\(process.processID)"
     }
 
     private static func bestTerminalIndex(
@@ -140,6 +143,7 @@ public enum GhosttySessionMatcher {
         DetectedAgentProcess(
             tool: process.tool,
             processID: process.processID,
+            processIdentity: process.processIdentity,
             cwd: process.cwd,
             terminal: TerminalContext(
                 termProgram: "ghostty",

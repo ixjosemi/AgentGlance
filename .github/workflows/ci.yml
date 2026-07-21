@@ -20,6 +20,8 @@ jobs:
         run: swift build
       - name: Test
         run: swift run agentglance-tests
+      - name: Test OpenCode plugin
+        run: node Tests/OpenCodePlugin/agentglance_test.mjs
       - name: Validate resources
         run: |
           plutil -lint config/Info.plist

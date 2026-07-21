@@ -11,6 +11,7 @@ const stateDirectory = join(
 );
 const sessions = new Map();
 const childSessionIDs = new Set();
+const updateQueues = new Map();
 
 function timestamp() {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -111,7 +112,6 @@ async function updateState(client, event, directory) {
     "permission.replied": ["working", null],
     "session.idle": ["idle", null],
     "session.deleted": ["ended", null],
-    "message.updated": ["working", null],
   };
   // session.status carries its own idle signal (properties.status.type ===
   // "idle") alongside the dedicated session.idle event below — OpenCode
@@ -129,7 +129,7 @@ async function updateState(client, event, directory) {
   const transition = statusTransition ?? transitions[event.type];
   if (!transition) return;
   // While a permission is pending, OpenCode keeps emitting session.status
-  // "busy" and message.updated noise for the paused turn. Only an explicit
+  // "busy" noise for the paused turn. Only an explicit
   // permission.replied may end the wait — anything else must not downgrade
   // the red light back to "working".
   if (state.status === "needs_attention" && transition[0] === "working" && event.type !== "permission.replied") {
@@ -144,8 +144,14 @@ async function updateState(client, event, directory) {
 
 export const AgentGlancePlugin = async ({ client, directory }) => ({
   event: async ({ event }) => {
+    const sessionID = eventSessionID(event);
+    const previous = sessionID ? updateQueues.get(sessionID) : undefined;
+    const update = (previous ?? Promise.resolve()).catch(() => {}).then(
+      () => updateState(client, event, directory),
+    );
+    if (sessionID) updateQueues.set(sessionID, update);
     try {
-      await updateState(client, event, directory);
+      await update;
     } catch (error) {
       await client.app.log({
         body: {
@@ -154,6 +160,10 @@ export const AgentGlancePlugin = async ({ client, directory }) => ({
           message: `State update failed: ${String(error)}`,
         },
       });
+    } finally {
+      if (sessionID && updateQueues.get(sessionID) === update) {
+        updateQueues.delete(sessionID);
+      }
     }
   },
 });

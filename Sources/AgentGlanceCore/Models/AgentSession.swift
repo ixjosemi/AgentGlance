@@ -28,6 +28,24 @@ public enum SessionSource: String, Codable, Sendable {
     case reaper
 }
 
+/// A PID names a process only until the kernel recycles it. Pairing it with
+/// the kernel's creation timestamp gives persisted sessions a stable process
+/// generation to reconcile against.
+public struct ProcessIdentity: Codable, Equatable, Hashable, Sendable {
+    public let processID: Int32
+    public let kernelStartTimeMicroseconds: UInt64
+
+    public init(processID: Int32, kernelStartTimeMicroseconds: UInt64) {
+        self.processID = processID
+        self.kernelStartTimeMicroseconds = kernelStartTimeMicroseconds
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case processID = "pid"
+        case kernelStartTimeMicroseconds = "kernel_start_time_us"
+    }
+}
+
 public struct TerminalContext: Codable, Equatable, Sendable {
     public let termProgram: String?
     public let ghosttyTerminalID: String?
@@ -67,6 +85,7 @@ public struct AgentSession: Codable, Identifiable, Equatable, Sendable {
     public let tool: AgentTool
     public let sessionID: String
     public let pid: Int32
+    public let processIdentity: ProcessIdentity?
     public let status: SessionStatus
     public let attentionReason: AttentionReason?
     public let cwd: String
@@ -87,6 +106,25 @@ public struct AgentSession: Codable, Identifiable, Equatable, Sendable {
             tool: tool,
             sessionID: sessionID,
             pid: processID,
+            processIdentity: nil,
+            status: status,
+            attentionReason: attentionReason,
+            cwd: cwd,
+            startedAt: startedAt,
+            updatedAt: updatedAt,
+            terminal: terminal,
+            source: source,
+            currentStep: currentStep
+        )
+    }
+
+    public func replacingProcess(_ process: DetectedAgentProcess) -> AgentSession {
+        AgentSession(
+            schemaVersion: schemaVersion,
+            tool: tool,
+            sessionID: sessionID,
+            pid: process.processID,
+            processIdentity: process.processIdentity,
             status: status,
             attentionReason: attentionReason,
             cwd: cwd,
@@ -103,6 +141,7 @@ public struct AgentSession: Codable, Identifiable, Equatable, Sendable {
         tool: AgentTool,
         sessionID: String,
         pid: Int32,
+        processIdentity: ProcessIdentity? = nil,
         status: SessionStatus,
         attentionReason: AttentionReason? = nil,
         cwd: String,
@@ -116,6 +155,7 @@ public struct AgentSession: Codable, Identifiable, Equatable, Sendable {
         self.tool = tool
         self.sessionID = sessionID
         self.pid = pid
+        self.processIdentity = processIdentity?.processID == pid ? processIdentity : nil
         self.status = status
         self.attentionReason = attentionReason
         self.cwd = cwd
@@ -131,6 +171,7 @@ public struct AgentSession: Codable, Identifiable, Equatable, Sendable {
         case tool
         case sessionID = "session_id"
         case pid
+        case processIdentity = "process_identity"
         case status
         case attentionReason = "attention_reason"
         case cwd

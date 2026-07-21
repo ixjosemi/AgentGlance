@@ -46,6 +46,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
             return
         }
+        let scheduler = ObservationScheduler(repository: repository)
+        observationScheduler = scheduler
+        do {
+            try scheduler.performInitialReconciliation()
+        } catch {
+            NSLog("AgentGlance initial process reconciliation failed: %@", String(describing: error))
+        }
         // Session names live next to — never inside — the state directory:
         // the store watches that directory and decode-attempts every .json.
         let store = StateStore(
@@ -80,8 +87,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         panelController = NotchPanelController(store: store)
         panelController?.show()
-        let scheduler = ObservationScheduler(repository: repository)
-        observationScheduler = scheduler
         scheduler.start()
         let focusObserver = FocusAcknowledgmentObserver(store: store)
         focusAcknowledgmentObserver = focusObserver

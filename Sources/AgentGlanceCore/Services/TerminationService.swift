@@ -46,31 +46,60 @@ public enum TerminationService {
         // Validate the close plan before sending any signal, so a corrupt
         // document cannot kill the process and then fail to clean up.
         let closeActions = try TerminationPlanner.closeActions(for: session)
-        try killProcess(session.pid, gracePeriod: gracePeriod)
+        try killProcess(
+            session.pid,
+            expectedIdentity: session.processIdentity,
+            gracePeriod: gracePeriod
+        )
         try FocusActionRunner.run(closeActions)
     }
 
-    private static func killProcess(_ processID: Int32, gracePeriod: TimeInterval) throws {
+    private static func killProcess(
+        _ processID: Int32,
+        expectedIdentity: ProcessIdentity?,
+        gracePeriod: TimeInterval
+    ) throws {
         // kill(0)/kill(-1) would signal a whole process group; refuse.
         guard processID > 0 else {
             throw TerminationError.signalFailed(pid: processID, underlyingErrno: EINVAL)
+        }
+        if let expectedIdentity,
+           SystemProcessScanner.processIdentity(of: processID) != expectedIdentity {
+            throw TerminationError.signalFailed(pid: processID, underlyingErrno: ESRCH)
         }
         if Darwin.kill(processID, SIGTERM) != 0 {
             if errno == ESRCH { return }
             throw TerminationError.signalFailed(pid: processID, underlyingErrno: errno)
         }
-        if waitForExit(processID, gracePeriod: gracePeriod) { return }
+        if waitForExit(
+            processID,
+            expectedIdentity: expectedIdentity,
+            gracePeriod: gracePeriod
+        ) { return }
+        if let expectedIdentity,
+           SystemProcessScanner.processIdentity(of: processID) != expectedIdentity {
+            return
+        }
         if Darwin.kill(processID, SIGKILL) != 0, errno != ESRCH {
             throw TerminationError.signalFailed(pid: processID, underlyingErrno: errno)
         }
-        guard waitForExit(processID, gracePeriod: gracePeriod) else {
+        guard waitForExit(
+            processID,
+            expectedIdentity: expectedIdentity,
+            gracePeriod: gracePeriod
+        ) else {
             throw TerminationError.processStillAlive(processID)
         }
     }
 
-    private static func waitForExit(_ processID: Int32, gracePeriod: TimeInterval) -> Bool {
+    private static func waitForExit(
+        _ processID: Int32,
+        expectedIdentity: ProcessIdentity?,
+        gracePeriod: TimeInterval
+    ) -> Bool {
         let deadline = Date().addingTimeInterval(gracePeriod)
-        while isRunning(processID) {
+        while isRunning(processID)
+            && expectedIdentity.map({ SystemProcessScanner.processIdentity(of: processID) == $0 }) != false {
             guard Date() < deadline else { return false }
             usleep(50_000)
         }

@@ -21,15 +21,28 @@ public final class ObservationScheduler {
         label: "com.agentglance.observation",
         qos: .utility
     )
-    private var heartbeatTimer: Timer?
+    private var heartbeatTimer: DispatchSourceTimer?
 
     // Only touched on workQueue.
     private var codexWatcher: CodexSessionsWatcher?
     private var convoyWatcher: ConvoyRunsWatcher?
     private var codexProcessMap: [String: Int32] = [:]
     private var codexDirectorySource: DispatchSourceFileSystemObject?
-    private var exitWatchers: [pid_t: DispatchSourceProcess] = [:]
+    private var convoyRunsDirectorySource: DispatchSourceFileSystemObject?
+    private var convoyRunDirectorySources: [URL: DispatchSourceFileSystemObject] = [:]
+    private var exitWatchers: [String: DispatchSourceProcess] = [:]
     private var tickScheduled = false
+    private var pendingReasons: TickReasons = []
+    private var generation = 0
+
+    private struct TickReasons: OptionSet {
+        let rawValue: Int
+        static let explicit = TickReasons(rawValue: 1 << 0)
+        static let heartbeat = TickReasons(rawValue: 1 << 1)
+        static let codexMetadata = TickReasons(rawValue: 1 << 2)
+        static let convoyMetadata = TickReasons(rawValue: 1 << 3)
+        static let processExit = TickReasons(rawValue: 1 << 4)
+    }
 
     public init(
         repository: StateRepository,
@@ -55,81 +68,127 @@ public final class ObservationScheduler {
     public func start() {
         stop()
         requestTick()
-        workQueue.async { [weak self] in self?.startCodexDirectorySource() }
-        let timer = Timer.scheduledTimer(
-            withTimeInterval: heartbeatInterval,
-            repeats: true
-        ) { [weak self] _ in
-            self?.requestTick()
+        workQueue.async { [weak self] in
+            guard let self else { return }
+            self.startCodexDirectorySource()
+            self.startConvoyRunsDirectorySource()
+            let timer = DispatchSource.makeTimerSource(queue: self.workQueue)
+            timer.schedule(
+                deadline: .now() + self.heartbeatInterval,
+                repeating: self.heartbeatInterval,
+                leeway: .milliseconds(Int(self.heartbeatInterval * 200))
+            )
+            timer.setEventHandler { [weak self] in self?.scheduleCoalescedTick(reason: .heartbeat) }
+            self.heartbeatTimer = timer
+            timer.resume()
         }
-        // A late heartbeat is indistinguishable from a slow one; tolerance
-        // lets the kernel coalesce the wakeup with other timers.
-        timer.tolerance = heartbeatInterval / 5
-        heartbeatTimer = timer
     }
 
     public func stop() {
-        heartbeatTimer?.invalidate()
-        heartbeatTimer = nil
         workQueue.async { [weak self] in
             guard let self else { return }
+            self.generation += 1
+            self.tickScheduled = false
+            self.pendingReasons = []
             self.codexDirectorySource?.cancel()
             self.codexDirectorySource = nil
+            self.heartbeatTimer?.cancel()
+            self.heartbeatTimer = nil
+            self.convoyRunsDirectorySource?.cancel()
+            self.convoyRunsDirectorySource = nil
+            self.convoyRunDirectorySources.values.forEach { $0.cancel() }
+            self.convoyRunDirectorySources.removeAll()
             self.exitWatchers.values.forEach { $0.cancel() }
             self.exitWatchers.removeAll()
         }
     }
 
     public func requestTick() {
-        workQueue.async { [weak self] in self?.scheduleCoalescedTick() }
+        workQueue.async { [weak self] in self?.scheduleCoalescedTick(reason: .explicit) }
+    }
+
+    /// Removes stale persisted state before StateStore establishes the UI's
+    /// baseline. This basic pass never invokes Ghostty or Apple Events.
+    public func performInitialReconciliation() throws {
+        _ = try reaper.reap(detected: processScanner.basicActiveProcesses())
     }
 
     /// Coalesces bursts of tick requests (Codex rollout files receive a write
     /// event per token flush) into one scan per debounce window.
-    private func scheduleCoalescedTick() {
+    private func scheduleCoalescedTick(reason: TickReasons) {
         dispatchPrecondition(condition: .onQueue(workQueue))
+        pendingReasons.formUnion(reason)
         guard !tickScheduled else { return }
         tickScheduled = true
+        let scheduledGeneration = generation
         workQueue.asyncAfter(deadline: .now() + debounceInterval) { [weak self] in
-            guard let self else { return }
+            guard let self, self.generation == scheduledGeneration else { return }
             self.tickScheduled = false
-            self.tick()
+            let reasons = self.pendingReasons
+            self.pendingReasons = []
+            self.tick(reasons: reasons)
         }
     }
 
-    private func tick() {
+    private func tick(reasons: TickReasons) {
         dispatchPrecondition(condition: .onQueue(workQueue))
         let detected: [DetectedAgentProcess]
         do {
-            detected = try processScanner.activeProcesses()
+            detected = try processScanner.basicActiveProcesses()
         } catch {
             NSLog("AgentGlance process scan failed: %@", String(describing: error))
             return
         }
+        let convoyResult = scanConvoyRuns(
+            detected: detected,
+            isHeartbeat: reasons.contains(.heartbeat),
+            forceRefresh: reasons.contains(.convoyMetadata)
+        )
         do {
-            _ = try reaper.reap(detected: detected)
+            _ = try reaper.reap(
+                detected: detected,
+                preservingSessionIDs: convoyResult?.preservingSessionIDs ?? []
+            )
         } catch {
             NSLog("AgentGlance reaper failed: %@", String(describing: error))
         }
-        refreshCodexWatcher(detected: detected)
-        scanConvoyRuns(detected: detected)
+        let enriched = processScanner.enrichTerminalContexts(in: detected)
+        do {
+            try reaper.applyTerminalEnrichment(basic: detected, enriched: enriched)
+        } catch {
+            NSLog("AgentGlance terminal enrichment failed: %@", String(describing: error))
+        }
+        refreshCodexWatcher(detected: enriched)
+        if let convoyResult {
+            do { try convoyWatcher?.suppressOpenCodeSessions(for: convoyResult) }
+            catch { NSLog("AgentGlance convoy suppression failed: %@", String(describing: error)) }
+            refreshConvoyRunDirectorySources(convoyResult.runDirectoryURLs)
+        }
         refreshExitWatchers(detected: detected)
     }
 
-    /// Convoy needs no directory event source: its metadata changes on
-    /// phase transitions, minutes apart, so the heartbeat cadence is
-    /// plenty and the watcher's mtime cache keeps each pass cheap.
-    private func scanConvoyRuns(detected: [DetectedAgentProcess]) {
+    /// Convoy metadata events are primary; the heartbeat remains a backstop
+    /// for missed vnode events and drives final-state grace expiration.
+    private func scanConvoyRuns(
+        detected: [DetectedAgentProcess],
+        isHeartbeat: Bool,
+        forceRefresh: Bool
+    ) -> ConvoyRunsWatcher.ScanResult? {
         let watcher = convoyWatcher ?? ConvoyRunsWatcher(
             runsDirectoryURL: convoyRunsDirectoryURL,
             repository: repository
         )
         convoyWatcher = watcher
         do {
-            try watcher.scan(detected: detected)
+            return try watcher.observe(
+                detected: detected,
+                isHeartbeat: isHeartbeat,
+                forceRefresh: forceRefresh
+            )
         } catch {
             NSLog("AgentGlance convoy watcher failed: %@", String(describing: error))
         }
+        return nil
     }
 
     /// Registers a kernel exit notification (EVFILT_PROC) per tracked agent
@@ -138,21 +197,30 @@ public final class ObservationScheduler {
     /// that dies before registration is caught by the heartbeat backstop.
     private func refreshExitWatchers(detected: [DetectedAgentProcess]) {
         dispatchPrecondition(condition: .onQueue(workQueue))
-        let activeProcessIDs = Set(detected.map(\.processID))
-        for (processID, watcher) in exitWatchers where !activeProcessIDs.contains(processID) {
+        let processesByKey = Dictionary(uniqueKeysWithValues: detected.map {
+            (processGenerationKey($0), $0)
+        })
+        for (key, watcher) in exitWatchers where processesByKey[key] == nil {
             watcher.cancel()
-            exitWatchers[processID] = nil
+            exitWatchers[key] = nil
         }
-        for processID in activeProcessIDs where exitWatchers[processID] == nil {
+        for (key, process) in processesByKey where exitWatchers[key] == nil {
             let watcher = DispatchSource.makeProcessSource(
-                identifier: processID,
+                identifier: process.processID,
                 eventMask: .exit,
                 queue: workQueue
             )
-            watcher.setEventHandler { [weak self] in self?.scheduleCoalescedTick() }
+            watcher.setEventHandler { [weak self] in self?.scheduleCoalescedTick(reason: .processExit) }
             watcher.resume()
-            exitWatchers[processID] = watcher
+            exitWatchers[key] = watcher
         }
+    }
+
+    private func processGenerationKey(_ process: DetectedAgentProcess) -> String {
+        if let identity = process.processIdentity {
+            return "\(identity.processID)-\(identity.kernelStartTimeMicroseconds)"
+        }
+        return String(process.processID)
     }
 
     /// Keeps one long-lived Codex watcher and retargets its PID resolver
@@ -201,9 +269,61 @@ public final class ObservationScheduler {
             eventMask: [.write, .extend, .rename],
             queue: workQueue
         )
-        source.setEventHandler { [weak self] in self?.scheduleCoalescedTick() }
+        source.setEventHandler { [weak self] in self?.scheduleCoalescedTick(reason: .codexMetadata) }
         source.setCancelHandler { Darwin.close(descriptor) }
         codexDirectorySource = source
         source.resume()
+    }
+
+    private func startConvoyRunsDirectorySource() {
+        dispatchPrecondition(condition: .onQueue(workQueue))
+        guard convoyRunsDirectorySource == nil,
+              FileManager.default.fileExists(atPath: convoyRunsDirectoryURL.path) else { return }
+        let descriptor = Darwin.open(convoyRunsDirectoryURL.path, O_EVTONLY)
+        guard descriptor >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor,
+            eventMask: [.write, .extend, .rename, .delete],
+            queue: workQueue
+        )
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            if !source.data.intersection([.rename, .delete]).isEmpty {
+                source.cancel()
+                self.convoyRunsDirectorySource = nil
+            }
+            self.scheduleCoalescedTick(reason: .convoyMetadata)
+        }
+        source.setCancelHandler { Darwin.close(descriptor) }
+        convoyRunsDirectorySource = source
+        source.resume()
+    }
+
+    private func refreshConvoyRunDirectorySources(_ directoryURLs: Set<URL>) {
+        for (url, source) in convoyRunDirectorySources where !directoryURLs.contains(url) {
+            source.cancel()
+            convoyRunDirectorySources[url] = nil
+        }
+        for url in directoryURLs where convoyRunDirectorySources[url] == nil {
+            let descriptor = Darwin.open(url.path, O_EVTONLY)
+            guard descriptor >= 0 else { continue }
+            let source = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: descriptor,
+                eventMask: [.write, .extend, .rename, .delete],
+                queue: workQueue
+            )
+            source.setEventHandler { [weak self] in
+                guard let self else { return }
+                if !source.data.intersection([.rename, .delete]).isEmpty {
+                    source.cancel()
+                    self.convoyRunDirectorySources[url] = nil
+                }
+                self.scheduleCoalescedTick(reason: .convoyMetadata)
+            }
+            source.setCancelHandler { Darwin.close(descriptor) }
+            convoyRunDirectorySources[url] = source
+            source.resume()
+        }
+        if convoyRunsDirectorySource == nil { startConvoyRunsDirectorySource() }
     }
 }

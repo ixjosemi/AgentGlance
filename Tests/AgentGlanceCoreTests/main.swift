@@ -517,6 +517,62 @@ struct TestProcessScanner: ProcessScanning {
     func activeProcesses() throws -> [DetectedAgentProcess] { processes }
 }
 
+func testReaperRejectsRecycledProcessIdentity() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let pid = Int32(getpid())
+    let currentIdentity = try SystemProcessScanner.processIdentity(of: pid)
+        .unwrap(or: "test process has no kernel identity")
+    let oldIdentity = ProcessIdentity(
+        processID: pid,
+        kernelStartTimeMicroseconds: currentIdentity.kernelStartTimeMicroseconds - 1
+    )
+    try repository.save(AgentSession(
+        tool: .claude, sessionID: "old-generation", pid: pid,
+        processIdentity: oldIdentity, status: .working, cwd: "/tmp/reused",
+        startedAt: Date(), updatedAt: Date()
+    ))
+    let replacement = DetectedAgentProcess(
+        tool: .claude, processID: pid, processIdentity: currentIdentity,
+        cwd: "/tmp/reused", terminal: TerminalContext()
+    )
+
+    let result = try ReaperService(repository: repository).reap(detected: [replacement])
+
+    try expect(result.removedSessionIDs, equals: ["old-generation"], "recycled PID removes old state")
+    let surviving = try repository.loadSessions().first.unwrap(or: "replacement fallback missing")
+    try expect(surviving.source, equals: .reaper, "new process gets fresh fallback state")
+    try expect(surviving.processIdentity, equals: currentIdentity, "replacement identity persisted")
+}
+
+func testReaperTreatsZombieAsDead() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    var child: pid_t = 0
+    var arguments: [UnsafeMutablePointer<CChar>?] = [strdup("/usr/bin/true"), nil]
+    defer { free(arguments[0]) }
+    let spawnStatus = arguments.withUnsafeMutableBufferPointer {
+        posix_spawn(&child, "/usr/bin/true", nil, nil, $0.baseAddress, environ)
+    }
+    guard spawnStatus == 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: spawnStatus) ?? .EAGAIN)
+    }
+    defer { var status: Int32 = 0; waitpid(child, &status, 0) }
+    usleep(50_000)
+    let repository = StateRepository(directoryURL: directory)
+    try repository.save(AgentSession(
+        tool: .claude, sessionID: "zombie", pid: child, status: .working,
+        cwd: "/tmp/zombie", startedAt: Date(), updatedAt: Date()
+    ))
+
+    let result = try ReaperService(repository: repository).reap(detected: [])
+
+    try expect(result.removedSessionIDs, equals: ["zombie"], "zombie removed immediately")
+}
+
 func testReaperCreatesFallbackStateForUntrackedProcess() throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -2356,7 +2412,8 @@ func writeConvoyRunFixture(
     serverStartedAt: Date,
     targetDir: String = "/tmp/convoy-target",
     phases: [(name: String, status: String, sessionID: String?)],
-    humanSteps: Set<String> = []
+    humanSteps: Set<String> = [],
+    includeServer: Bool = true
 ) throws {
     let phaseEntries = phases.map { phase in
         let sessionIDField = phase.sessionID.map { "\"sessionID\": \"\($0)\"," } ?? ""
@@ -2373,6 +2430,13 @@ func writeConvoyRunFixture(
         {"type": "\(humanSteps.contains(phase.name) ? "human" : "agent")", "name": "\(phase.name)"}
         """
     }.joined(separator: ",\n")
+    let serverField = includeServer ? """
+      "server": {
+        "url": "http://127.0.0.1:4096",
+        "pid": \(serverPid),
+        "startedAt": \(Int(serverStartedAt.timeIntervalSince1970 * 1000))
+      },
+    """ : ""
     let metadata = """
     {
       "schemaVersion": 2,
@@ -2380,11 +2444,7 @@ func writeConvoyRunFixture(
       "targetDir": "\(targetDir)",
       "createdAt": \(Int(serverStartedAt.timeIntervalSince1970 * 1000)),
       "updatedAt": \(Int(Date().timeIntervalSince1970 * 1000)),
-      "server": {
-        "url": "http://127.0.0.1:4096",
-        "pid": \(serverPid),
-        "startedAt": \(Int(serverStartedAt.timeIntervalSince1970 * 1000))
-      },
+      \(serverField)
       "phases": { \(phaseEntries) },
       "pipeline": { "name": "test", "steps": [ \(steps) ] }
     }
@@ -2534,6 +2594,78 @@ func testConvoyWatcherIgnoresRunsNotOwnedByLiveProcess() throws {
     try expect(try repository.loadSessions().isEmpty, equals: true, "no session published")
 }
 
+func testConvoyWatcherMapsThinkingAndUsesProjectName() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL, runID: "20260721-thinking",
+        serverPid: Int32(getpid()), serverStartedAt: Date().addingTimeInterval(-60),
+        targetDir: "/tmp/the-real-project",
+        phases: [("implementer", "thinking", "ses_impl")]
+    )
+    let process = DetectedAgentProcess(
+        tool: .convoy, processID: Int32(getpid()), cwd: "/tmp/the-real-project",
+        terminal: TerminalContext(termProgram: "ghostty", windowTitleHint: "convoy — implement")
+    )
+
+    try ConvoyRunsWatcher(runsDirectoryURL: runsDirectoryURL, repository: repository)
+        .scan(detected: [process])
+
+    let session = try repository.loadSessions().first.unwrap(or: "thinking run missing")
+    try expect(session.status, equals: .working, "thinking is active work")
+    try expect(session.currentStep, equals: "implementer", "thinking step")
+    try expect(session.projectName, equals: "the-real-project", "name comes from metadata target")
+    try expect(session.terminal.windowTitleHint, equals: nil, "generic Convoy tab title cannot override name")
+}
+
+func testConvoyFinalTransitionSurvivesImmediateProcessExitOnce() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    let runID = "20260721-final"
+    let startedAt = Date().addingTimeInterval(-60)
+    let processID: Int32 = 999_999
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL, runID: runID, serverPid: processID,
+        serverStartedAt: startedAt, phases: [("implementer", "running", "ses_impl")]
+    )
+    let watcher = ConvoyRunsWatcher(runsDirectoryURL: runsDirectoryURL, repository: repository)
+    let process = DetectedAgentProcess(
+        tool: .convoy, processID: processID, cwd: "/tmp/convoy-target",
+        terminal: TerminalContext(termProgram: "ghostty"), elapsedSeconds: 120
+    )
+    _ = try watcher.observe(detected: [process], isHeartbeat: false)
+    let store = StateStore(repository: repository)
+    var completions = 0
+    store.onTurnCompleted = { completions += $0.count }
+    try store.reload()
+
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL, runID: runID, serverPid: processID,
+        serverStartedAt: startedAt, phases: [("implementer", "completed", "ses_impl")],
+        includeServer: false
+    )
+    let final = try watcher.observe(detected: [], isHeartbeat: false, forceRefresh: true)
+    _ = try ReaperService(repository: repository).reap(
+        detected: [], preservingSessionIDs: final.preservingSessionIDs
+    )
+    try store.reload()
+    try store.reload()
+
+    try expect(store.sessions.first?.status, equals: .idle, "final idle remains observable")
+    try expect(completions, equals: 1, "completed transition notifies exactly once")
+
+    let firstHeartbeat = try watcher.observe(detected: [], isHeartbeat: true)
+    try expect(
+        firstHeartbeat.preservingSessionIDs.contains("convoy-\(runID)"),
+        equals: true,
+        "one-heartbeat grace"
+    )
+    let secondHeartbeat = try watcher.observe(detected: [], isHeartbeat: true)
+    try expect(secondHeartbeat.preservingSessionIDs.isEmpty, equals: true, "grace expires")
+}
+
 func testConvoyWatcherSuppressesPipelineOwnedOpenCodeSessions() throws {
     // Convoy phases run as OpenCode sessions on convoy's embedded server;
     // if that server loads the AgentGlance plugin, each phase would also
@@ -2546,7 +2678,10 @@ func testConvoyWatcherSuppressesPipelineOwnedOpenCodeSessions() throws {
         from: validStateJSON(sessionID: "ses_security", status: "working", pid: Int32(getpid()), tool: "opencode")
     ))
     try repository.save(AgentSession.decode(
-        from: validStateJSON(sessionID: "ses_unrelated", status: "idle", pid: Int32(getpid()), tool: "opencode")
+        from: validStateJSON(
+            sessionID: "ses_unrelated", status: "idle", pid: Int32(getpid()),
+            tool: "opencode", cwd: "/tmp/convoy-target"
+        )
     ))
     try writeConvoyRunFixture(
         at: runsDirectoryURL,
@@ -2562,7 +2697,7 @@ func testConvoyWatcherSuppressesPipelineOwnedOpenCodeSessions() throws {
     let opencodeSessionIDs = try repository.loadSessions()
         .filter { $0.tool == .opencode }
         .map(\.sessionID)
-    try expect(opencodeSessionIDs, equals: ["ses_unrelated"], "surviving opencode sessions")
+    try expect(opencodeSessionIDs, equals: ["ses_unrelated"], "same-cwd native session survives")
 }
 
 func testConvoyWatcherSuppressesEmbeddedServerReaperFallbackByDirectory() throws {
@@ -3806,6 +3941,8 @@ let tests: [(String, () throws -> Void)] = [
     ("reaper drops stale native state when agent is no longer detected", testReaperDropsStaleNativeStateWhenTheAgentIsNoLongerDetected),
     ("reaper rebinds by terminal when several processes share a directory", testReaperRebindsByTerminalWhenSeveralProcessesShareADirectory),
     ("reaper does not rebind across conflicting terminal identities", testReaperDoesNotRebindAcrossConflictingTerminalIdentities),
+    ("reaper rejects recycled process identity", testReaperRejectsRecycledProcessIdentity),
+    ("reaper treats zombie as dead", testReaperTreatsZombieAsDead),
     ("reaper creates fallback state for untracked process", testReaperCreatesFallbackStateForUntrackedProcess),
     ("reaper reaps against provided scan", testReaperReapsAgainstProvidedScan),
     ("reaper rebinds daemon-hosted session to visible process", testReaperRebindsDaemonHostedSessionToVisibleProcess),
@@ -3869,6 +4006,8 @@ let tests: [(String, () throws -> Void)] = [
     ("convoy watcher publishes running pipeline step", testConvoyWatcherPublishesRunningPipelineStep),
     ("convoy watcher flags waiting human gate", testConvoyWatcherFlagsWaitingHumanGate),
     ("convoy watcher maps terminal pipeline states", testConvoyWatcherMapsTerminalPipelineStates),
+    ("convoy watcher maps thinking and uses project name", testConvoyWatcherMapsThinkingAndUsesProjectName),
+    ("convoy final transition survives immediate process exit once", testConvoyFinalTransitionSurvivesImmediateProcessExitOnce),
     ("convoy watcher ignores runs not owned by live process", testConvoyWatcherIgnoresRunsNotOwnedByLiveProcess),
     ("convoy watcher suppresses pipeline-owned opencode sessions", testConvoyWatcherSuppressesPipelineOwnedOpenCodeSessions),
     ("convoy watcher suppresses embedded server reaper fallback by directory", testConvoyWatcherSuppressesEmbeddedServerReaperFallbackByDirectory),

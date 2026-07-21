@@ -36,14 +36,23 @@ public struct ReaperService: Sendable {
     /// consumers from one scan (for example the observation scheduler) do not
     /// trigger a rescan per consumer.
     public func reap(detected activeProcesses: [DetectedAgentProcess]) throws -> ReaperResult {
+        try reap(detected: activeProcesses, preservingSessionIDs: [])
+    }
+
+    public func reap(
+        detected activeProcesses: [DetectedAgentProcess],
+        preservingSessionIDs: Set<String>
+    ) throws -> ReaperResult {
         let sessions = try repository.loadSessions()
         nativeMisses.retain(sessionIDs: Set(sessions.map(\.id)))
-        let activeProcessKeys = Set(activeProcesses.map {
-            "\($0.tool.rawValue)-\($0.processID)"
-        })
+        let activeProcessKeys = Set(activeProcesses.map(processKey))
         var removedSessionIDs: [String] = []
         var survivors: [AgentSession] = []
         for session in sessions {
+            if preservingSessionIDs.contains(session.id) {
+                survivors.append(session)
+                continue
+            }
             if shouldRemove(
                 session,
                 activeProcessKeys: activeProcessKeys,
@@ -62,7 +71,7 @@ public struct ReaperService: Sendable {
         )
         var createdSessionIDs: [String] = []
         for process in activeProcesses {
-            let processKey = "\(process.tool.rawValue)-\(process.processID)"
+            let processKey = processKey(process)
             if let existing = tracked[processKey] {
                 try refreshFallback(existing, from: process)
                 try adoptScannedTerminal(existing, from: process)
@@ -76,6 +85,7 @@ public struct ReaperService: Sendable {
                 tool: process.tool,
                 sessionID: sessionID,
                 pid: process.processID,
+                processIdentity: process.processIdentity,
                 status: .idle,
                 cwd: process.cwd,
                 startedAt: Date(),
@@ -91,6 +101,28 @@ public struct ReaperService: Sendable {
         )
     }
 
+    /// Applies optional terminal enrichment after liveness reconciliation.
+    /// Ghostty Apple Events must never sit in front of the reaper, so the
+    /// scheduler calls this only after the basic libproc pass has completed.
+    public func applyTerminalEnrichment(
+        basic: [DetectedAgentProcess],
+        enriched: [DetectedAgentProcess]
+    ) throws {
+        let enrichedKeys = Set(enriched.map { "\($0.tool.rawValue)-\($0.processID)" })
+        let basicKeys = Set(basic.map { "\($0.tool.rawValue)-\($0.processID)" })
+        for session in try repository.loadSessions() {
+            let key = "\(session.tool.rawValue)-\(session.pid)"
+            if session.source == .reaper,
+               basicKeys.contains(key),
+               !enrichedKeys.contains(key) {
+                try repository.remove(session)
+                continue
+            }
+            guard let process = enriched.first(where: { processMatches(session, $0) }) else { continue }
+            try adoptScannedTerminal(session, from: process)
+        }
+    }
+
     /// A terminal shows one session at a time, so several documents pointing
     /// at the same process describe at most one visible session. OpenCode
     /// accumulates the rest — child sessions spawned for subagents and chats
@@ -102,7 +134,7 @@ public struct ReaperService: Sendable {
     ) throws -> [String: AgentSession] {
         var tracked: [String: AgentSession] = [:]
         for session in sessions {
-            let key = "\(session.tool.rawValue)-\(session.pid)"
+            let key = processKey(session)
             guard let incumbent = tracked[key] else {
                 tracked[key] = session
                 continue
@@ -138,11 +170,11 @@ public struct ReaperService: Sendable {
         activeProcessKeys: Set<String>,
         activeProcesses: [DetectedAgentProcess]
     ) -> Bool {
-        if session.status == .ended || !isAlive(session.pid) {
+        if session.status == .ended || !isAlive(session) {
             nativeMisses.clear(sessionID: session.id)
             return true
         }
-        let key = "\(session.tool.rawValue)-\(session.pid)"
+        let key = processKey(session)
         if session.source == .reaper {
             return !activeProcessKeys.contains(key)
         }
@@ -179,15 +211,48 @@ public struct ReaperService: Sendable {
         to activeProcesses: [DetectedAgentProcess]
     ) throws -> [AgentSession] {
         let processesByTool = Dictionary(grouping: activeProcesses, by: \.tool)
-        return try sessions.map { session in
-            guard session.source != .reaper,
-                  let sameToolProcesses = processesByTool[session.tool],
-                  !sameToolProcesses.contains(where: { $0.processID == session.pid }) else {
-                return session
+        var reserved = Set<String>()
+        for session in sessions {
+            guard let process = activeProcesses.first(where: { processMatches(session, $0) }) else { continue }
+            reserved.insert(processKey(process))
+        }
+        var assignments: [String: DetectedAgentProcess] = [:]
+        var changed = true
+        while changed {
+            changed = false
+            let proposals: [(AgentSession, DetectedAgentProcess)] = sessions.compactMap { session in
+                guard session.source != .reaper,
+                      assignments[session.id] == nil,
+                      !(processesByTool[session.tool] ?? []).contains(where: { processMatches(session, $0) }) else {
+                    return nil
+                }
+                let available = candidatesForRebinding(
+                    session,
+                    to: processesByTool[session.tool] ?? []
+                ).filter { !reserved.contains(processKey($0)) }
+                return available.count == 1 ? (session, available[0]) : nil
             }
-            let candidates = candidatesForRebinding(session, to: sameToolProcesses)
-            guard candidates.count == 1 else { return session }
-            let rebound = session.replacingProcessID(candidates[0].processID)
+            let claims = Dictionary(grouping: proposals, by: { processKey($0.1) })
+            for (key, claimants) in claims where claimants.count == 1 {
+                let (session, process) = claimants[0]
+                assignments[session.id] = process
+                reserved.insert(key)
+                changed = true
+            }
+        }
+        return try sessions.map { session in
+            guard let process = assignments[session.id] else {
+                // A legacy exact PID match safely adopts the scanned kernel
+                // identity without changing its activity timestamp.
+                guard session.processIdentity == nil,
+                      let exact = activeProcesses.first(where: {
+                          $0.tool == session.tool && $0.processID == session.pid
+                      }), exact.processIdentity != nil else { return session }
+                let identified = session.replacingProcess(exact)
+                try repository.save(identified)
+                return identified
+            }
+            let rebound = session.replacingProcess(process)
             try repository.save(rebound)
             return rebound
         }
@@ -205,6 +270,7 @@ public struct ReaperService: Sendable {
             tool: session.tool,
             sessionID: session.sessionID,
             pid: session.pid,
+            processIdentity: session.processIdentity,
             status: session.status,
             attentionReason: session.attentionReason,
             cwd: process.cwd,
@@ -232,7 +298,7 @@ public struct ReaperService: Sendable {
             return
         }
         let adoptsIdentifier = session.terminal.ghosttyTerminalID != scannedTerminalID
-        let adoptsTitle = titleMeaningfullyChanged(
+        let adoptsTitle = session.tool != .convoy && titleMeaningfullyChanged(
             scanned: process.terminal.windowTitleHint,
             current: session.terminal.windowTitleHint
         )
@@ -241,6 +307,7 @@ public struct ReaperService: Sendable {
             tool: session.tool,
             sessionID: session.sessionID,
             pid: session.pid,
+            processIdentity: session.processIdentity,
             status: session.status,
             attentionReason: session.attentionReason,
             cwd: session.cwd,
@@ -252,8 +319,9 @@ public struct ReaperService: Sendable {
                 itermSessionID: session.terminal.itermSessionID,
                 tmuxPane: session.terminal.tmuxPane ?? process.terminal.tmuxPane,
                 tty: session.terminal.tty ?? process.terminal.tty,
-                windowTitleHint: process.terminal.windowTitleHint
-                    ?? session.terminal.windowTitleHint
+                windowTitleHint: session.tool == .convoy
+                    ? nil
+                    : process.terminal.windowTitleHint ?? session.terminal.windowTitleHint
             ),
             source: session.source,
             currentStep: session.currentStep
@@ -270,12 +338,36 @@ public struct ReaperService: Sendable {
             != SessionTitleFormatter.rowTitle(tabTitle: current, fallback: "")
     }
 
-    private func isAlive(_ processID: Int32) -> Bool {
-        guard processID > 0 else { return false }
-        if Darwin.kill(processID, 0) == 0 {
-            return true
+    private func isAlive(_ session: AgentSession) -> Bool {
+        guard session.pid > 0 else { return false }
+        if let currentIdentity = SystemProcessScanner.processIdentity(of: session.pid) {
+            return session.processIdentity.map { $0 == currentIdentity } ?? true
         }
-        return errno == EPERM
+        // A zombie has no active identity. EPERM remains conservative for a
+        // process owned by another user, although integrations normally only
+        // publish the current user's agents.
+        return Darwin.kill(session.pid, 0) != 0 && errno == EPERM
+    }
+
+    private func processMatches(_ session: AgentSession, _ process: DetectedAgentProcess) -> Bool {
+        guard session.tool == process.tool, session.pid == process.processID else { return false }
+        guard let sessionIdentity = session.processIdentity,
+              let detectedIdentity = process.processIdentity else { return true }
+        return sessionIdentity == detectedIdentity
+    }
+
+    private func processKey(_ process: DetectedAgentProcess) -> String {
+        if let identity = process.processIdentity {
+            return "\(process.tool.rawValue)-\(identity.processID)-\(identity.kernelStartTimeMicroseconds)"
+        }
+        return "\(process.tool.rawValue)-\(process.processID)"
+    }
+
+    private func processKey(_ session: AgentSession) -> String {
+        if let identity = session.processIdentity {
+            return "\(session.tool.rawValue)-\(identity.processID)-\(identity.kernelStartTimeMicroseconds)"
+        }
+        return "\(session.tool.rawValue)-\(session.pid)"
     }
 
     /// Prefer a terminal identity over cwd when several agents of the same

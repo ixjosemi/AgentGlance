@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Publishes convoy pipeline runs as sessions by reading the run metadata
@@ -5,6 +6,7 @@ import Foundation
 /// integration is read-only: convoy needs no hook or plugin, and a run's
 /// document dies with its process through the regular reaper pass.
 public final class ConvoyRunsWatcher {
+    private static let maximumMetadataSize: off_t = 1_048_576
     /// Tolerance between a process's kernel start time and the server
     /// timestamp convoy records, guarding pid reuse across old runs.
     private static let processStartSlack: TimeInterval = 120
@@ -15,6 +17,20 @@ public final class ConvoyRunsWatcher {
     /// time: only the active run's metadata changes between scans, so
     /// historical runs are parsed at most once per process lifetime.
     private var parsedRunsByFileURL: [URL: (modifiedAt: Date, run: ConvoyRun?)] = [:]
+    private var trackedRuns: [String: TrackedRun] = [:]
+
+    public struct ScanResult {
+        public let preservingSessionIDs: Set<String>
+        public let runDirectoryURLs: Set<URL>
+        fileprivate let runs: [ConvoyRun]
+    }
+
+    private struct TrackedRun {
+        let metadataURL: URL
+        let process: DetectedAgentProcess
+        let startedAt: Date
+        var missedHeartbeats: Int
+    }
 
     public init(runsDirectoryURL: URL, repository: StateRepository) {
         self.runsDirectoryURL = runsDirectoryURL
@@ -22,16 +38,73 @@ public final class ConvoyRunsWatcher {
     }
 
     public func scan(detected: [DetectedAgentProcess]) throws {
+        let result = try observe(detected: detected, isHeartbeat: false)
+        try suppressPipelineOwnedOpenCodeSessions(of: result.runs)
+    }
+
+    /// Publishes metadata before the reaper runs and retains only associations
+    /// that were verified while their server was alive. A process-exit event
+    /// can therefore consume serverless final metadata, and one full heartbeat
+    /// leaves the terminal state visible long enough for StateStore to notify.
+    public func observe(
+        detected: [DetectedAgentProcess],
+        isHeartbeat: Bool,
+        forceRefresh: Bool = false
+    ) throws -> ScanResult {
+        if forceRefresh { parsedRunsByFileURL.removeAll() }
         let convoyProcesses = detected.filter { $0.tool == .convoy }
-        guard !convoyProcesses.isEmpty else { return }
-        let runs = currentRuns(startedAfter: oldestProcessStart(of: convoyProcesses))
+        let runs = convoyProcesses.isEmpty
+            ? []
+            : currentRuns(startedAfter: oldestProcessStart(of: convoyProcesses))
         var liveRuns: [ConvoyRun] = []
+        var publishedRunIDs: Set<String> = []
         for process in convoyProcesses {
             guard let run = run(ownedBy: process, in: runs) else { continue }
-            try repository.save(session(for: run, process: process))
+            let startedAt = run.serverStartedAt ?? Date(timeIntervalSinceNow: -process.elapsedSeconds)
+            try repository.save(session(for: run, process: process, startedAt: startedAt))
+            trackedRuns[run.runID] = TrackedRun(
+                metadataURL: runsDirectoryURL
+                    .appendingPathComponent(run.runID, isDirectory: true)
+                    .appendingPathComponent("metadata.json"),
+                process: process,
+                startedAt: startedAt,
+                missedHeartbeats: 0
+            )
             liveRuns.append(run)
+            publishedRunIDs.insert(run.runID)
         }
-        try suppressPipelineOwnedOpenCodeSessions(of: liveRuns)
+        for runID in trackedRuns.keys.sorted() where !publishedRunIDs.contains(runID) {
+            guard var tracked = trackedRuns[runID] else { continue }
+            let processIsPresent = convoyProcesses.contains { processMatches($0, tracked.process) }
+            if processIsPresent {
+                tracked.missedHeartbeats = 0
+            } else if isHeartbeat {
+                tracked.missedHeartbeats += 1
+            }
+            guard tracked.missedHeartbeats <= 1 else {
+                trackedRuns[runID] = nil
+                continue
+            }
+            trackedRuns[runID] = tracked
+            if forceRefresh { parsedRunsByFileURL[tracked.metadataURL] = nil }
+            if let run = parsedRunAtCurrentModificationDate(tracked.metadataURL) {
+                try repository.save(session(
+                    for: run,
+                    process: tracked.process,
+                    startedAt: tracked.startedAt
+                ))
+                liveRuns.append(run)
+            }
+        }
+        return ScanResult(
+            preservingSessionIDs: Set(trackedRuns.keys.map { "convoy-\($0)" }),
+            runDirectoryURLs: Set(trackedRuns.values.map { $0.metadataURL.deletingLastPathComponent() }),
+            runs: liveRuns
+        )
+    }
+
+    public func suppressOpenCodeSessions(for result: ScanResult) throws {
+        try suppressPipelineOwnedOpenCodeSessions(of: result.runs)
     }
 
     /// Convoy phases run as OpenCode sessions on convoy's embedded server;
@@ -53,7 +126,8 @@ public final class ConvoyRunsWatcher {
         guard !pipelineSessionIDs.isEmpty || !pipelineTargetDirs.isEmpty else { return }
         for session in try repository.loadSessions()
         where session.tool == .opencode
-            && (pipelineSessionIDs.contains(session.sessionID) || pipelineTargetDirs.contains(session.cwd)) {
+            && (pipelineSessionIDs.contains(session.sessionID)
+                || (session.source == .reaper && pipelineTargetDirs.contains(session.cwd))) {
             try repository.remove(session)
         }
     }
@@ -101,9 +175,29 @@ public final class ConvoyRunsWatcher {
         if let cached = parsedRunsByFileURL[metadataURL], cached.modifiedAt == modifiedAt {
             return cached.run
         }
-        let run = (try? Data(contentsOf: metadataURL)).flatMap(ConvoyRun.decode)
+        let run = secureMetadata(at: metadataURL).flatMap(ConvoyRun.decode)
         parsedRunsByFileURL[metadataURL] = (modifiedAt, run)
         return run
+    }
+
+    private func secureMetadata(at url: URL) -> Data? {
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW)
+        guard descriptor >= 0 else { return nil }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        var metadata = stat()
+        guard Darwin.fstat(descriptor, &metadata) == 0,
+              metadata.st_mode & S_IFMT == S_IFREG,
+              metadata.st_uid == getuid(),
+              metadata.st_size >= 0,
+              metadata.st_size <= Self.maximumMetadataSize else { return nil }
+        return try? handle.readToEnd()
+    }
+
+    private func parsedRunAtCurrentModificationDate(_ metadataURL: URL) -> ConvoyRun? {
+        guard let modifiedAt = try? metadataURL
+            .resourceValues(forKeys: [.contentModificationDateKey])
+            .contentModificationDate else { return nil }
+        return parsedRun(at: metadataURL, modifiedAt: modifiedAt)
     }
 
     /// The run a process owns records that process as its server; convoy's
@@ -118,29 +212,48 @@ public final class ConvoyRunsWatcher {
             ? Date(timeIntervalSinceNow: -process.elapsedSeconds - Self.processStartSlack)
             : Date.distantPast
         return runs
-            .filter { $0.serverPid == process.processID && $0.serverStartedAt >= processStartedAt }
-            .max { $0.serverStartedAt < $1.serverStartedAt }
+            .filter {
+                $0.serverPid == process.processID
+                    && ($0.serverStartedAt ?? .distantPast) >= processStartedAt
+            }
+            .max { ($0.serverStartedAt ?? .distantPast) < ($1.serverStartedAt ?? .distantPast) }
     }
 
     // MARK: Session mapping
 
     private func session(
         for run: ConvoyRun,
-        process: DetectedAgentProcess
+        process: DetectedAgentProcess,
+        startedAt: Date
     ) -> AgentSession {
         let state = run.sessionState()
         return AgentSession(
             tool: .convoy,
             sessionID: run.runID,
             pid: process.processID,
+            processIdentity: process.processIdentity,
             status: state.status,
             attentionReason: state.attentionReason,
             cwd: run.targetDir,
-            startedAt: run.serverStartedAt,
+            startedAt: startedAt,
             updatedAt: run.updatedAt,
-            terminal: process.terminal,
+            terminal: TerminalContext(
+                termProgram: process.terminal.termProgram,
+                ghosttyTerminalID: process.terminal.ghosttyTerminalID,
+                itermSessionID: process.terminal.itermSessionID,
+                tmuxPane: process.terminal.tmuxPane,
+                tty: process.terminal.tty,
+                windowTitleHint: nil
+            ),
             currentStep: state.currentStep
         )
+    }
+
+
+    private func processMatches(_ lhs: DetectedAgentProcess, _ rhs: DetectedAgentProcess) -> Bool {
+        guard lhs.processID == rhs.processID else { return false }
+        guard let left = lhs.processIdentity, let right = rhs.processIdentity else { return true }
+        return left == right
     }
 }
 
@@ -156,8 +269,8 @@ struct ConvoyRun {
     let runID: String
     let targetDir: String
     let updatedAt: Date
-    let serverPid: Int32
-    let serverStartedAt: Date
+    let serverPid: Int32?
+    let serverStartedAt: Date?
     /// Ordered by phase start so the earliest-started phase leads displays.
     let phases: [Phase]
     let humanStepNames: Set<String>
@@ -167,7 +280,7 @@ struct ConvoyRun {
         attentionReason: AttentionReason?,
         currentStep: String?
     ) {
-        let runningPhases = phases.filter { $0.status == "running" }
+        let runningPhases = phases.filter { $0.status == "running" || $0.status == "thinking" }
         // A human gate registers as a running phase, but the pipeline is
         // paused waiting for the user's verdict — that is attention, not
         // work, and it outranks agent phases still running alongside it.
@@ -187,8 +300,7 @@ struct ConvoyRun {
     }
 
     static func decode(_ data: Data) -> ConvoyRun? {
-        guard let file = try? JSONDecoder().decode(MetadataFile.self, from: data),
-              let server = file.server else {
+        guard let file = try? JSONDecoder().decode(MetadataFile.self, from: data) else {
             return nil
         }
         let phases = file.phases
@@ -211,8 +323,8 @@ struct ConvoyRun {
             runID: file.runID,
             targetDir: file.targetDir,
             updatedAt: date(fromEpochMilliseconds: file.updatedAt),
-            serverPid: server.pid,
-            serverStartedAt: date(fromEpochMilliseconds: server.startedAt),
+            serverPid: file.server?.pid,
+            serverStartedAt: file.server.map { date(fromEpochMilliseconds: $0.startedAt) },
             phases: phases,
             humanStepNames: Set(humanStepNames)
         )
