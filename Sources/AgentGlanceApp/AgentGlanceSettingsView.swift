@@ -25,6 +25,7 @@ struct AgentGlanceSettingsView: View {
                 Picker("Show the notch on", selection: $screenSelectionMode) {
                     Text("Screen with pointer").tag(ScreenSelectionMode.pointer.rawValue)
                     Text("Screen with focused window").tag(ScreenSelectionMode.focusedWindow.rawValue)
+                    Text("All displays").tag(ScreenSelectionMode.allDisplays.rawValue)
                 }
             }
             Section {

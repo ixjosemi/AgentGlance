@@ -6,6 +6,7 @@ import Foundation
 public enum ScreenSelectionMode: String, CaseIterable, Sendable {
     case pointer
     case focusedWindow
+    case allDisplays
 }
 
 public struct DisplayPoint: Equatable, Sendable {
@@ -48,6 +49,29 @@ public struct DisplaySnapshot: Equatable, Sendable {
 }
 
 public enum ScreenSelection {
+    /// Resolves every display that should host a notch. Pointer and focused
+    /// modes return one display; all-displays mode retains every connected
+    /// display in the AppKit-provided order.
+    public static func selectDisplayIDs(
+        mode: ScreenSelectionMode,
+        pointerLocation: DisplayPoint?,
+        focusedDisplayID: UInt32?,
+        lastSelectedDisplayID: UInt32?,
+        displays: [DisplaySnapshot]
+    ) -> [UInt32] {
+        guard !displays.isEmpty else { return [] }
+        if mode == .allDisplays {
+            return displays.map(\.id)
+        }
+        return selectDisplayID(
+            mode: mode,
+            pointerLocation: pointerLocation,
+            focusedDisplayID: focusedDisplayID,
+            lastSelectedDisplayID: lastSelectedDisplayID,
+            displays: displays
+        ).map { [$0] } ?? []
+    }
+
     public static func selectDisplayID(
         mode: ScreenSelectionMode,
         pointerLocation: DisplayPoint?,
@@ -68,6 +92,8 @@ public enum ScreenSelection {
             return pointerDisplayID ?? focusedID ?? lastID ?? displays.first?.id
         case .focusedWindow:
             return focusedID ?? pointerDisplayID ?? lastID ?? displays.first?.id
+        case .allDisplays:
+            return displays.first?.id
         }
     }
 }
