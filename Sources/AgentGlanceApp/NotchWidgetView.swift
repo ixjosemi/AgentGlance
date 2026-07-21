@@ -500,6 +500,20 @@ private extension SessionStatusSummary.StatusEntry.Kind {
     }
 }
 
+/// User-facing status vocabulary shared by the bar and the session rows.
+/// Mirrors the README "Session states" table so VoiceOver reads the same
+/// words the compact indicators announce, instead of the snake-case rawValue.
+private extension SessionStatus {
+    var accessibilityName: String {
+        switch self {
+        case .working: "running"
+        case .idle: "waiting"
+        case .needsAttention: "blocked"
+        case .ended: "ended"
+        }
+    }
+}
+
 /// One compact status counter. Zero-count states never reach this view —
 /// the summary filters them out — so every glyph on the bar earns its
 /// space. Waiting and blocked share the same dot size: state reads through
@@ -826,7 +840,7 @@ private struct SessionRow: View {
                 GitWorkspaceInspector.branchName(forWorkingDirectory: cwd)
             }.value
         }
-        .accessibilityLabel("\(title), \(session.status.rawValue)")
+        .accessibilityLabel("\(title), \(session.status.accessibilityName)")
     }
 
     private var mainRow: some View {
