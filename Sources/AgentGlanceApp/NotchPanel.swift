@@ -19,7 +19,14 @@ final class NotchPanel: NSPanel {
 final class NotchHostingView<Content: View>: NSHostingView<Content> {
     /// The broad expanded panel reports its visible drop; the compact bar
     /// reports only its attached silhouette. An empty region passes through.
-    var interactiveRegion = HangingNotchInteractionRegion.empty
+    var interactiveRegion = HangingNotchInteractionRegion.empty {
+        didSet { refreshPointerLocation() }
+    }
+    /// A single tracking area covers the fixed-size panel. Its callback then
+    /// tests the current hanging silhouette, so resizing the SwiftUI card
+    /// never replaces the area that owns hover state.
+    var onPointerUpdate: ((Bool, DisplayPoint) -> Void)?
+    private var pointerTrackingArea: NSTrackingArea?
 
     /// The panel never becomes key, so every click arrives as a "first
     /// mouse" while another app is frontmost. Accepting it makes the first
@@ -41,31 +48,94 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
         }
         return super.hitTest(point)
     }
+
+    override func updateTrackingAreas() {
+        if let pointerTrackingArea {
+            removeTrackingArea(pointerTrackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        pointerTrackingArea = area
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        report(event: event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        report(event: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        let location = globalLocation(for: event)
+        onPointerUpdate?(false, location)
+    }
+
+    func refreshPointerLocation() {
+        guard let window else { return }
+        let global = NSEvent.mouseLocation
+        let inWindow = window.convertPoint(fromScreen: NSPoint(x: global.x, y: global.y))
+        let local = convert(inWindow, from: nil)
+        report(localPoint: local, globalLocation: DisplayPoint(x: global.x, y: global.y))
+    }
+
+    private func report(event: NSEvent) {
+        let local = convert(event.locationInWindow, from: nil)
+        report(localPoint: local, globalLocation: globalLocation(for: event))
+    }
+
+    private func report(localPoint: NSPoint, globalLocation: DisplayPoint) {
+        let topLeadingY = isFlipped
+            ? localPoint.y - bounds.minY
+            : bounds.maxY - localPoint.y
+        let isInside = interactiveRegion.contains(
+            DisplayPoint(x: localPoint.x - bounds.minX, y: topLeadingY)
+        )
+        onPointerUpdate?(isInside, globalLocation)
+    }
+
+    private func globalLocation(for event: NSEvent) -> DisplayPoint {
+        guard let window else {
+            let location = NSEvent.mouseLocation
+            return DisplayPoint(x: location.x, y: location.y)
+        }
+        let point = window.convertPoint(toScreen: event.locationInWindow)
+        return DisplayPoint(x: point.x, y: point.y)
+    }
 }
 
+/// One independent SwiftUI/AppKit surface for a display. Each surface owns
+/// hover, expanded-menu, and keyboard-focus state, which lets all-displays
+/// mode show the helper on every connected screen at once.
 @MainActor
-final class NotchPanelController {
+private final class NotchDisplayPanel {
     private let store: StateStore
     private let panel: NotchPanel
     private var layout: NotchLayout
     private var hostingView: NotchHostingView<NotchWidgetView>?
-    private var screenObserver: NSObjectProtocol?
-    private var activationObserver: NSObjectProtocol?
-    private var spaceObserver: NSObjectProtocol?
-    private var defaultsObserver: NSObjectProtocol?
-    private var screenTrackingTimer: Timer?
-    private var selectedDisplayID: UInt32?
-    private var menuIsVisible = false
-    private var pendingScreen: NSScreen?
-    /// Arms on every screen jump so the bar materialising under an unmoving
-    /// pointer does not read as a hover and pop the menu open by itself.
     private var pointerGate = PointerMovementGate()
+    private let pointerTracker = NotchPointerTracker()
+    private let onMenuVisibilityChanged: () -> Void
 
-    init(store: StateStore) {
+    private(set) var menuIsVisible = false
+
+    init(
+        store: StateStore,
+        layout: NotchLayout,
+        onMenuVisibilityChanged: @escaping () -> Void
+    ) {
         self.store = store
-        let screen = Self.selectedScreen(lastSelectedDisplayID: nil)
-        layout = Self.layout(for: screen)
-        selectedDisplayID = Self.displayID(for: screen)
+        self.layout = layout
+        self.onMenuVisibilityChanged = onMenuVisibilityChanged
         panel = NotchPanel(
             contentRect: NSRect(x: 0, y: 0, width: layout.width, height: layout.expandedHeight),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -80,33 +150,123 @@ final class NotchPanelController {
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = false
         applyLayout()
+    }
+
+    func show() {
+        panel.orderFrontRegardless()
+    }
+
+    func hide() {
+        panel.orderOut(nil)
+    }
+
+    func update(layout: NotchLayout) {
+        guard layout != self.layout else { return }
+        self.layout = layout
+        applyLayout()
+    }
+
+    func lockHoverExpansion(at point: DisplayPoint) {
+        pointerGate.lock(at: point)
+    }
+
+    private func applyLayout() {
+        if let hostingView {
+            hostingView.rootView = makeRootView()
+        } else {
+            let hostingView = NotchHostingView(rootView: makeRootView())
+            hostingView.onPointerUpdate = { [weak pointerTracker] isInside, location in
+                pointerTracker?.update(isInside: isInside, location: location)
+            }
+            self.hostingView = hostingView
+            panel.contentView = hostingView
+        }
+        panel.setFrame(
+            NSRect(
+                x: layout.originX,
+                y: layout.originY + layout.height - layout.expandedHeight,
+                width: layout.width,
+                height: layout.expandedHeight
+            ),
+            display: true
+        )
+    }
+
+    private func makeRootView() -> NotchWidgetView {
+        NotchWidgetView(
+            store: store,
+            layout: layout,
+            allowHoverExpansion: { [weak self] point in
+                self?.pointerGate.update(pointerLocation: point) ?? false
+            },
+            pointerTracker: pointerTracker,
+            requestPointerRefresh: { [weak self] in
+                self?.hostingView?.refreshPointerLocation()
+            },
+            onInteractiveRegionChange: { [weak self] region in
+                self?.hostingView?.interactiveRegion = region
+            },
+            onKeyboardFocusChange: { [weak self] wantsKeyboard in
+                self?.setKeyboardFocus(wantsKeyboard)
+            },
+            onMenuVisibilityChange: { [weak self] isVisible in
+                guard let self else { return }
+                menuIsVisible = isVisible
+                onMenuVisibilityChanged()
+            }
+        )
+    }
+
+    private func setKeyboardFocus(_ wantsKeyboard: Bool) {
+        panel.allowsKeyboardFocus = wantsKeyboard
+        if wantsKeyboard {
+            panel.makeKey()
+        } else if panel.isKeyWindow {
+            panel.resignKey()
+        }
+    }
+}
+
+@MainActor
+final class NotchPanelController {
+    private let store: StateStore
+    private var displayPanels: [UInt32: NotchDisplayPanel] = [:]
+    private var selectedDisplayID: UInt32?
+    private var panelsAreVisible = false
+    /// A pointer/focus move waits for the current menu to close. All-displays
+    /// mode has no selected display and therefore never needs this deferral.
+    private var hasPendingSelectedDisplay = false
+    private var screenObserver: NSObjectProtocol?
+    private var activationObserver: NSObjectProtocol?
+    private var spaceObserver: NSObjectProtocol?
+    private var defaultsObserver: NSObjectProtocol?
+    private var screenTrackingTimer: Timer?
+
+    init(store: StateStore) {
+        self.store = store
+        synchronizePanels()
         // Display changes — docking, resolution switches, lid state —
-        // invalidate every notch metric, so the panel re-derives its layout
-        // from the current screen instead of keeping the launch-time one.
+        // invalidate every notch metric, so every panel re-derives its layout
+        // from the current screen instead of keeping launch-time values.
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.relayoutIfScreenChanged()
+                self?.synchronizePanels()
             }
         }
-        // The widget follows the screen the user is working on: activating
-        // an app on another display moves the key window — and NSScreen.main
-        // — there. This panel never activates, so clicking the widget itself
-        // does not trigger a jump; the equality check makes every other
-        // activation a cheap no-op until the active screen actually changes.
+        // The widget follows the screen the user is working on when a
+        // single-display policy is active. All-displays mode deliberately
+        // keeps every panel visible regardless of activation.
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                // Workspace activation can arrive before AppKit has updated
-                // NSScreen.main, so resolve it on the following main-loop
-                // turn instead of reading the previous app's display.
-                DispatchQueue.main.async { self?.relayoutIfScreenChanged() }
+                DispatchQueue.main.async { self?.synchronizePanels() }
             }
         }
         spaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
@@ -115,7 +275,7 @@ final class NotchPanelController {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.relayoutIfScreenChanged()
+                self?.synchronizePanels()
             }
         }
         defaultsObserver = NotificationCenter.default.addObserver(
@@ -124,12 +284,12 @@ final class NotchPanelController {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.relayoutIfScreenChanged()
+                self?.synchronizePanels()
             }
         }
         let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.relayoutIfScreenChanged()
+                self?.synchronizePanels()
             }
         }
         timer.tolerance = 0.05
@@ -153,29 +313,95 @@ final class NotchPanelController {
     }
 
     func show() {
-        panel.orderFrontRegardless()
+        panelsAreVisible = true
+        displayPanels.values.forEach { $0.show() }
     }
 
-    private func relayoutIfScreenChanged() {
-        let screen = Self.selectedScreen(lastSelectedDisplayID: selectedDisplayID)
-        let displayID = Self.displayID(for: screen)
-        let current = Self.layout(for: screen)
-        let displayChanged = displayID != selectedDisplayID
-        guard current != layout || displayChanged else { return }
-        guard !menuIsVisible else {
-            pendingScreen = screen
+    private func synchronizePanels() {
+        let screens = NSScreen.screens
+        let screensByID = screens.reduce(into: [UInt32: NSScreen]()) { result, screen in
+            guard let displayID = Self.displayID(for: screen) else { return }
+            result[displayID] = screen
+        }
+        let displays = screens.compactMap { screen -> DisplaySnapshot? in
+            guard let displayID = Self.displayID(for: screen) else { return nil }
+            return DisplaySnapshot(
+                id: displayID,
+                frame: DisplayFrame(
+                    minX: screen.frame.minX,
+                    minY: screen.frame.minY,
+                    width: screen.frame.width,
+                    height: screen.frame.height
+                )
+            )
+        }
+        let mode = ScreenSelectionMode(
+            rawValue: UserDefaults.standard.string(forKey: "screenSelectionMode") ?? ""
+        ) ?? .pointer
+        // AgentGlance deliberately does not activate for notch clicks. If its
+        // own Settings window is key, treating NSScreen.main as user focus
+        // would move a single selected helper for an internal UI action.
+        let focusedDisplayID = NSApp.isActive ? nil : Self.displayID(for: NSScreen.main)
+        let mouseLocation = NSEvent.mouseLocation
+        let desiredIDs = ScreenSelection.selectDisplayIDs(
+            mode: mode,
+            pointerLocation: DisplayPoint(x: mouseLocation.x, y: mouseLocation.y),
+            focusedDisplayID: focusedDisplayID,
+            lastSelectedDisplayID: selectedDisplayID,
+            displays: displays
+        )
+        let desiredIDSet = Set(desiredIDs)
+
+        if mode != .allDisplays,
+           let desiredID = desiredIDs.first,
+           let currentID = selectedDisplayID,
+           currentID != desiredID,
+           displayPanels[currentID]?.menuIsVisible == true {
+            hasPendingSelectedDisplay = true
             return
         }
-        if displayChanged {
-            // The bar materialises wherever the pointer's display is; a
-            // stationary pointer resting where it lands must not read as a
-            // hover and open the menu on its own.
-            let mouse = NSEvent.mouseLocation
-            pointerGate.lock(at: DisplayPoint(x: mouse.x, y: mouse.y))
+
+        let previousSelectedDisplayID = selectedDisplayID
+        selectedDisplayID = mode == .allDisplays ? nil : desiredIDs.first
+        hasPendingSelectedDisplay = false
+
+        for displayID in desiredIDs {
+            guard let screen = screensByID[displayID] else { continue }
+            let layout = Self.layout(for: screen)
+            if let displayPanel = displayPanels[displayID] {
+                displayPanel.update(layout: layout)
+            } else {
+                let displayPanel = NotchDisplayPanel(
+                    store: store,
+                    layout: layout,
+                    onMenuVisibilityChanged: { [weak self] in
+                        self?.handleMenuVisibilityChange()
+                    }
+                )
+                displayPanels[displayID] = displayPanel
+                if panelsAreVisible {
+                    displayPanel.show()
+                }
+                if mode != .allDisplays,
+                   let previousSelectedDisplayID,
+                   previousSelectedDisplayID != displayID {
+                    let mouse = NSEvent.mouseLocation
+                    displayPanel.lockHoverExpansion(at: DisplayPoint(x: mouse.x, y: mouse.y))
+                }
+            }
         }
-        selectedDisplayID = displayID
-        layout = current
-        applyLayout()
+
+        let removedDisplayIDs = displayPanels.keys.filter { !desiredIDSet.contains($0) }
+        for displayID in removedDisplayIDs {
+            displayPanels[displayID]?.hide()
+            displayPanels.removeValue(forKey: displayID)
+        }
+    }
+
+    private func handleMenuVisibilityChange() {
+        guard hasPendingSelectedDisplay,
+              !displayPanels.values.contains(where: \.menuIsVisible) else { return }
+        synchronizePanels()
     }
 
     private static func layout(for screen: NSScreen?) -> NotchLayout {
@@ -194,97 +420,8 @@ final class NotchPanelController {
         )
     }
 
-    private static func selectedScreen(lastSelectedDisplayID: UInt32?) -> NSScreen? {
-        let screens = NSScreen.screens
-        let snapshots = screens.compactMap { screen -> DisplaySnapshot? in
-            guard let id = displayID(for: screen) else { return nil }
-            return DisplaySnapshot(
-                id: id,
-                frame: DisplayFrame(
-                    minX: screen.frame.minX,
-                    minY: screen.frame.minY,
-                    width: screen.frame.width,
-                    height: screen.frame.height
-                )
-            )
-        }
-        let mode = ScreenSelectionMode(
-            rawValue: UserDefaults.standard.string(forKey: "screenSelectionMode") ?? ""
-        ) ?? .pointer
-        // AgentGlance deliberately does not activate for notch clicks. If its
-        // own Settings window is key, treating NSScreen.main as user focus
-        // would move the widget for an internal UI action; pointer/last are a
-        // safer fallback in that case.
-        let focusedDisplayID = NSApp.isActive ? nil : displayID(for: NSScreen.main)
-        let mouseLocation = NSEvent.mouseLocation
-        let selectedID = ScreenSelection.selectDisplayID(
-            mode: mode,
-            pointerLocation: DisplayPoint(x: mouseLocation.x, y: mouseLocation.y),
-            focusedDisplayID: focusedDisplayID,
-            lastSelectedDisplayID: lastSelectedDisplayID,
-            displays: snapshots
-        )
-        return screens.first { displayID(for: $0) == selectedID } ?? screens.first
-    }
-
     private static func displayID(for screen: NSScreen?) -> UInt32? {
         (screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)
             .map { $0.uint32Value }
-    }
-
-    /// Pins the panel to the current layout's notch. The hosting view is
-    /// updated in place rather than rebuilt so SwiftUI keeps view identity —
-    /// and with it hover and expansion state.
-    private func applyLayout() {
-        if let hostingView {
-            hostingView.rootView = makeRootView()
-        } else {
-            let hostingView = NotchHostingView(rootView: makeRootView())
-            self.hostingView = hostingView
-            panel.contentView = hostingView
-        }
-        panel.setFrame(
-            NSRect(
-                x: layout.originX,
-                y: layout.originY + layout.height - layout.expandedHeight,
-                width: layout.width,
-                height: layout.expandedHeight
-            ),
-            display: true
-        )
-    }
-
-    private func makeRootView() -> NotchWidgetView {
-        let controller = self
-        return NotchWidgetView(
-            store: store,
-            layout: layout,
-            allowHoverExpansion: { point in
-                controller.pointerGate.update(pointerLocation: point)
-            },
-            onInteractiveRegionChange: { controller.setInteractiveRegion($0) },
-            onKeyboardFocusChange: { controller.setKeyboardFocus($0) },
-            onMenuVisibilityChange: { controller.setMenuVisibility($0) }
-        )
-    }
-
-    private func setInteractiveRegion(_ region: HangingNotchInteractionRegion) {
-        hostingView?.interactiveRegion = region
-    }
-
-    private func setMenuVisibility(_ isVisible: Bool) {
-        menuIsVisible = isVisible
-        guard !isVisible, pendingScreen != nil else { return }
-        pendingScreen = nil
-        relayoutIfScreenChanged()
-    }
-
-    private func setKeyboardFocus(_ wantsKeyboard: Bool) {
-        panel.allowsKeyboardFocus = wantsKeyboard
-        if wantsKeyboard {
-            panel.makeKey()
-        } else if panel.isKeyWindow {
-            panel.resignKey()
-        }
     }
 }

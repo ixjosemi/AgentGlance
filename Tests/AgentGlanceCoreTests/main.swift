@@ -1334,8 +1334,8 @@ func testHoverInteractionUsesOnlyVisibleContentForHoverExit() throws {
             isExpanded: true,
             isHidden: false
         ),
-        equals: DisplayFrame(minX: 0, minY: 0, width: 800, height: 24),
-        "the compact bar keeps a synthetic expansion exit inside before measurement"
+        equals: DisplayFrame(minX: 0, minY: 0, width: 800, height: 384),
+        "the provisional expanded card stays hoverable before its first measurement"
     )
 }
 
@@ -1488,6 +1488,25 @@ func testScreenSelectionFollowsThePointerAndFallsBackToFocusedDisplay() throws {
     )
 }
 
+func testScreenSelectionReturnsEveryDisplayWhenConfiguredForAllDisplays() throws {
+    let displays = [
+        DisplaySnapshot(id: 11, frame: DisplayFrame(minX: 0, minY: 0, width: 1_512, height: 982)),
+        DisplaySnapshot(id: 22, frame: DisplayFrame(minX: 1_512, minY: 0, width: 2_560, height: 1_440)),
+    ]
+
+    try expect(
+        ScreenSelection.selectDisplayIDs(
+            mode: .allDisplays,
+            pointerLocation: DisplayPoint(x: 2_000, y: 400),
+            focusedDisplayID: 11,
+            lastSelectedDisplayID: 11,
+            displays: displays
+        ),
+        equals: [11, 22],
+        "all-displays mode keeps a notch panel on every connected display"
+    )
+}
+
 func testAttentionAcknowledgmentsSilenceVisitedSessionsUntilNewActivity() throws {
     let waiting = try AgentSession.decode(
         from: validStateJSON(sessionID: "ack", status: "needs_attention")
@@ -1603,13 +1622,13 @@ func testNotchLayoutExtendsFromLeftSideOfHardwareNotch() throws {
     try expect(layout.presentation, equals: .notch, "a screen with a camera housing keeps the notch")
     try expect(layout.width, equals: 800, "wide expanded panel leaves room for smooth side curves")
     try expect(layout.height, equals: 38, "collapsed panel height")
-    try expect(layout.expandedHeight, equals: 398, "expanded panel height")
+    try expect(layout.expandedHeight, equals: 406, "expanded panel height")
     try expect(layout.originX, equals: 356, "expanded panel x")
     try expect(layout.originY, equals: 944, "panel y")
     try expect(layout.notchWidth, equals: 180, "hardware notch width")
 }
 
-func testNotchLayoutDoublesTheExpandedPanelWidthForSessionDetails() throws {
+func testNotchLayoutKeepsExpandedContentCloseToTheSideEdges() throws {
     let layout = NotchLayout(
         screenMinX: 0,
         screenWidth: 1_512,
@@ -1619,12 +1638,12 @@ func testNotchLayoutDoublesTheExpandedPanelWidthForSessionDetails() throws {
         rightNotchEdgeX: 846
     )
 
-    try expect(layout.width, equals: 800, "outer panel adds lateral room for the corner curves")
-    try expect(NotchLayout.expandedContentWidth, equals: 720, "session content keeps its readable width")
+    try expect(layout.width, equals: 800, "outer panel keeps its rounded outer shape")
+    try expect(NotchLayout.expandedContentWidth, equals: 784, "session content sits close to the expanded side edges")
     try expect(
         NotchLayout.contentWidth(forExpandedPanelWidth: 600),
-        equals: 520,
-        "narrow screens preserve curve gutters instead of clipping content"
+        equals: 584,
+        "narrow screens keep only a small safe gutter"
     )
 }
 
@@ -1651,7 +1670,7 @@ func testNotchLayoutPinsCompactBarToPhysicalNotchWhenExpandedPanelIsClamped() th
     )
 }
 
-func testNotchLayoutFakesTheEmptyWingToStaySymmetric() throws {
+func testNotchLayoutAddsOnlyAMinimalFixedRightWing() throws {
     let notched = NotchLayout(
         screenMinX: 0,
         screenWidth: 1_512,
@@ -1660,10 +1679,20 @@ func testNotchLayoutFakesTheEmptyWingToStaySymmetric() throws {
         leftNotchEdgeX: 666,
         rightNotchEdgeX: 846
     )
-    let balanced = notched.balancedStatusWingWidths(leftWidth: 54, rightWidth: 0)
+    let activeNotchWing = notched.statusWingWidth(
+        visibleIndicatorCount: 1,
+        showsIdleMark: false
+    )
+    try expect(notched.statusWingEdgePadding, equals: 8, "hardware-notch outer edge uses a small visual margin")
+    try expect(notched.leftStatusWingLeadingPadding, equals: 8, "left wing has a small outer margin")
+    try expect(notched.leftStatusWingTrailingPadding, equals: 12, "left wing leaves a small camera-facing gap")
+    try expect(notched.rightStatusWingLeadingPadding, equals: 12, "right wing mirrors the small camera gap")
+    try expect(notched.rightStatusWingTrailingPadding, equals: 8, "right wing has a small outer margin")
+    try expect(activeNotchWing, equals: 50, "hardware-notch counter leaves a 12-point camera gap")
+    let balanced = notched.balancedStatusWingWidths(leftWidth: activeNotchWing, rightWidth: 0)
 
-    try expect(balanced.left, equals: 54, "visible left wing keeps its width")
-    try expect(balanced.right, equals: 54, "empty right wing mirrors the left around the hardware notch")
+    try expect(balanced.left, equals: 50, "visible left wing keeps its real content width")
+    try expect(balanced.right, equals: 28, "empty right wing is only a minimal fixed visual extension")
 
     let pill = NotchLayout(
         screenMinX: 0,
@@ -1674,6 +1703,7 @@ func testNotchLayoutFakesTheEmptyWingToStaySymmetric() throws {
         rightNotchEdgeX: nil,
         menuBarHeight: 24
     )
+    try expect(pill.statusWingEdgePadding, equals: 18, "virtual pill keeps its roomier horizontal padding")
     let unbalanced = pill.balancedStatusWingWidths(leftWidth: 54, rightWidth: 0)
     try expect(unbalanced.left, equals: 54, "notchless drop preserves its real left content")
     try expect(unbalanced.right, equals: 0, "notchless drop adds no phantom status wing")
@@ -1695,12 +1725,12 @@ func testNotchLayoutUsesPillStyleOnNotchlessScreen() throws {
 
     try expect(layout.presentation, equals: .pill, "notchless screen gets the pill")
     try expect(layout.notchWidth, equals: 0, "no phantom camera gap")
-    try expect(layout.height, equals: 38, "pill is tall enough to match the hardware-notch curves")
-    try expect(layout.originY, equals: 1_402, "pill attaches to the screen top while hanging below the menu bar")
+    try expect(layout.height, equals: 24, "pill stays within the real menu bar instead of overlapping app content")
+    try expect(layout.originY, equals: 1_416, "pill attaches to the screen top without hanging into app content")
     try expect(layout.originY + layout.height, equals: 1_440, "pill and notch share the top edge")
     try expect(layout.width, equals: 800, "panel wide enough for session details and side curves")
     try expect(layout.originX, equals: 880, "centered on screen")
-    try expect(layout.expandedHeight, equals: 398, "menu hangs below the pill")
+    try expect(layout.expandedHeight, equals: 392, "menu hangs below the pill")
 }
 
 func testNotchLayoutPillFallsBackToStandardMenuBarHeight() throws {
@@ -1714,7 +1744,7 @@ func testNotchLayoutPillFallsBackToStandardMenuBarHeight() throws {
         menuBarHeight: 0
     )
 
-    try expect(layout.height, equals: 38, "standard menu bar still receives the hardware-notch profile")
+    try expect(layout.height, equals: 24, "standard menu bar bounds the virtual pill height")
 }
 
 func testHangingNotchGeometryCreatesConcaveShouldersAndRoundedBase() throws {
@@ -1840,8 +1870,8 @@ func testHangingNotchMetricsShareOneCornerProfileAcrossModes() throws {
     )
     try expect(
         SessionMenuLayout.contentHorizontalInset,
-        equals: 18,
-        "expanded content stays clear of the rounded shoulders"
+        equals: 8,
+        "expanded content uses a compact side inset like the bottom inset"
     )
     try expect(
         SessionMenuLayout.sessionRowHeight,
@@ -1855,14 +1885,93 @@ func testHangingNotchMetricsShareOneCornerProfileAcrossModes() throws {
     )
     try expect(
         SessionMenuLayout.sessionListHeight(sessionCount: 5, hasExpandedActions: true),
-        equals: 260,
+        equals: 300,
         "several rows scroll instead of escaping the panel"
+    )
+}
+
+func testSessionMenuLayoutKeepsThreeExpandedSessionsOutOfAScrollView() throws {
+    try expect(
+        SessionMenuLayout.sessionListHeight(sessionCount: 3, hasExpandedActions: true),
+        equals: 300,
+        "three sessions plus the expanded action area fit before scrolling"
+    )
+    try expect(
+        SessionMenuLayout.requiresScrolling(sessionCount: 3, hasExpandedActions: true),
+        equals: false,
+        "opening the final row of a three-session list does not introduce a scroll bar"
+    )
+    try expect(
+        SessionMenuLayout.requiresScrolling(sessionCount: 4, hasExpandedActions: true),
+        equals: true,
+        "a fourth expanded session still scrolls instead of exceeding the menu"
+    )
+}
+
+func testHoverInteractionKeepsInlineRowInteractionsOpenDuringDelayedExit() throws {
+    try expect(
+        HoverInteraction.shouldCollapse(
+            isExpanded: true,
+            isHoveringPanel: false,
+            openMenuTrackingCount: 0,
+            rowInteractionActive: true
+        ),
+        equals: false,
+        "a delayed exit cannot collapse an inline row interaction"
+    )
+}
+
+func testNotchLayoutUsesNormalizedCameraClearance() throws {
+    let layout = NotchLayout(
+        screenMinX: 0,
+        screenWidth: 1_512,
+        screenMaxY: 982,
+        safeAreaTop: 38,
+        leftNotchEdgeX: 666,
+        rightNotchEdgeX: 846
+    )
+
+    try expect(
+        layout.leftStatusWingLeadingPadding,
+        equals: 8,
+        "the running spinner has a small left margin"
+    )
+    try expect(
+        layout.leftStatusWingTrailingPadding,
+        equals: 12,
+        "the waiting counter has a small camera-facing gap"
+    )
+    try expect(
+        layout.rightStatusWingLeadingPadding,
+        equals: 12,
+        "the opposite wing mirrors the camera clearance"
+    )
+
+    let leftWingWidth = layout.statusWingWidth(
+        visibleIndicatorCount: 2,
+        showsIdleMark: false
+    )
+    let balancedWings = layout.balancedStatusWingWidths(
+        leftWidth: leftWingWidth,
+        rightWidth: 0
+    )
+    let barLeadingX = layout.originX + layout.barLeadingOffset(
+        leftWidth: balancedWings.left,
+        rightWidth: balancedWings.right
+    )
+    let waitingCounterTrailingX = barLeadingX
+        + balancedWings.left
+        - layout.leftStatusWingTrailingPadding
+    try expect(
+        waitingCounterTrailingX,
+        equals: 654,
+        "the waiting counter ends 12 points before the physical notch edge"
     )
 }
 
 func testHangingNotchInteractionRegionPassesTransparentCornersThrough() throws {
     let region = HangingNotchInteractionRegion(
-        frame: DisplayFrame(minX: 309, minY: 0, width: 102, height: 38),
+        frame: DisplayFrame(minX: 309, minY: 0, width: 102, height: 24),
         topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
         bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
     )
@@ -1878,7 +1987,7 @@ func testHangingNotchInteractionRegionPassesTransparentCornersThrough() throws {
         "AppKit gate accepts the visible drop body"
     )
     try expect(
-        region.contains(DisplayPoint(x: 360, y: 39)),
+        region.contains(DisplayPoint(x: 360, y: 25)),
         equals: false,
         "AppKit gate passes space below the compact drop through"
     )
@@ -3731,17 +3840,21 @@ let tests: [(String, () throws -> Void)] = [
     ("single instance lock excludes bundled and unbundled processes", testSingleInstanceLockExcludesBundledAndUnbundledProcesses),
     ("notch layout status wing width hides zero count indicators", testNotchLayoutStatusWingWidthHidesZeroCountIndicators),
     ("screen selection follows pointer and falls back to focused display", testScreenSelectionFollowsThePointerAndFallsBackToFocusedDisplay),
+    ("screen selection returns every display when configured for all displays", testScreenSelectionReturnsEveryDisplayWhenConfiguredForAllDisplays),
     ("attention acknowledgments silence visited sessions", testAttentionAcknowledgmentsSilenceVisitedSessionsUntilNewActivity),
     ("git workspace inspector resolves branch names", testGitWorkspaceInspectorResolvesBranchNames),
     ("notch layout extends from left side of hardware notch", testNotchLayoutExtendsFromLeftSideOfHardwareNotch),
-    ("notch layout doubles the expanded panel width for session details", testNotchLayoutDoublesTheExpandedPanelWidthForSessionDetails),
+    ("notch layout keeps expanded content close to the side edges", testNotchLayoutKeepsExpandedContentCloseToTheSideEdges),
     ("notch layout pins compact bar to physical notch when panel is clamped", testNotchLayoutPinsCompactBarToPhysicalNotchWhenExpandedPanelIsClamped),
-    ("notch layout fakes empty wing to stay symmetric", testNotchLayoutFakesTheEmptyWingToStaySymmetric),
+    ("notch layout adds only a minimal fixed right wing", testNotchLayoutAddsOnlyAMinimalFixedRightWing),
     ("notch layout uses pill style on notchless screen", testNotchLayoutUsesPillStyleOnNotchlessScreen),
     ("notch layout pill falls back to standard menu bar height", testNotchLayoutPillFallsBackToStandardMenuBarHeight),
     ("hanging notch geometry creates concave shoulders and rounded base", testHangingNotchGeometryCreatesConcaveShouldersAndRoundedBase),
     ("hanging notch geometry keeps expanded sides straight with circular corners", testHangingNotchGeometryKeepsExpandedSidesStraightWithCircularCorners),
     ("hanging notch metrics share one corner profile across modes", testHangingNotchMetricsShareOneCornerProfileAcrossModes),
+    ("session menu layout keeps three expanded sessions out of a scroll view", testSessionMenuLayoutKeepsThreeExpandedSessionsOutOfAScrollView),
+    ("hover interaction keeps inline row interactions open during delayed exit", testHoverInteractionKeepsInlineRowInteractionsOpenDuringDelayedExit),
+    ("notch layout uses normalized camera clearance", testNotchLayoutUsesNormalizedCameraClearance),
     ("hanging notch interaction region passes transparent corners through", testHangingNotchInteractionRegionPassesTransparentCornersThrough),
     ("notch layout menu card width never cramped in pill mode", testNotchLayoutMenuCardWidthNeverCrampedInPillMode),
     ("opencode plugin writes session state", testOpenCodePluginWritesSessionState),

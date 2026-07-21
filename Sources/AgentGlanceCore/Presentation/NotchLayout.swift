@@ -19,13 +19,13 @@ public struct NotchLayout: Equatable, Sendable {
     public let notchWidth: CGFloat
     private let notchLeadingX: CGFloat?
 
-    /// The outer expanded shell is wider than its content so the S-curves can
-    /// sweep laterally instead of looking vertically compressed.
+    /// The outer expanded shell remains just wider than its content so text
+    /// can sit close to the straight sides without entering their corners.
     public static let expandedPanelWidth: CGFloat = 800
-    /// Session details keep their readable measure while the outer shell adds
-    /// forty points of curve room on each side.
-    public static let expandedContentWidth: CGFloat = 720
-    public static let expandedCurveGutter: CGFloat = 40
+    /// Session details use nearly all of the panel width; their own row
+    /// padding keeps text clear of the small remaining corner gutter.
+    public static let expandedContentWidth: CGFloat = 784
+    public static let expandedCurveGutter: CGFloat = 8
 
     public static func contentWidth(forExpandedPanelWidth panelWidth: CGFloat) -> CGFloat {
         guard panelWidth.isFinite else { return 1 }
@@ -35,10 +35,9 @@ public struct NotchLayout: Equatable, Sendable {
         )
     }
 
-    public static let menuMaxHeight: CGFloat = 360
-    /// A virtual notch needs the same vertical room as a physical housing so
-    /// both use the identical shoulder and lower-corner curves.
-    public static let minimumCompactHeight: CGFloat = 38
+    /// The panel has room for three expanded rows without creating a nested
+    /// scroll surface. Longer lists retain their own bounded scroll view.
+    public static let menuMaxHeight = SessionMenuLayout.maximumCardHeight
     /// An optional amount to remove from the menu-bar contribution to the
     /// virtual-notch height.
     public static let pillBottomInset: CGFloat = 0
@@ -61,7 +60,7 @@ public struct NotchLayout: Equatable, Sendable {
         if safeAreaTop > 0, let leftNotchEdgeX, let rightNotchEdgeX {
             presentation = .notch
             notchLeadingX = leftNotchEdgeX
-            height = max(safeAreaTop, Self.minimumCompactHeight)
+            height = safeAreaTop
             notchWidth = max(rightNotchEdgeX - leftNotchEdgeX, 168)
             width = expandedWidth
             // Centre the broad expanded card on the physical camera housing,
@@ -76,10 +75,10 @@ public struct NotchLayout: Equatable, Sendable {
         } else {
             presentation = .pill
             notchLeadingX = nil
-            // The virtual notch is allowed to hang beneath the menu bar: its
-            // extra depth is what lets it match the physical-notch curves.
+            // A virtual notch must stay entirely within the menu-bar strip so
+            // it never overlaps the app content below it.
             let menuBar = menuBarHeight > 0 ? menuBarHeight : Self.fallbackMenuBarHeight
-            height = max(Self.minimumCompactHeight, menuBar - Self.pillBottomInset)
+            height = max(1, menuBar - Self.pillBottomInset)
             notchWidth = 0
             width = expandedWidth
             originX = centerX - width / 2
@@ -96,18 +95,90 @@ public struct NotchLayout: Equatable, Sendable {
     /// Gap between adjacent indicators; shared by the width formula and the
     /// view so both always agree.
     public static let statusIndicatorSpacing: CGFloat = 6
-    /// Breathing room at each end of a status wing — equal on both sides so
-    /// compact virtual and physical notches keep the same relaxed padding.
+    /// Breathing room at each end of a virtual-pill status wing.
     public static let statusWingEdgePadding: CGFloat = 18
+    /// The camera-facing edge of a hardware-notch wing reserves enough room
+    /// to keep the counter cluster fully clear of the physical camera cutout.
+    /// Hardware-notch counters keep a small outer margin and enough camera
+    /// clearance that the trailing session count remains fully visible.
+    public static let hardwareNotchOuterWingPadding: CGFloat = 8
+    public static let hardwareNotchInnerWingPadding: CGFloat = 12
+    /// A small empty continuation after a physical notch, just enough to
+    /// finish the hanging silhouette without mirroring a status wing.
+    public static let hardwareNotchFakeRightWingWidth: CGFloat = 28
+
+    /// The outer edge padding for a compact status wing. Hardware-notch wings
+    /// use larger inset on the camera side; see the side-specific properties.
+    public var statusWingEdgePadding: CGFloat {
+        switch presentation {
+        case .notch: Self.hardwareNotchOuterWingPadding
+        case .pill: Self.statusWingEdgePadding
+        }
+    }
+
+    /// Padding on the outer and camera-facing edges of the left wing.
+    public var leftStatusWingLeadingPadding: CGFloat {
+        presentation == .notch ? Self.hardwareNotchOuterWingPadding : Self.statusWingEdgePadding
+    }
+
+    public var leftStatusWingTrailingPadding: CGFloat {
+        presentation == .notch ? Self.hardwareNotchInnerWingPadding : Self.statusWingEdgePadding
+    }
+
+    /// Padding on the camera-facing and outer edges of the right wing.
+    public var rightStatusWingLeadingPadding: CGFloat {
+        presentation == .notch ? Self.hardwareNotchInnerWingPadding : Self.statusWingEdgePadding
+    }
+
+    public var rightStatusWingTrailingPadding: CGFloat {
+        presentation == .notch ? Self.hardwareNotchOuterWingPadding : Self.statusWingEdgePadding
+    }
 
     /// Compact status-bar wing sizing: one slot per *visible* indicator —
     /// zero-count kinds claim nothing — plus equal padding on both ends.
-    /// A completely quiet bar keeps a relaxed footprint for its idle mark.
-    public static func statusWingWidth(visibleIndicatorCount: Int, showsIdleMark: Bool) -> CGFloat {
-        guard visibleIndicatorCount > 0 else { return showsIdleMark ? 64 : 0 }
+    /// A completely quiet bar keeps the same minimum outer clearance as a
+    /// populated wing. The optional padding lets the physical notch stay
+    /// compact while the virtual pill remains comfortably spaced.
+    public static func statusWingWidth(
+        visibleIndicatorCount: Int,
+        showsIdleMark: Bool,
+        edgePadding: CGFloat = NotchLayout.statusWingEdgePadding
+    ) -> CGFloat {
+        statusWingWidth(
+            visibleIndicatorCount: visibleIndicatorCount,
+            showsIdleMark: showsIdleMark,
+            leadingPadding: edgePadding,
+            trailingPadding: edgePadding
+        )
+    }
+
+    /// Compact status-wing width with independently controllable leading and
+    /// trailing insets. Hardware-notch wings use opposite values on each side
+    /// so their counter clusters stay visually symmetric around the cutout.
+    public static func statusWingWidth(
+        visibleIndicatorCount: Int,
+        showsIdleMark: Bool,
+        leadingPadding: CGFloat,
+        trailingPadding: CGFloat
+    ) -> CGFloat {
+        let leading = leadingPadding.isFinite ? max(0, leadingPadding) : 0
+        let trailing = trailingPadding.isFinite ? max(0, trailingPadding) : 0
+        guard visibleIndicatorCount > 0 else {
+            return showsIdleMark ? max(46, 28 + leading + trailing) : 0
+        }
         return CGFloat(visibleIndicatorCount) * statusIndicatorSlotWidth
             + CGFloat(max(visibleIndicatorCount - 1, 0)) * statusIndicatorSpacing
-            + 2 * statusWingEdgePadding
+            + leading + trailing
+    }
+
+    /// Status-wing width for this layout's presentation.
+    public func statusWingWidth(visibleIndicatorCount: Int, showsIdleMark: Bool) -> CGFloat {
+        Self.statusWingWidth(
+            visibleIndicatorCount: visibleIndicatorCount,
+            showsIdleMark: showsIdleMark,
+            leadingPadding: leftStatusWingLeadingPadding,
+            trailingPadding: leftStatusWingTrailingPadding
+        )
     }
 
     /// Horizontal origin of the compact bar inside the broad panel. On a
@@ -122,16 +193,17 @@ public struct NotchLayout: Equatable, Sendable {
         }
     }
 
-    /// A physical notch needs matching black shoulders even when all visible
-    /// status belongs on one side. Mirror the larger wing so the fake extension
-    /// meets both hardware corner radii symmetrically; notchless drops retain
-    /// only their real content widths.
+    /// When statuses exist only to the left of the camera, add a simple empty
+    /// right wing for a finished silhouette. The real left wing stays intact;
+    /// no width is mirrored back into it, and a real right status takes over
+    /// as soon as one exists.
     public func balancedStatusWingWidths(
         leftWidth: CGFloat,
         rightWidth: CGFloat
     ) -> (left: CGFloat, right: CGFloat) {
-        guard presentation == .notch else { return (leftWidth, rightWidth) }
-        let width = max(leftWidth, rightWidth)
-        return (width, width)
+        guard presentation == .notch, leftWidth > 0, rightWidth == 0 else {
+            return (leftWidth, rightWidth)
+        }
+        return (leftWidth, Self.hardwareNotchFakeRightWingWidth)
     }
 }

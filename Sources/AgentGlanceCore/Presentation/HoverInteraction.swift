@@ -4,6 +4,21 @@ import Foundation
 /// Changing an animated view's size replaces its AppKit tracking area, which
 /// can emit `.ended` even while the pointer remains over the new surface.
 public enum HoverInteraction {
+    /// A delayed hover-exit dismissal must re-check the interaction locks
+    /// when it fires: the pointer can click an inline row after the delay was
+    /// scheduled but before it expires.
+    public static func shouldCollapse(
+        isExpanded: Bool,
+        isHoveringPanel: Bool,
+        openMenuTrackingCount: Int,
+        rowInteractionActive: Bool
+    ) -> Bool {
+        isExpanded
+            && !isHoveringPanel
+            && openMenuTrackingCount == 0
+            && !rowInteractionActive
+    }
+
     /// Resolves the AppKit event gate independently from SwiftUI's animated
     /// presentation geometry. The compact target always follows the visible
     /// bar exactly; once expanded, the whole card width must become clickable
@@ -37,8 +52,9 @@ public enum HoverInteraction {
 
     /// The hover surface follows what SwiftUI has actually measured, rather
     /// than the larger provisional AppKit click gate. Before the expanded
-    /// measurement arrives, the compact height is enough to retain the
-    /// pointer that initiated expansion without claiming transparent space.
+    /// measurement arrives, it must use that provisional gate as well: the
+    /// pointer is allowed to travel from the compact bar into the card while
+    /// SwiftUI is still installing its replacement tracking area.
     public static func visibleHoverFrame(
         compactFrame: DisplayFrame,
         expandedPanelWidth: CGFloat,
@@ -53,9 +69,11 @@ public enum HoverInteraction {
         guard isExpanded else { return compactFrame }
 
         let maximumHeight = max(compactFrame.height, expandedMaximumHeight)
-        let measuredHeight = measuredContentHeight.isFinite
+        let hasExpandedMeasurement = measuredContentHeight.isFinite
+            && measuredContentHeight > compactFrame.height
+        let measuredHeight = hasExpandedMeasurement
             ? measuredContentHeight
-            : compactFrame.height
+            : maximumHeight
         return DisplayFrame(
             minX: 0,
             minY: 0,

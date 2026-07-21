@@ -3,6 +3,32 @@ import SwiftUI
 
 import AgentGlanceCore
 
+struct NotchPointerSnapshot: Equatable {
+    let isInside: Bool
+    let location: DisplayPoint
+    let sequence: UInt
+}
+
+/// The AppKit hosting view owns one fixed tracking area for its entire
+/// lifetime. SwiftUI observes its normalized result instead of replacing a
+/// tracking area every time the hanging card changes height.
+@MainActor
+final class NotchPointerTracker: ObservableObject {
+    @Published private(set) var snapshot = NotchPointerSnapshot(
+        isInside: false,
+        location: DisplayPoint(x: 0, y: 0),
+        sequence: 0
+    )
+
+    func update(isInside: Bool, location: DisplayPoint) {
+        snapshot = NotchPointerSnapshot(
+            isInside: isInside,
+            location: location,
+            sequence: snapshot.sequence &+ 1
+        )
+    }
+}
+
 struct NotchWidgetView: View {
     @Bindable var store: StateStore
     @AppStorage("hideWhenEmpty") private var hideWhenEmpty = false
@@ -11,6 +37,8 @@ struct NotchWidgetView: View {
     /// the pointer actually moves; this closure answers whether a hover at
     /// the given global position may open the menu. Clicks bypass it.
     let allowHoverExpansion: (DisplayPoint) -> Bool
+    @ObservedObject var pointerTracker: NotchPointerTracker
+    let requestPointerRefresh: () -> Void
     let onInteractiveRegionChange: (HangingNotchInteractionRegion) -> Void
     let onKeyboardFocusChange: (Bool) -> Void
     let onMenuVisibilityChange: (Bool) -> Void
@@ -33,11 +61,11 @@ struct NotchWidgetView: View {
         let leftEntries = summary.visibleEntries.filter { $0.kind != .blocked }
         let rightEntries = summary.visibleEntries.filter { $0.kind == .blocked }
         let showsIdleMark = summary.activeSessionCount == 0
-        let naturalLeftWidth = NotchLayout.statusWingWidth(
+        let naturalLeftWidth = layout.statusWingWidth(
             visibleIndicatorCount: leftEntries.count,
             showsIdleMark: showsIdleMark
         )
-        let naturalRightWidth = NotchLayout.statusWingWidth(
+        let naturalRightWidth = layout.statusWingWidth(
             visibleIndicatorCount: rightEntries.count,
             showsIdleMark: false
         )
@@ -94,7 +122,11 @@ struct NotchWidgetView: View {
                             setKeyboardFocus: onKeyboardFocusChange,
                             onRowInteractionChange: { isActive in
                                 rowInteractionActive = isActive
-                                if !isActive { settleAfterDetachedInteraction() }
+                                if isActive {
+                                    cancelPendingCollapse()
+                                } else {
+                                    settleAfterDetachedInteraction()
+                                }
                             }
                         )
                         .frame(width: menuContentWidth)
@@ -110,10 +142,10 @@ struct NotchWidgetView: View {
                         // continuous silhouette.
                         .fill(Color(white: 0))
                 )
-                // Clip row hover fills and inline-action backgrounds to the
-                // same straight-sided, rounded-corner path so they cannot
-                // leak into its transparent lower pockets.
-                .clipShape(silhouette)
+                // Do not clip the compact counters to the curved silhouette:
+                // the physical camera already owns the central cutout, while
+                // clipping here shaves off the leading spinner before it can
+                // reach the safe area beside that cutout.
                 .background {
                     GeometryReader { geometry in
                         Color.clear.preference(
@@ -126,52 +158,6 @@ struct NotchWidgetView: View {
                 // panel is always expanded-height, so the outer frame covers
                 // transparent dead space below the visible shape.
                 .contentShape(silhouette)
-                .onContinuousHover(coordinateSpace: .local) { phase in
-                    switch phase {
-                    case .active:
-                        let mouse = NSEvent.mouseLocation
-                        let pointer = DisplayPoint(x: mouse.x, y: mouse.y)
-                        let visibleFrame = HoverInteraction.visibleHoverFrame(
-                            compactFrame: compactInteractiveFrame,
-                            expandedPanelWidth: layout.width,
-                            expandedMaximumHeight: layout.expandedHeight,
-                            measuredContentHeight: latestMeasuredContentHeight,
-                            isExpanded: isExpanded,
-                            isHidden: false
-                        )
-                        guard HoverInteraction.pointerIsInsideHangingSilhouette(
-                            pointer,
-                            localTopLeadingFrame: visibleFrame,
-                            panelOriginX: layout.originX,
-                            panelTopY: layout.originY + layout.height,
-                            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
-                            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
-                        ) else {
-                            isHoveringPanel = false
-                            hoverExpandWorkItem?.cancel()
-                            hoverExpandWorkItem = nil
-                            scheduleCollapseOnHoverExit()
-                            return
-                        }
-                        isHoveringPanel = true
-                        collapseWorkItem?.cancel()
-                        // After a screen jump the bar appears under an
-                        // unmoving pointer; only real travel unlocks
-                        // hover-expansion. Clicks stay always allowed.
-                        guard HoverInteraction.shouldScheduleExpansion(
-                            pointer: pointer,
-                            compactFrame: compactInteractiveFrame,
-                            panelOriginX: layout.originX,
-                            panelTopY: layout.originY + layout.height,
-                            isExpanded: isExpanded,
-                            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
-                            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
-                        ) else { return }
-                        if allowHoverExpansion(pointer) { scheduleExpansion() }
-                    case .ended:
-                        reconcileHoverExit(compactFrame: compactInteractiveFrame)
-                    }
-                }
                 .contextMenu {
                     SettingsLink {
                         Label("AgentGlance Settings", systemImage: "gearshape")
@@ -190,7 +176,7 @@ struct NotchWidgetView: View {
                     NotificationCenter.default.publisher(for: NSMenu.didBeginTrackingNotification)
                 ) { _ in
                     openMenuTrackingCount += 1
-                    collapseWorkItem?.cancel()
+                    cancelPendingCollapse()
                 }
                 .onReceive(
                     NotificationCenter.default.publisher(for: NSMenu.didEndTrackingNotification)
@@ -208,6 +194,9 @@ struct NotchWidgetView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: isExpanded)
+        .onChange(of: pointerTracker.snapshot) { _, snapshot in
+            handlePointerUpdate(snapshot, compactFrame: compactInteractiveFrame)
+        }
         .onAppear {
             publishInteractiveRegion(
                 compactFrame: compactInteractiveFrame,
@@ -215,6 +204,7 @@ struct NotchWidgetView: View {
                 isExpanded: isExpanded,
                 isHidden: shouldHide
             )
+            requestPointerRefresh()
             onMenuVisibilityChange(isExpanded)
         }
         .onPreferenceChange(InteractiveHeightPreferenceKey.self) { measuredHeight in
@@ -243,6 +233,7 @@ struct NotchWidgetView: View {
                 isExpanded: isExpanded,
                 isHidden: shouldHide
             )
+            requestPointerRefresh()
         }
         .onChange(of: shouldHide) { _, isHidden in
             publishInteractiveRegion(
@@ -288,28 +279,36 @@ struct NotchWidgetView: View {
                             .accessibilityLabel("No active agents")
                     }
                 } else {
-                    HStack(spacing: NotchLayout.statusIndicatorSpacing) {
-                        ForEach(leftEntries) { entry in
-                            StatusSummaryIndicator(kind: entry.kind, count: entry.count)
+                    HStack(spacing: 0) {
+                        Spacer(minLength: layout.leftStatusWingLeadingPadding)
+                        HStack(spacing: NotchLayout.statusIndicatorSpacing) {
+                            ForEach(leftEntries) { entry in
+                                StatusSummaryIndicator(kind: entry.kind, count: entry.count)
+                            }
                         }
+                        Spacer(minLength: layout.leftStatusWingTrailingPadding)
                     }
-                    .padding(.horizontal, NotchLayout.statusWingEdgePadding)
+                    .frame(width: leftWidth, height: layout.height, alignment: .leading)
                 }
             }
-            .frame(width: leftWidth, height: layout.height, alignment: .trailing)
+            .frame(width: leftWidth, height: layout.height, alignment: .leading)
             Color.clear
                 .frame(width: layout.notchWidth, height: layout.height)
             Group {
                 if !rightEntries.isEmpty {
-                    HStack(spacing: NotchLayout.statusIndicatorSpacing) {
-                        ForEach(rightEntries) { entry in
-                            StatusSummaryIndicator(kind: entry.kind, count: entry.count)
+                    HStack(spacing: 0) {
+                        Spacer(minLength: layout.rightStatusWingLeadingPadding)
+                        HStack(spacing: NotchLayout.statusIndicatorSpacing) {
+                            ForEach(rightEntries) { entry in
+                                StatusSummaryIndicator(kind: entry.kind, count: entry.count)
+                            }
                         }
+                        Spacer(minLength: layout.rightStatusWingTrailingPadding)
                     }
-                    .padding(.horizontal, NotchLayout.statusWingEdgePadding)
+                    .frame(width: rightWidth, height: layout.height, alignment: .trailing)
                 }
             }
-            .frame(width: rightWidth, height: layout.height, alignment: .leading)
+            .frame(width: rightWidth, height: layout.height, alignment: .trailing)
         }
     }
 
@@ -341,7 +340,7 @@ struct NotchWidgetView: View {
     private func openMenu() {
         hoverExpandWorkItem?.cancel()
         hoverExpandWorkItem = nil
-        collapseWorkItem?.cancel()
+        cancelPendingCollapse()
         isExpanded = true
     }
 
@@ -370,55 +369,75 @@ struct NotchWidgetView: View {
     private func collapseMenu() {
         hoverExpandWorkItem?.cancel()
         hoverExpandWorkItem = nil
-        collapseWorkItem?.cancel()
+        cancelPendingCollapse()
         isExpanded = false
+    }
+
+    private func cancelPendingCollapse() {
+        collapseWorkItem?.cancel()
+        collapseWorkItem = nil
     }
 
     /// Collapse shortly after the pointer leaves the panel, mirroring how
     /// notch utilities dismiss. Inline row interactions keep it open.
     private func scheduleCollapseOnHoverExit() {
-        collapseWorkItem?.cancel()
+        cancelPendingCollapse()
         hoverExpandWorkItem?.cancel()
         hoverExpandWorkItem = nil
-        guard isExpanded,
-              openMenuTrackingCount == 0,
-              !rowInteractionActive else { return }
-        let workItem = DispatchWorkItem { isExpanded = false }
+        guard HoverInteraction.shouldCollapse(
+            isExpanded: isExpanded,
+            isHoveringPanel: isHoveringPanel,
+            openMenuTrackingCount: openMenuTrackingCount,
+            rowInteractionActive: rowInteractionActive
+        ) else { return }
+        let workItem = DispatchWorkItem {
+            guard HoverInteraction.shouldCollapse(
+                isExpanded: isExpanded,
+                isHoveringPanel: isHoveringPanel,
+                openMenuTrackingCount: openMenuTrackingCount,
+                rowInteractionActive: rowInteractionActive
+            ) else { return }
+            collapseWorkItem = nil
+            isExpanded = false
+        }
         collapseWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: workItem)
     }
 
-    private func settleAfterDetachedInteraction() {
-        guard !isHoveringPanel else { return }
-        scheduleCollapseOnHoverExit()
-    }
-
-    /// SwiftUI replaces the tracking area when the silhouette grows from the
-    /// compact bar to the menu. AppKit reports an exit from the old area even
-    /// when the pointer is still inside the new one; defer one run-loop turn
-    /// and compare against the real global pointer position before collapsing.
-    private func reconcileHoverExit(compactFrame: DisplayFrame) {
-        DispatchQueue.main.async {
-            let frame = HoverInteraction.visibleHoverFrame(
+    private func handlePointerUpdate(
+        _ snapshot: NotchPointerSnapshot,
+        compactFrame: DisplayFrame
+    ) {
+        if snapshot.isInside {
+            isHoveringPanel = true
+            cancelPendingCollapse()
+            // After a screen jump the bar can materialize under a stationary
+            // cursor. The fixed AppKit tracking area supplies every actual
+            // pointer movement to this gate; clicks still bypass it.
+            guard HoverInteraction.shouldScheduleExpansion(
+                pointer: snapshot.location,
                 compactFrame: compactFrame,
-                expandedPanelWidth: layout.width,
-                expandedMaximumHeight: layout.expandedHeight,
-                measuredContentHeight: latestMeasuredContentHeight,
-                isExpanded: isExpanded,
-                isHidden: false
-            )
-            let mouse = NSEvent.mouseLocation
-            let isInside = HoverInteraction.pointerIsInsideHangingSilhouette(
-                DisplayPoint(x: mouse.x, y: mouse.y),
-                localTopLeadingFrame: frame,
                 panelOriginX: layout.originX,
                 panelTopY: layout.originY + layout.height,
+                isExpanded: isExpanded,
                 topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
                 bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
-            )
-            isHoveringPanel = isInside
-            if isInside {
-                collapseWorkItem?.cancel()
+            ) else { return }
+            if allowHoverExpansion(snapshot.location) { scheduleExpansion() }
+        } else {
+            isHoveringPanel = false
+            hoverExpandWorkItem?.cancel()
+            hoverExpandWorkItem = nil
+            scheduleCollapseOnHoverExit()
+        }
+    }
+
+    private func settleAfterDetachedInteraction() {
+        guard !rowInteractionActive else { return }
+        requestPointerRefresh()
+        DispatchQueue.main.async {
+            if isHoveringPanel {
+                cancelPendingCollapse()
             } else {
                 scheduleCollapseOnHoverExit()
             }
@@ -607,7 +626,7 @@ private struct SessionMenuCard: View {
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: SessionMenuLayout.cardStackSpacing) {
             HStack(spacing: 6) {
                 Image(systemName: "rectangle.stack.fill")
                     .font(.system(size: 11, weight: .semibold))
@@ -644,7 +663,7 @@ private struct SessionMenuCard: View {
                 // several sessions are visible it scrolls instead of growing
                 // past the panel and clipping the lower controls.
                 ScrollViewReader { proxy in
-                    ScrollView(showsIndicators: sessions.count > 5 || actionsSessionID != nil) {
+                    ScrollView(showsIndicators: false) {
                         VStack(spacing: 0) {
                             ForEach(sessions) { session in
                                 row(for: session)
@@ -665,7 +684,7 @@ private struct SessionMenuCard: View {
                         }
                     }
                 }
-                .padding(.bottom, 8)
+                .padding(.bottom, SessionMenuLayout.sessionListBottomPadding)
             }
 
             if let errorMessage {
