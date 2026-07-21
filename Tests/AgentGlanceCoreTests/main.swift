@@ -2666,6 +2666,57 @@ func testConvoyFinalTransitionSurvivesImmediateProcessExitOnce() throws {
     try expect(secondHeartbeat.preservingSessionIDs.isEmpty, equals: true, "grace expires")
 }
 
+func testConvoyWatcherKeepsFinalReadsInDiscoveredMetadataFile() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    let directoryRunID = "actual-run-directory"
+    let metadataRunID = "../external-run"
+    let serverStartedAt = Date().addingTimeInterval(-60)
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: directoryRunID,
+        serverPid: Int32(getpid()),
+        serverStartedAt: serverStartedAt,
+        phases: [("implementer", "completed", "ses_impl")]
+    )
+    let metadataURL = runsDirectoryURL
+        .appendingPathComponent(directoryRunID, isDirectory: true)
+        .appendingPathComponent("metadata.json")
+    let originalMetadata = try String(contentsOf: metadataURL, encoding: .utf8)
+    let metadata = originalMetadata.replacingOccurrences(
+        of: #""runID": "actual-run-directory""#,
+        with: #""runID": "../external-run""#
+    )
+    try Data(metadata.utf8).write(to: metadataURL)
+    // This is outside the watched runs directory. It must never become the
+    // final-state source merely because metadata supplied a traversal ID.
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL.deletingLastPathComponent(),
+        runID: "external-run",
+        serverPid: Int32(getpid()),
+        serverStartedAt: serverStartedAt,
+        phases: [("external", "running", "ses_external")]
+    )
+    let watcher = ConvoyRunsWatcher(runsDirectoryURL: runsDirectoryURL, repository: repository)
+    let process = detectedConvoyProcess(elapsedSeconds: 120)
+
+    _ = try watcher.observe(detected: [process], isHeartbeat: false)
+    _ = try watcher.observe(detected: [], isHeartbeat: false, forceRefresh: true)
+
+    let sessions = try repository.loadSessions()
+    try expect(
+        sessions.contains(where: { $0.sessionID == "external-run" }),
+        equals: false,
+        "metadata run ID cannot redirect final reads outside its discovered file"
+    )
+    try expect(
+        sessions.first(where: { $0.sessionID == metadataRunID })?.status,
+        equals: .idle,
+        "final state remains sourced from the discovered metadata file"
+    )
+}
+
 func testConvoyWatcherSuppressesPipelineOwnedOpenCodeSessions() throws {
     // Convoy phases run as OpenCode sessions on convoy's embedded server;
     // if that server loads the AgentGlance plugin, each phase would also
@@ -4008,6 +4059,7 @@ let tests: [(String, () throws -> Void)] = [
     ("convoy watcher maps terminal pipeline states", testConvoyWatcherMapsTerminalPipelineStates),
     ("convoy watcher maps thinking and uses project name", testConvoyWatcherMapsThinkingAndUsesProjectName),
     ("convoy final transition survives immediate process exit once", testConvoyFinalTransitionSurvivesImmediateProcessExitOnce),
+    ("convoy watcher keeps final reads in discovered metadata file", testConvoyWatcherKeepsFinalReadsInDiscoveredMetadataFile),
     ("convoy watcher ignores runs not owned by live process", testConvoyWatcherIgnoresRunsNotOwnedByLiveProcess),
     ("convoy watcher suppresses pipeline-owned opencode sessions", testConvoyWatcherSuppressesPipelineOwnedOpenCodeSessions),
     ("convoy watcher suppresses embedded server reaper fallback by directory", testConvoyWatcherSuppressesEmbeddedServerReaperFallbackByDirectory),

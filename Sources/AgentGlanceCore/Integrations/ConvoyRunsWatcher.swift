@@ -6,7 +6,6 @@ import Foundation
 /// integration is read-only: convoy needs no hook or plugin, and a run's
 /// document dies with its process through the regular reaper pass.
 public final class ConvoyRunsWatcher {
-    private static let maximumMetadataSize: off_t = 1_048_576
     /// Tolerance between a process's kernel start time and the server
     /// timestamp convoy records, guarding pid reuse across old runs.
     private static let processStartSlack: TimeInterval = 120
@@ -32,6 +31,14 @@ public final class ConvoyRunsWatcher {
         var missedHeartbeats: Int
     }
 
+    /// A parsed run remains paired with the metadata file it came from. The
+    /// metadata's run ID is untrusted and may identify the published session,
+    /// but it must never be used to reconstruct a filesystem path.
+    private struct DiscoveredRun {
+        let metadataURL: URL
+        let run: ConvoyRun
+    }
+
     public init(runsDirectoryURL: URL, repository: StateRepository) {
         self.runsDirectoryURL = runsDirectoryURL
         self.repository = repository
@@ -53,19 +60,18 @@ public final class ConvoyRunsWatcher {
     ) throws -> ScanResult {
         if forceRefresh { parsedRunsByFileURL.removeAll() }
         let convoyProcesses = detected.filter { $0.tool == .convoy }
-        let runs = convoyProcesses.isEmpty
+        let discoveredRuns = convoyProcesses.isEmpty
             ? []
             : currentRuns(startedAfter: oldestProcessStart(of: convoyProcesses))
         var liveRuns: [ConvoyRun] = []
         var publishedRunIDs: Set<String> = []
         for process in convoyProcesses {
-            guard let run = run(ownedBy: process, in: runs) else { continue }
+            guard let discoveredRun = run(ownedBy: process, in: discoveredRuns) else { continue }
+            let run = discoveredRun.run
             let startedAt = run.serverStartedAt ?? Date(timeIntervalSinceNow: -process.elapsedSeconds)
             try repository.save(session(for: run, process: process, startedAt: startedAt))
             trackedRuns[run.runID] = TrackedRun(
-                metadataURL: runsDirectoryURL
-                    .appendingPathComponent(run.runID, isDirectory: true)
-                    .appendingPathComponent("metadata.json"),
+                metadataURL: discoveredRun.metadataURL,
                 process: process,
                 startedAt: startedAt,
                 missedHeartbeats: 0
@@ -143,13 +149,13 @@ public final class ConvoyRunsWatcher {
     /// A live process created its run after it started, so metadata last
     /// written before any visible convoy process began cannot describe a
     /// current run and is skipped without parsing.
-    private func currentRuns(startedAfter cutoff: Date) -> [ConvoyRun] {
+    private func currentRuns(startedAfter cutoff: Date) -> [DiscoveredRun] {
         let runDirectoryURLs = (try? FileManager.default.contentsOfDirectory(
             at: runsDirectoryURL,
             includingPropertiesForKeys: [.isDirectoryKey]
         )) ?? []
         var currentMetadataURLs: Set<URL> = []
-        var runs: [ConvoyRun] = []
+        var runs: [DiscoveredRun] = []
         for runDirectoryURL in runDirectoryURLs {
             let metadataURL = runDirectoryURL.appendingPathComponent("metadata.json")
             guard let modifiedAt = try? metadataURL
@@ -160,7 +166,7 @@ public final class ConvoyRunsWatcher {
             }
             currentMetadataURLs.insert(metadataURL)
             if let run = parsedRun(at: metadataURL, modifiedAt: modifiedAt) {
-                runs.append(run)
+                runs.append(DiscoveredRun(metadataURL: metadataURL, run: run))
             }
         }
         // Runs aging out of the cutoff never come back; their cached parses
@@ -187,10 +193,8 @@ public final class ConvoyRunsWatcher {
         var metadata = stat()
         guard Darwin.fstat(descriptor, &metadata) == 0,
               metadata.st_mode & S_IFMT == S_IFREG,
-              metadata.st_uid == getuid(),
-              metadata.st_size >= 0,
-              metadata.st_size <= Self.maximumMetadataSize else { return nil }
-        return try? handle.readToEnd()
+              metadata.st_uid == getuid() else { return nil }
+        return try? BoundedInput.read(from: handle)
     }
 
     private func parsedRunAtCurrentModificationDate(_ metadataURL: URL) -> ConvoyRun? {
@@ -206,17 +210,19 @@ public final class ConvoyRunsWatcher {
     /// resurrect an old run.
     private func run(
         ownedBy process: DetectedAgentProcess,
-        in runs: [ConvoyRun]
-    ) -> ConvoyRun? {
+        in runs: [DiscoveredRun]
+    ) -> DiscoveredRun? {
         let processStartedAt = process.elapsedSeconds.isFinite
             ? Date(timeIntervalSinceNow: -process.elapsedSeconds - Self.processStartSlack)
             : Date.distantPast
         return runs
             .filter {
-                $0.serverPid == process.processID
-                    && ($0.serverStartedAt ?? .distantPast) >= processStartedAt
+                $0.run.serverPid == process.processID
+                    && ($0.run.serverStartedAt ?? .distantPast) >= processStartedAt
             }
-            .max { ($0.serverStartedAt ?? .distantPast) < ($1.serverStartedAt ?? .distantPast) }
+            .max {
+                ($0.run.serverStartedAt ?? .distantPast) < ($1.run.serverStartedAt ?? .distantPast)
+            }
     }
 
     // MARK: Session mapping
