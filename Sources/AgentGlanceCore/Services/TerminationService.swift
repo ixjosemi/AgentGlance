@@ -63,8 +63,19 @@ public enum TerminationService {
         guard processID > 0 else {
             throw TerminationError.signalFailed(pid: processID, underlyingErrno: EINVAL)
         }
-        if let expectedIdentity,
-           SystemProcessScanner.processIdentity(of: processID) != expectedIdentity {
+        // State documents and their PIDs arrive from integrations. A PID
+        // alone can be recycled after its agent exits, so a missing identity
+        // is not enough authority for this destructive operation. The reaper
+        // records the current kernel identity before an actionable session is
+        // displayed; legacy or malformed documents fail closed here.
+        guard let expectedIdentity else {
+            throw TerminationError.signalFailed(pid: processID, underlyingErrno: ESRCH)
+        }
+        // A process that already exited (including an unreaped zombie) has
+        // reached the requested end state. Do not turn this benign race into
+        // a failure merely because it no longer exposes an identity.
+        guard isRunning(processID) else { return }
+        guard SystemProcessScanner.processIdentity(of: processID) == expectedIdentity else {
             throw TerminationError.signalFailed(pid: processID, underlyingErrno: ESRCH)
         }
         if Darwin.kill(processID, SIGTERM) != 0 {
@@ -76,8 +87,7 @@ public enum TerminationService {
             expectedIdentity: expectedIdentity,
             gracePeriod: gracePeriod
         ) { return }
-        if let expectedIdentity,
-           SystemProcessScanner.processIdentity(of: processID) != expectedIdentity {
+        if SystemProcessScanner.processIdentity(of: processID) != expectedIdentity {
             return
         }
         if Darwin.kill(processID, SIGKILL) != 0, errno != ESRCH {

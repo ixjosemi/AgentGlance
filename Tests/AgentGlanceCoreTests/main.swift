@@ -3878,14 +3878,24 @@ func testTerminationServiceKillsPolitelyAndEscalatesToSigkill() throws {
         return process
     }
     func sessionForProcessID(_ processID: Int32) throws -> AgentSession {
-        try AgentSession.decode(
-            from: validStateJSON(sessionID: "kill-\(processID)", status: "working", pid: processID)
+        let identity = try SystemProcessScanner.processIdentity(of: processID)
+            .unwrap(or: "test process has no kernel identity")
+        return AgentSession(
+            tool: .claude,
+            sessionID: "kill-\(processID)",
+            pid: processID,
+            processIdentity: identity,
+            status: .working,
+            cwd: "/tmp/kill",
+            startedAt: Date(),
+            updatedAt: Date()
         )
     }
 
     // A well-behaved process dies on SIGTERM within the grace period.
     let polite = try spawn(["/bin/sleep", "60"])
-    try TerminationService.terminate(try sessionForProcessID(polite.processIdentifier), gracePeriod: 2)
+    let politeSession = try sessionForProcessID(polite.processIdentifier)
+    try TerminationService.terminate(politeSession, gracePeriod: 2)
     polite.waitUntilExit()
     try expect(polite.terminationReason, equals: .uncaughtSignal, "polite process killed by signal")
 
@@ -3898,7 +3908,44 @@ func testTerminationServiceKillsPolitelyAndEscalatesToSigkill() throws {
     try expect(stubborn.terminationReason, equals: .uncaughtSignal, "stubborn process killed by signal")
 
     // A pid that is already gone is not an error: the goal state holds.
-    try TerminationService.terminate(try sessionForProcessID(polite.processIdentifier), gracePeriod: 0.3)
+    try TerminationService.terminate(politeSession, gracePeriod: 0.3)
+}
+
+func testTerminationServiceRefusesUnverifiedProcess() throws {
+    // State documents originate outside the app and can outlive their
+    // process. A legacy document without a kernel generation must not turn a
+    // stale PID into permission to signal an unrelated process.
+    let target = Process()
+    target.executableURL = URL(fileURLWithPath: "/bin/sleep")
+    target.arguments = ["60"]
+    try target.run()
+    defer {
+        if Darwin.kill(target.processIdentifier, 0) == 0 {
+            Darwin.kill(target.processIdentifier, SIGKILL)
+        }
+        target.waitUntilExit()
+    }
+    let unverified = AgentSession(
+        tool: .claude,
+        sessionID: "unverified-\(target.processIdentifier)",
+        pid: target.processIdentifier,
+        status: .working,
+        cwd: "/tmp/unverified",
+        startedAt: Date(),
+        updatedAt: Date()
+    )
+
+    do {
+        try TerminationService.terminate(unverified, gracePeriod: 0.1)
+        throw TestFailure.expectation("termination accepted an unverified process")
+    } catch let error as TerminationError {
+        try expect(
+            error,
+            equals: .signalFailed(pid: target.processIdentifier, underlyingErrno: ESRCH),
+            "unverified session is rejected before signaling"
+        )
+    }
+    try expect(Darwin.kill(target.processIdentifier, 0), equals: 0, "unverified process remains alive")
 }
 
 func testSessionTitleFormatterCleansTabTitles() throws {
@@ -4093,6 +4140,7 @@ let tests: [(String, () throws -> Void)] = [
     ("state store rename persists across restarts and prunes", testStateStoreRenamePersistsAcrossRestartsAndPrunesWithSessions),
     ("termination planner closes only exact containers", testTerminationPlannerClosesOnlyExactContainers),
     ("termination service kills politely and escalates to SIGKILL", testTerminationServiceKillsPolitelyAndEscalatesToSigkill),
+    ("termination service refuses unverified process", testTerminationServiceRefusesUnverifiedProcess),
     ("session title formatter cleans tab titles", testSessionTitleFormatterCleansTabTitles),
     ("state store display name prefers override then tab title", testStateStoreDisplayNamePrefersOverrideThenTabTitle),
     ("state store clears all session names", testStateStoreClearsAllSessionNames),
