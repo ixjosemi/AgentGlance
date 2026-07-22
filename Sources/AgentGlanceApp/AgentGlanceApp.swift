@@ -70,30 +70,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard UserDefaults.standard.bool(forKey: "turnCompleteSoundEnabled") else { return }
             NSSound(named: "Tink")?.play()
         }
-        do {
-            // Directory events and Darwin notifications deliver state changes
-            // immediately; polling is only a 30-second safety heartbeat.
-            try store.startObserving(pollInterval: 30)
-        } catch {
-            store.stopObserving()
-            NSLog("AgentGlance failed to start state observation: %@", String(describing: error))
-        }
-        // State observation is armed before the scheduler can save or remove
-        // anything. The completion is a final main-thread baseline after the
-        // asynchronous reconciliation, independent of event coalescing.
+        // Capture scheduler sources first, then build Convoy ownership and
+        // reconcile persisted state off the main thread. The panel stays
+        // hidden until that baseline is ready, so internal OpenCode phases
+        // cannot flash as global sessions during cold start.
         let scheduler = ObservationScheduler(repository: repository)
         observationScheduler = scheduler
         scheduler.startWithInitialReconciliation { [weak self, weak scheduler, weak store] in
             guard let self,
                   self.observationScheduler === scheduler,
                   self.store === store else { return }
-            store?.reloadRecordingError()
+            guard let store else { return }
+            do {
+                // Arm event capture before reading the post-reconciliation
+                // baseline. Polling is only a 30-second safety heartbeat.
+                try store.startObserving(pollInterval: 30)
+            } catch {
+                store.stopObserving()
+                store.reloadRecordingError()
+                NSLog("AgentGlance failed to start state observation: %@", String(describing: error))
+            }
+            self.panelController = NotchPanelController(store: store)
+            self.panelController?.show()
+            let focusObserver = FocusAcknowledgmentObserver(store: store)
+            self.focusAcknowledgmentObserver = focusObserver
+            focusObserver.start()
         }
-        panelController = NotchPanelController(store: store)
-        panelController?.show()
-        let focusObserver = FocusAcknowledgmentObserver(store: store)
-        focusAcknowledgmentObserver = focusObserver
-        focusObserver.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

@@ -95,7 +95,13 @@ public struct SystemProcessScanner: ProcessScanning {
             previousAssignments: assignmentMemory.assignments()
         )
         assignmentMemory.remember(matched)
-        return nonGhosttyProcesses + matched
+        let matchedByKey = Dictionary(
+            uniqueKeysWithValues: matched.map { (GhosttySessionMatcher.assignmentKey(for: $0), $0) }
+        )
+        let unresolvedGhosttyProcesses = ghosttyProcesses.filter {
+            matchedByKey[GhosttySessionMatcher.assignmentKey(for: $0)] == nil
+        }
+        return nonGhosttyProcesses + matched + unresolvedGhosttyProcesses
     }
 
     /// Lists every process ID visible to this user via libproc, without
@@ -374,8 +380,17 @@ public struct SystemProcessScanner: ProcessScanning {
     static func queryGhosttyTerminals() throws -> [GhosttyTerminal] {
         let script = """
         const app = Application("Ghostty");
+        function optionalProperty(terminal, name) {
+          try {
+            if (typeof terminal[name] !== "function") return null;
+            return terminal[name]();
+          } catch (_) {
+            return null;
+          }
+        }
         JSON.stringify(app.terminals().map(t => ({
-          id: t.id(), name: t.name(), cwd: t.workingDirectory()
+          id: t.id(), name: t.name(), cwd: t.workingDirectory(),
+          pid: optionalProperty(t, "pid"), tty: optionalProperty(t, "tty")
         })))
         """
         let result = try Self.run(

@@ -4,16 +4,24 @@ import Darwin
 public enum StateRepositoryError: Error, Equatable, Sendable {
     case insecureDirectory
     case enrichmentTooLarge
+    case ownershipIndexTooLarge
+    case invalidOwnershipIndex
     case sessionIdentifierTooLong
 }
 
 package struct StateSnapshot: Sendable {
     package fileprivate(set) var sessions: [AgentSession]
     fileprivate var lifecycleSessions: [AgentSession]
+    fileprivate let convoyOwnedOpenCodeSessionIDs: Set<String>
 
     fileprivate mutating func upsert(lifecycle: AgentSession, merged: AgentSession) {
         upsert(lifecycle, in: &lifecycleSessions)
-        upsert(merged, in: &sessions)
+        if merged.tool == .opencode,
+           convoyOwnedOpenCodeSessionIDs.contains(merged.sessionID) {
+            sessions.removeAll { $0.id == merged.id }
+        } else {
+            upsert(merged, in: &sessions)
+        }
     }
 
     private func upsert(_ session: AgentSession, in sessions: inout [AgentSession]) {
@@ -27,6 +35,18 @@ package struct StateSnapshot: Sendable {
     fileprivate mutating func remove(_ session: AgentSession) {
         sessions.removeAll { $0.id == session.id }
         lifecycleSessions.removeAll { $0.id == session.id }
+    }
+}
+
+private struct ConvoyOpenCodeOwnershipDocument: Codable, Equatable {
+    static let currentSchemaVersion = 1
+
+    let schemaVersion: Int
+    let sessionIDs: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case sessionIDs = "session_ids"
     }
 }
 
@@ -73,9 +93,12 @@ private struct TerminalEnrichmentDocument: Codable, Equatable {
 public struct StateRepository: Sendable {
     private static let maximumStateFileSize = 1_048_576
     private static let maximumEnrichmentFileSize = 16_384
+    private static let maximumOwnershipIndexFileSize = 16 * 1_048_576
+    private static let maximumOwnershipEntryCount = 65_536
     private static let maximumSessionIdentifierBytes = 128
     private static let enrichmentFilePrefix = "enrichment-"
     private static let enrichmentFileExtension = "overlay"
+    private static let convoyOwnershipFileName = "convoy-opencode-ownership.index"
     public let directoryURL: URL
     private let materializationObserver: (@Sendable () -> Void)?
     private let reloadObserver: (@Sendable () throws -> Void)?
@@ -132,8 +155,15 @@ public struct StateRepository: Sendable {
                 includingPropertiesForKeys: nil
             )
         } catch CocoaError.fileReadNoSuchFile {
-            return StateSnapshot(sessions: [], lifecycleSessions: [])
+            return StateSnapshot(
+                sessions: [],
+                lifecycleSessions: [],
+                convoyOwnedOpenCodeSessionIDs: []
+            )
         }
+        let convoyOwnedOpenCodeSessionIDs = mergingEnrichments
+            ? try loadConvoyOwnedOpenCodeSessionIDs()
+            : []
         var lifecycleSessions: [AgentSession] = []
         for fileURL in fileURLs where fileURL.pathExtension == "json" {
             do {
@@ -146,7 +176,8 @@ public struct StateRepository: Sendable {
         guard mergingEnrichments else {
             return StateSnapshot(
                 sessions: lifecycleSessions,
-                lifecycleSessions: lifecycleSessions
+                lifecycleSessions: lifecycleSessions,
+                convoyOwnedOpenCodeSessionIDs: convoyOwnedOpenCodeSessionIDs
             )
         }
 
@@ -177,7 +208,14 @@ public struct StateRepository: Sendable {
                 pruneEnrichmentFile(at: fileURL)
             }
         }
-        return StateSnapshot(sessions: sessions, lifecycleSessions: lifecycleSessions)
+        return StateSnapshot(
+            sessions: sessions.filter {
+                $0.tool != .opencode
+                    || !convoyOwnedOpenCodeSessionIDs.contains($0.sessionID)
+            },
+            lifecycleSessions: lifecycleSessions,
+            convoyOwnedOpenCodeSessionIDs: convoyOwnedOpenCodeSessionIDs
+        )
     }
 
     package func reload(
@@ -237,9 +275,133 @@ public struct StateRepository: Sendable {
 
     public func save(_ session: AgentSession) throws {
         var snapshot = session.source == .reaper
-            ? StateSnapshot(sessions: [], lifecycleSessions: [])
+            ? StateSnapshot(
+                sessions: [],
+                lifecycleSessions: [],
+                convoyOwnedOpenCodeSessionIDs: try loadConvoyOwnedOpenCodeSessionIDs()
+            )
             : try loadSnapshot()
         try save(session, updating: &snapshot)
+    }
+
+    /// Convoy owns every OpenCode phase session named in its run metadata.
+    /// Keep that ownership as an app-owned projection instead of deleting the
+    /// plugin's lifecycle document: the plugin can rewrite its file at any
+    /// time, while an exact session ID remains owned for its whole lifetime.
+    @discardableResult
+    package func mergeConvoyOwnedOpenCodeSessionIDs(
+        _ sessionIDs: Set<String>,
+        allowingInvalidIndexRepair: Bool = false
+    ) throws -> Bool {
+        try validateOwnershipSessionIDs(sessionIDs)
+        try prepareDirectory()
+        let existing: Set<String>
+        let repairsInvalidIndex: Bool
+        do {
+            existing = try loadConvoyOwnedOpenCodeSessionIDs()
+            repairsInvalidIndex = false
+        } catch StateRepositoryError.invalidOwnershipIndex {
+            guard allowingInvalidIndexRepair, ownershipIndexCanBeReplaced() else {
+                throw StateRepositoryError.invalidOwnershipIndex
+            }
+            // The inventory is a complete scan of durable Convoy metadata, so
+            // an invalid app-owned regular file can be rebuilt safely. Never
+            // replace a link, directory, FIFO, or file owned by another user.
+            existing = []
+            repairsInvalidIndex = true
+        }
+        let combined = existing.union(sessionIDs)
+        guard repairsInvalidIndex || combined != existing else { return false }
+        guard combined.count <= Self.maximumOwnershipEntryCount else {
+            throw StateRepositoryError.ownershipIndexTooLarge
+        }
+        let document = ConvoyOpenCodeOwnershipDocument(
+            schemaVersion: ConvoyOpenCodeOwnershipDocument.currentSchemaVersion,
+            sessionIDs: combined.sorted()
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(document)
+        guard data.count <= Self.maximumOwnershipIndexFileSize else {
+            throw StateRepositoryError.ownershipIndexTooLarge
+        }
+        let destinationURL = directoryURL.appendingPathComponent(Self.convoyOwnershipFileName)
+        let temporaryURL = directoryURL.appendingPathComponent(".\(UUID().uuidString).ownership.tmp")
+        try data.write(to: temporaryURL)
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: temporaryURL.path
+        )
+        guard Darwin.rename(temporaryURL.path, destinationURL.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        StateChangeNotifier.post()
+        return true
+    }
+
+    private func ownershipIndexCanBeReplaced() -> Bool {
+        let fileURL = directoryURL.appendingPathComponent(Self.convoyOwnershipFileName)
+        var metadata = stat()
+        guard Darwin.lstat(fileURL.path, &metadata) == 0 else { return false }
+        return metadata.st_mode & S_IFMT == S_IFREG && metadata.st_uid == getuid()
+    }
+
+    private func loadConvoyOwnedOpenCodeSessionIDs() throws -> Set<String> {
+        let fileURL = directoryURL.appendingPathComponent(Self.convoyOwnershipFileName)
+        let data: Data
+        do {
+            data = try secureData(
+                at: fileURL,
+                maximumSize: Self.maximumOwnershipIndexFileSize,
+                requiredPermissions: 0o600
+            )
+        } catch let error as POSIXError where error.code == .ENOENT {
+            return []
+        } catch StateRepositoryError.insecureDirectory {
+            // Wrong mode/size on an owner-controlled regular app file is
+            // explicit corruption and can be rebuilt from a complete Convoy
+            // inventory. A stable-looking file that merely changed while it
+            // was read remains a transient I/O failure and is never replaced.
+            var metadata = stat()
+            guard Darwin.lstat(fileURL.path, &metadata) == 0,
+                  metadata.st_mode & S_IFMT == S_IFREG,
+                  metadata.st_uid == getuid() else {
+                throw StateRepositoryError.insecureDirectory
+            }
+            if metadata.st_mode & 0o7777 != 0o600
+                || metadata.st_size < 0
+                || metadata.st_size > Self.maximumOwnershipIndexFileSize {
+                throw StateRepositoryError.invalidOwnershipIndex
+            }
+            throw StateRepositoryError.insecureDirectory
+        }
+        let document: ConvoyOpenCodeOwnershipDocument
+        do {
+            document = try JSONDecoder().decode(ConvoyOpenCodeOwnershipDocument.self, from: data)
+        } catch {
+            throw StateRepositoryError.invalidOwnershipIndex
+        }
+        guard document.schemaVersion == ConvoyOpenCodeOwnershipDocument.currentSchemaVersion,
+              document.sessionIDs.count <= Self.maximumOwnershipEntryCount else {
+            throw StateRepositoryError.invalidOwnershipIndex
+        }
+        let sessionIDs = Set(document.sessionIDs)
+        guard sessionIDs.count == document.sessionIDs.count else {
+            throw StateRepositoryError.invalidOwnershipIndex
+        }
+        try validateOwnershipSessionIDs(sessionIDs)
+        return sessionIDs
+    }
+
+    private func validateOwnershipSessionIDs(_ sessionIDs: Set<String>) throws {
+        guard sessionIDs.count <= Self.maximumOwnershipEntryCount,
+              sessionIDs.allSatisfy({
+                  let count = $0.utf8.count
+                  return count > 0 && count <= Self.maximumSessionIdentifierBytes
+              }) else {
+            throw StateRepositoryError.invalidOwnershipIndex
+        }
     }
 
     package func save(_ session: AgentSession, updating snapshot: inout StateSnapshot) throws {

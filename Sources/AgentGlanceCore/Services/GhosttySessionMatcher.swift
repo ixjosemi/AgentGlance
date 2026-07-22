@@ -4,11 +4,21 @@ public struct GhosttyTerminal: Codable, Equatable, Sendable {
     public let id: String
     public let name: String
     public let cwd: String
+    public let pid: Int32?
+    public let tty: String?
 
-    public init(id: String, name: String, cwd: String) {
+    public init(
+        id: String,
+        name: String,
+        cwd: String,
+        pid: Int32? = nil,
+        tty: String? = nil
+    ) {
         self.id = id
         self.name = name
         self.cwd = cwd
+        self.pid = pid
+        self.tty = tty
     }
 }
 
@@ -79,6 +89,18 @@ public enum GhosttySessionMatcher {
         in terminals: [GhosttyTerminal],
         rememberedTerminalID: String?
     ) -> Int? {
+        let sameProcess = terminals.indices.filter {
+            terminals[$0].pid == process.processID
+        }
+        if sameProcess.count == 1 {
+            return sameProcess[0]
+        }
+        if let tty = process.terminal.tty {
+            let sameTTY = terminals.indices.filter { terminals[$0].tty == tty }
+            if sameTTY.count == 1 {
+                return sameTTY[0]
+            }
+        }
         if let rememberedTerminalID,
            let rememberedIndex = terminals.firstIndex(where: { $0.id == rememberedTerminalID }) {
             return rememberedIndex

@@ -956,6 +956,43 @@ func testReaperAdoptsScannedGhosttyTerminalForNativeSession() throws {
     )
 }
 
+func testReaperAdoptsControllingTTYWithoutGhosttySurface() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let processID = Int32(getpid())
+    let processIdentity = try SystemProcessScanner.processIdentity(of: processID)
+        .unwrap(or: "test process identity unavailable")
+    try repository.save(AgentSession(
+        tool: .opencode,
+        sessionID: "tty-only-native",
+        pid: processID,
+        processIdentity: processIdentity,
+        status: .working,
+        cwd: "/tmp/tty-only",
+        startedAt: Date(),
+        updatedAt: Date(),
+        terminal: TerminalContext(termProgram: "ghostty")
+    ))
+    let process = DetectedAgentProcess(
+        tool: .opencode,
+        processID: processID,
+        processIdentity: processIdentity,
+        cwd: "/tmp/tty-only",
+        terminal: TerminalContext(termProgram: "ghostty", tty: "/dev/ttys046")
+    )
+
+    _ = try ReaperService(repository: repository).reap(detected: [process])
+
+    let session = try repository.loadSessions().first.unwrap(or: "native session disappeared")
+    try expect(
+        session.terminal.tty,
+        equals: "/dev/ttys046",
+        "controlling TTY remains available when Ghostty cannot enumerate a surface"
+    )
+}
+
 func testTerminalEnrichmentPreservesConcurrentLifecycleWrite() throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1377,7 +1414,17 @@ func testTerminalEnrichmentPreservesLiveFallbackWhenGhosttyOmitsProcess() throws
     )
     let scanner = SystemProcessScanner(ghosttyTerminalSource: { [] })
     let enriched = scanner.enrichTerminalContexts(in: [liveProcess])
-    try expect(enriched.isEmpty, equals: true, "failed Ghostty match omits enrichment")
+    try expect(enriched.count, equals: 1, "failed Ghostty match preserves basic process context")
+    try expect(
+        enriched.first?.terminal.ghosttyTerminalID,
+        equals: nil,
+        "failed Ghostty match fabricates no surface ID"
+    )
+    try expect(
+        enriched.first?.terminal.tty,
+        equals: "/dev/ttys001",
+        "failed Ghostty match retains controlling TTY"
+    )
 
     let reaper = ReaperService(repository: repository)
     _ = try reaper.reap(detected: [liveProcess])
@@ -1625,13 +1672,15 @@ func testObservationSchedulerMaterializesStateOncePerTick() throws {
     scheduler.requestTick()
 
     let deadline = Date().addingTimeInterval(2)
-    while FileManager.default.fileExists(atPath: phaseStateURL.path), Date() < deadline {
+    while (try StateRepository(directoryURL: stateDirectoryURL).loadSessions())
+        .contains(where: { $0.tool == .opencode }), Date() < deadline {
         usleep(1_000)
     }
+    scheduler.waitUntilIdle()
     try expect(
         FileManager.default.fileExists(atPath: phaseStateURL.path),
-        equals: false,
-        "tick completed Convoy phase suppression"
+        equals: true,
+        "tick keeps the producer-owned Convoy phase lifecycle document"
     )
     try expect(
         counter.materializationCount,
@@ -1680,8 +1729,13 @@ final class StartupOrderingProcessScanner: ProcessScanning, @unchecked Sendable 
     let recurringScanStarted = DispatchSemaphore(value: 0)
 
     private let lock = NSLock()
+    private let detected: [DetectedAgentProcess]
     private var count = 0
     private var firstScanWasOnMain = false
+
+    init(_ detected: [DetectedAgentProcess] = []) {
+        self.detected = detected
+    }
 
     func activeProcesses() throws -> [DetectedAgentProcess] {
         try basicActiveProcesses()
@@ -1702,7 +1756,7 @@ final class StartupOrderingProcessScanner: ProcessScanning, @unchecked Sendable 
         } else {
             recurringScanStarted.signal()
         }
-        return []
+        return detected
     }
 
     var scanCount: Int {
@@ -4042,7 +4096,11 @@ func testCodexSessionsWatcherResavesWhenProcessAppearsLater() throws {
             processID: processID,
             processIdentity: processIdentity,
             cwd: session.cwd,
-            terminal: TerminalContext()
+            terminal: TerminalContext(
+                termProgram: "ghostty",
+                ghosttyTerminalID: "codex-surface",
+                tty: "/dev/ttys045"
+            )
         )
     }
     try watcher.scan()
@@ -4051,6 +4109,15 @@ func testCodexSessionsWatcherResavesWhenProcessAppearsLater() throws {
     try expect(session.sessionID, equals: "codex-late", "published session identity")
     try expect(session.pid, equals: Int32(getpid()), "session adopts the resolved pid")
     try expect(session.processIdentity, equals: processIdentity, "session adopts the resolved generation")
+    try expect(
+        session.terminal,
+        equals: TerminalContext(
+            termProgram: "ghostty",
+            ghosttyTerminalID: "codex-surface",
+            tty: "/dev/ttys045"
+        ),
+        "session adopts the resolved terminal context"
+    )
 }
 
 func testCodexSessionsWatcherSkipsDateDirectoriesOutsideWindow() throws {
@@ -4871,7 +4938,11 @@ func testConvoyWatcherRejectsUnsafeMetadataFileTypesAndSizes() throws {
         "startedAt": \(Int(serverStartedAt.timeIntervalSince1970 * 1000))
       },
       "phases": {
-        "implementer": { "status": "running", "startedAt": \(Int(serverStartedAt.timeIntervalSince1970 * 1000)) }
+        "implementer": {
+          "status": "running",
+          "startedAt": \(Int(serverStartedAt.timeIntervalSince1970 * 1000)),
+          "sessionID": "ses_unsafe"
+        }
       }
     }
     """
@@ -4895,15 +4966,41 @@ func testConvoyWatcherRejectsUnsafeMetadataFileTypesAndSizes() throws {
     var oversizedMetadata = Data(validMetadata.utf8)
     oversizedMetadata.append(Data(repeating: 0x20, count: BoundedInput.maximumPayloadSize + 1 - oversizedMetadata.count))
     try oversizedMetadata.write(to: oversizedRun.appendingPathComponent("metadata.json"))
+    let fifoRun = runsDirectoryURL.appendingPathComponent("fifo", isDirectory: true)
+    try FileManager.default.createDirectory(at: fifoRun, withIntermediateDirectories: true)
+    guard Darwin.mkfifo(fifoRun.appendingPathComponent("metadata.json").path, 0o600) == 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    let insecureDirectoryRun = runsDirectoryURL.appendingPathComponent("insecure-directory", isDirectory: true)
+    try FileManager.default.createDirectory(at: insecureDirectoryRun, withIntermediateDirectories: true)
+    try Data(validMetadata.utf8).write(to: insecureDirectoryRun.appendingPathComponent("metadata.json"))
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o777],
+        ofItemAtPath: insecureDirectoryRun.path
+    )
+    let insecureFileRun = runsDirectoryURL.appendingPathComponent("insecure-file", isDirectory: true)
+    try FileManager.default.createDirectory(at: insecureFileRun, withIntermediateDirectories: true)
+    let insecureMetadataURL = insecureFileRun.appendingPathComponent("metadata.json")
+    try Data(validMetadata.utf8).write(to: insecureMetadataURL)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o666],
+        ofItemAtPath: insecureMetadataURL.path
+    )
+    try repository.save(AgentSession.decode(from: validStateJSON(
+        sessionID: "ses_unsafe",
+        status: "working",
+        pid: Int32(getpid()),
+        tool: "opencode"
+    )))
 
     try ConvoyRunsWatcher(runsDirectoryURL: runsDirectoryURL, repository: repository).scan(
         detected: [detectedConvoyProcess(elapsedSeconds: Date().timeIntervalSince(serverStartedAt) + 60)]
     )
 
     try expect(
-        try repository.loadSessions().isEmpty,
-        equals: true,
-        "unsafe Convoy metadata cannot publish a session"
+        try repository.loadSessions().map(\.sessionID),
+        equals: ["ses_unsafe"],
+        "unsafe Convoy metadata cannot publish ownership or a run"
     )
 }
 
@@ -4911,7 +5008,8 @@ func testConvoyWatcherSuppressesPipelineOwnedOpenCodeSessions() throws {
     // Convoy phases run as OpenCode sessions on convoy's embedded server;
     // if that server loads the AgentGlance plugin, each phase would also
     // surface as a standalone OpenCode row next to the pipeline it belongs
-    // to. The run metadata names those session IDs, so they are removed.
+    // to. The run metadata names those session IDs, so the repository hides
+    // them without deleting the plugin-owned lifecycle documents.
     let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
     defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
     let repository = StateRepository(directoryURL: stateDirectoryURL)
@@ -4939,6 +5037,417 @@ func testConvoyWatcherSuppressesPipelineOwnedOpenCodeSessions() throws {
         .filter { $0.tool == .opencode }
         .map(\.sessionID)
     try expect(opencodeSessionIDs, equals: ["ses_unrelated"], "same-cwd native session survives")
+    try expect(
+        Set(try repository.loadLifecycleSessions()
+            .filter { $0.tool == .opencode }
+            .map(\.sessionID)),
+        equals: ["ses_security", "ses_unrelated"],
+        "Convoy ownership does not delete native producer state"
+    )
+}
+
+func testStateRepositoryKeepsConvoyOwnedOpenCodeHiddenAfterProducerRewrite() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let owned = try AgentSession.decode(from: validStateJSON(
+        sessionID: "ses_convoy_owned",
+        status: "working",
+        pid: Int32(getpid()),
+        tool: "opencode",
+        cwd: "/tmp/shared-target"
+    ))
+    let independent = try AgentSession.decode(from: validStateJSON(
+        sessionID: "ses_independent",
+        status: "idle",
+        pid: Int32(getpid()),
+        tool: "opencode",
+        cwd: "/tmp/shared-target"
+    ))
+    try repository.save(owned)
+    try repository.save(independent)
+    let ownershipURL = directory.appendingPathComponent("convoy-opencode-ownership.index")
+    try Data(
+        #"{"schema_version":1,"session_ids":["ses_convoy_owned"]}"#.utf8
+    ).write(to: ownershipURL)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o600],
+        ofItemAtPath: ownershipURL.path
+    )
+
+    try expect(
+        try repository.loadSessions().map(\.sessionID),
+        equals: ["ses_independent"],
+        "ownership projection hides only the exact Convoy session ID"
+    )
+
+    try validStateJSON(
+        sessionID: "ses_convoy_owned",
+        status: "needs_attention",
+        pid: Int32(getpid()),
+        tool: "opencode",
+        cwd: "/tmp/shared-target"
+    ).writeAtomically(to: directory.appendingPathComponent("opencode-c2VzX2NvbnZveV9vd25lZA.json"))
+
+    try expect(
+        try repository.loadSessions().map(\.sessionID),
+        equals: ["ses_independent"],
+        "producer rewrite cannot republish a Convoy-owned session"
+    )
+    try expect(
+        Set(try repository.loadLifecycleSessions().map(\.sessionID)),
+        equals: ["ses_convoy_owned", "ses_independent"],
+        "raw lifecycle documents remain intact"
+    )
+}
+
+func testConvoyOwnershipIndexRejectsLinksAndFIFOsWithoutBlocking() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let directory = root.appendingPathComponent("state", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let repository = StateRepository(directoryURL: directory)
+    let ownershipURL = directory.appendingPathComponent("convoy-opencode-ownership.index")
+    let externalURL = root.appendingPathComponent("external.index")
+    try Data(#"{"schema_version":1,"session_ids":["ses_external"]}"#.utf8)
+        .write(to: externalURL)
+    try FileManager.default.createSymbolicLink(
+        at: ownershipURL,
+        withDestinationURL: externalURL
+    )
+
+    do {
+        _ = try repository.loadSessions()
+        throw TestFailure.expectation("symlinked ownership index was accepted")
+    } catch is TestFailure {
+        throw TestFailure.expectation("symlinked ownership index was accepted")
+    } catch {
+        // Expected: app-owned policy is never read through a link.
+    }
+    do {
+        _ = try repository.mergeConvoyOwnedOpenCodeSessionIDs(["ses_safe"])
+        throw TestFailure.expectation("symlinked ownership index was replaced")
+    } catch is TestFailure {
+        throw TestFailure.expectation("symlinked ownership index was replaced")
+    } catch {
+        // Expected: recovery only replaces an owner-controlled regular file.
+    }
+
+    try FileManager.default.removeItem(at: ownershipURL)
+    guard Darwin.mkfifo(ownershipURL.path, 0o600) == 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    let startedAt = Date()
+    do {
+        _ = try repository.loadSessions()
+        throw TestFailure.expectation("FIFO ownership index was accepted")
+    } catch is TestFailure {
+        throw TestFailure.expectation("FIFO ownership index was accepted")
+    } catch {
+        // Expected: O_NONBLOCK plus file-type validation rejects immediately.
+    }
+    try expect(
+        Date().timeIntervalSince(startedAt) < 1,
+        equals: true,
+        "FIFO ownership index rejected without blocking"
+    )
+}
+
+func testCorruptOwnershipIndexWaitsForCompleteMetadataInventory() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    try repository.prepareDirectory()
+    let ownershipURL = stateDirectoryURL.appendingPathComponent("convoy-opencode-ownership.index")
+    let corruptData = Data("truncated".utf8)
+    try corruptData.write(to: ownershipURL)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o600],
+        ofItemAtPath: ownershipURL.path
+    )
+    let incompleteRun = runsDirectoryURL.appendingPathComponent("incomplete", isDirectory: true)
+    try FileManager.default.createDirectory(at: incompleteRun, withIntermediateDirectories: true)
+    guard Darwin.mkfifo(incompleteRun.appendingPathComponent("metadata.json").path, 0o600) == 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    let watcher = ConvoyRunsWatcher(runsDirectoryURL: runsDirectoryURL, repository: repository)
+
+    do {
+        try watcher.refreshOpenCodeOwnershipIndex()
+        throw TestFailure.expectation("partial metadata inventory rebuilt a corrupt ownership index")
+    } catch is TestFailure {
+        throw TestFailure.expectation("partial metadata inventory rebuilt a corrupt ownership index")
+    } catch {
+        // Expected: fail closed until a complete inventory can rebuild it.
+    }
+    try expect(
+        try Data(contentsOf: ownershipURL),
+        equals: corruptData,
+        "incomplete inventory leaves the previous policy file untouched"
+    )
+}
+
+func testConvoyOwnershipWatchersAreBounded() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    for index in 0..<100 {
+        try FileManager.default.createDirectory(
+            at: runsDirectoryURL.appendingPathComponent(
+                String(format: "20260722-%06d-pending", index),
+                isDirectory: true
+            ),
+            withIntermediateDirectories: true
+        )
+    }
+    let watcher = ConvoyRunsWatcher(
+        runsDirectoryURL: runsDirectoryURL,
+        repository: StateRepository(directoryURL: stateDirectoryURL)
+    )
+
+    try watcher.refreshOpenCodeOwnershipIndex()
+
+    try expect(
+        watcher.ownershipWatchDirectoryURLs.count,
+        equals: ConvoyRunsWatcher.maximumOwnershipWatchDirectoryCount,
+        "pending Convoy runs cannot exhaust file descriptors"
+    )
+}
+
+func testInitialReconciliationIndexesServerlessConvoyOwnership() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    for sessionID in ["ses_old_phase", "ses_new_phase", "ses_independent"] {
+        try repository.save(AgentSession.decode(from: validStateJSON(
+            sessionID: sessionID,
+            status: "working",
+            pid: Int32(getpid()),
+            tool: "opencode",
+            cwd: "/tmp/shared-target"
+        )))
+    }
+    for (runID, sessionID) in [
+        ("20260720-101010-old", "ses_old_phase"),
+        ("20260722-101010-new", "ses_new_phase"),
+        ("20260722-101010-invalid", String(repeating: "x", count: 129)),
+    ] {
+        let runDirectory = runsDirectoryURL.appendingPathComponent(runID, isDirectory: true)
+        try FileManager.default.createDirectory(at: runDirectory, withIntermediateDirectories: true)
+        let metadata = """
+        {
+          "schemaVersion": 2,
+          "runID": "\(runID)",
+          "targetDir": "/tmp/shared-target",
+          "createdAt": 1784700000000,
+          "updatedAt": 1784700001000,
+          "phases": {
+            "implementer": {
+              "status": "completed",
+              "sessionID": "\(sessionID)"
+            }
+          }
+        }
+        """
+        try Data(metadata.utf8).write(to: runDirectory.appendingPathComponent("metadata.json"))
+    }
+    let ownershipURL = stateDirectoryURL.appendingPathComponent("convoy-opencode-ownership.index")
+    try Data("truncated".utf8).write(to: ownershipURL)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o600],
+        ofItemAtPath: ownershipURL.path
+    )
+    let scheduler = ObservationScheduler(
+        repository: repository,
+        processScanner: TestProcessScanner([]),
+        codexSessionsDirectoryURL: stateDirectoryURL.appendingPathComponent("codex", isDirectory: true),
+        convoyRunsDirectoryURL: runsDirectoryURL,
+        debounceInterval: 0.01
+    )
+    defer {
+        scheduler.stop()
+        scheduler.waitUntilIdle()
+    }
+    let completion = StartupCompletionProbe()
+
+    scheduler.startWithInitialReconciliation { completion.record() }
+
+    let deadline = Date().addingTimeInterval(2)
+    while !completion.completionRan, Date() < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+    }
+    try expect(completion.completionRan, equals: true, "serverless ownership bootstrap completed")
+    try expect(
+        try repository.loadSessions().map(\.sessionID),
+        equals: ["ses_independent"],
+        "cold start indexes every historical Convoy phase without a live server"
+    )
+    try expect(
+        Set(try repository.loadLifecycleSessions().map(\.sessionID)),
+        equals: ["ses_old_phase", "ses_new_phase", "ses_independent"],
+        "cold-start ownership does not delete producer state"
+    )
+    let ownershipMode = try FileManager.default.attributesOfItem(
+        atPath: ownershipURL.path
+    )[.posixPermissions] as? NSNumber
+    try expect(ownershipMode?.intValue, equals: 0o600, "ownership index permissions")
+}
+
+func testInitialReconciliationWatchesLiveConvoyOwnershipBeforeBaseline() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    let opencodeProcessID = Int32(getppid())
+    try repository.save(AgentSession.decode(from: validStateJSON(
+        sessionID: "ses_late_phase",
+        status: "working",
+        pid: opencodeProcessID,
+        tool: "opencode",
+        cwd: "/tmp/convoy-target"
+    )))
+    let runID = "20260722-202020-watched"
+    let serverStartedAt = Date().addingTimeInterval(-60)
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: runID,
+        serverPid: Int32(getpid()),
+        serverStartedAt: serverStartedAt,
+        phases: [("first", "running", "ses_first_phase")]
+    )
+    let opencodeProcess = DetectedAgentProcess(
+        tool: .opencode,
+        processID: opencodeProcessID,
+        cwd: "/tmp/convoy-target",
+        terminal: TerminalContext()
+    )
+    let scheduler = ObservationScheduler(
+        repository: repository,
+        processScanner: TestProcessScanner([detectedConvoyProcess(), opencodeProcess]),
+        codexSessionsDirectoryURL: stateDirectoryURL.appendingPathComponent("codex", isDirectory: true),
+        convoyRunsDirectoryURL: runsDirectoryURL,
+        heartbeatInterval: 60,
+        debounceInterval: 0.01
+    )
+    defer {
+        scheduler.stop()
+        scheduler.waitUntilIdle()
+    }
+    let completion = StartupCompletionProbe()
+    scheduler.startWithInitialReconciliation { completion.record() }
+    var deadline = Date().addingTimeInterval(2)
+    while !completion.completionRan, Date() < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+    }
+    try expect(completion.completionRan, equals: true, "live ownership baseline completed")
+    // Let the normal startup tick drain, then rely only on the per-run vnode
+    // source; the heartbeat is deliberately too far away to help this test.
+    RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+    scheduler.waitUntilIdle()
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: runID,
+        serverPid: Int32(getpid()),
+        serverStartedAt: serverStartedAt,
+        phases: [
+            ("first", "completed", "ses_first_phase"),
+            ("late", "running", "ses_late_phase"),
+        ]
+    )
+    let metadataURL = runsDirectoryURL
+        .appendingPathComponent(runID, isDirectory: true)
+        .appendingPathComponent("metadata.json")
+    try Data(contentsOf: metadataURL).writeAtomically(to: metadataURL)
+
+    deadline = Date().addingTimeInterval(2)
+    while (try repository.loadSessions()).contains(where: {
+        $0.tool == .opencode && $0.sessionID == "ses_late_phase"
+    }), Date() < deadline {
+        usleep(10_000)
+    }
+    try expect(
+        (try repository.loadSessions()).contains(where: { $0.sessionID == "ses_late_phase" }),
+        equals: false,
+        "live run watcher indexes a newly persisted phase before the heartbeat"
+    )
+}
+
+func testInitialBaselineWaitsForConcurrentConvoyMetadata() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    let opencodeProcessID = Int32(getppid())
+    try repository.save(AgentSession.decode(from: validStateJSON(
+        sessionID: "ses_during_startup",
+        status: "working",
+        pid: opencodeProcessID,
+        tool: "opencode",
+        cwd: "/tmp/convoy-target"
+    )))
+    let runID = "20260722-212121-startup-race"
+    let serverStartedAt = Date().addingTimeInterval(-60)
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: runID,
+        serverPid: Int32(getpid()),
+        serverStartedAt: serverStartedAt,
+        phases: [("first", "running", "ses_first")]
+    )
+    let scanner = StartupOrderingProcessScanner([
+        detectedConvoyProcess(),
+        DetectedAgentProcess(
+            tool: .opencode,
+            processID: opencodeProcessID,
+            cwd: "/tmp/convoy-target",
+            terminal: TerminalContext()
+        ),
+    ])
+    let scheduler = ObservationScheduler(
+        repository: repository,
+        processScanner: scanner,
+        codexSessionsDirectoryURL: stateDirectoryURL.appendingPathComponent("codex", isDirectory: true),
+        convoyRunsDirectoryURL: runsDirectoryURL,
+        heartbeatInterval: 60,
+        debounceInterval: 0.02
+    )
+    defer {
+        scanner.releaseBaseline.signal()
+        scheduler.stop()
+        scheduler.waitUntilIdle()
+    }
+    let completion = StartupCompletionProbe()
+    scheduler.startWithInitialReconciliation { completion.record() }
+    guard scanner.baselineStarted.wait(timeout: .now() + 2) == .success else {
+        throw TestFailure.expectation("startup process scan never blocked")
+    }
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: runID,
+        serverPid: Int32(getpid()),
+        serverStartedAt: serverStartedAt,
+        phases: [
+            ("first", "completed", "ses_first"),
+            ("late", "running", "ses_during_startup"),
+        ]
+    )
+    let metadataURL = runsDirectoryURL
+        .appendingPathComponent(runID, isDirectory: true)
+        .appendingPathComponent("metadata.json")
+    try Data(contentsOf: metadataURL).writeAtomically(to: metadataURL)
+    scanner.releaseBaseline.signal()
+
+    let deadline = Date().addingTimeInterval(2)
+    while !completion.completionRan, Date() < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+    }
+    try expect(completion.completionRan, equals: true, "quiet startup baseline completed")
+    try expect(
+        (try repository.loadSessions()).contains(where: {
+            $0.tool == .opencode && $0.sessionID == "ses_during_startup"
+        }),
+        equals: false,
+        "metadata delivered during reconciliation is indexed before baseline"
+    )
 }
 
 func testConvoyWatcherSuppressesEmbeddedServerReaperFallbackByDirectory() throws {
@@ -4998,6 +5507,187 @@ func testFocusPlannerPrioritizesTmuxThenTerminal() throws {
     }) else {
         throw TestFailure.expectation("Ghostty focus action is missing")
     }
+}
+
+func testFocusPlannerRequiresOneExactGhosttyTarget() throws {
+    let session = AgentSession(
+        tool: .opencode,
+        sessionID: "ghostty-exact",
+        pid: 42,
+        status: .working,
+        cwd: "/tmp/project",
+        startedAt: Date(),
+        updatedAt: Date(),
+        terminal: TerminalContext(
+            termProgram: "ghostty",
+            ghosttyTerminalID: "surface-42",
+            tty: "/dev/ttys042",
+            windowTitleHint: "project — opencode"
+        )
+    )
+
+    let actions = try FocusPlanner.actions(for: session)
+    guard case let .appleScript(script)? = actions.last else {
+        throw TestFailure.expectation("Ghostty focus did not produce AppleScript")
+    }
+    try expect(
+        script.contains("if (count of matches) is not 1 then error"),
+        equals: true,
+        "Ghostty rejects missing or ambiguous targets"
+    )
+    try expect(
+        script.contains("if (count of matches) > 0 then focus item 1 of matches"),
+        equals: false,
+        "Ghostty no longer reports activation-only as exact focus"
+    )
+    try expect(
+        script.contains("working directory") || script.contains("whose tty"),
+        equals: false,
+        "stale strong Ghostty identity never falls back to another tab"
+    )
+}
+
+func testFocusPlannerNormalizesITermIdentityAndSelectsItsWindow() throws {
+    let session = AgentSession(
+        tool: .claude,
+        sessionID: "iterm-exact",
+        pid: 43,
+        status: .idle,
+        cwd: "/tmp/project",
+        startedAt: Date(),
+        updatedAt: Date(),
+        terminal: TerminalContext(
+            termProgram: "iTerm.app",
+            itermSessionID: "w0t1p2:ABC-123",
+            tty: "/dev/ttys043"
+        )
+    )
+
+    let actions = try FocusPlanner.actions(for: session)
+    guard case let .appleScript(script)? = actions.last else {
+        throw TestFailure.expectation("iTerm focus did not produce AppleScript")
+    }
+    try expect(
+        script.contains("unique ID of aSession is \"ABC-123\""),
+        equals: true,
+        "iTerm compares its normalized GUID exactly"
+    )
+    try expect(script.contains("select targetSession"), equals: true, "iTerm selects the split")
+    try expect(script.contains("select targetTab"), equals: true, "iTerm selects the tab")
+    try expect(script.contains("select targetWindow"), equals: true, "iTerm raises the window")
+    try expect(
+        script.contains("if matchCount is not 1 then error"),
+        equals: true,
+        "iTerm rejects missing or ambiguous targets"
+    )
+}
+
+func testFocusPlannerRejectsEmptyITermIdentityWithoutTTY() throws {
+    let session = AgentSession(
+        tool: .claude,
+        sessionID: "iterm-missing",
+        pid: 45,
+        status: .idle,
+        cwd: "/tmp/project",
+        startedAt: Date(),
+        updatedAt: Date(),
+        terminal: TerminalContext(
+            termProgram: "iTerm.app",
+            itermSessionID: "w0t0p0:"
+        )
+    )
+
+    do {
+        _ = try FocusPlanner.actions(for: session)
+        throw TestFailure.expectation("empty iTerm identity produced an activation-only plan")
+    } catch let error as FocusError {
+        try expect(error, equals: .missingTerminalTarget, "empty iTerm target fails closed")
+    }
+}
+
+func testFocusPlannerMatchesTerminalTTYExactlyAndRaisesItsWindow() throws {
+    let session = AgentSession(
+        tool: .pi,
+        sessionID: "terminal-exact",
+        pid: 44,
+        status: .idle,
+        cwd: "/tmp/project",
+        startedAt: Date(),
+        updatedAt: Date(),
+        terminal: TerminalContext(termProgram: "Apple_Terminal", tty: "/dev/ttys1")
+    )
+
+    let actions = try FocusPlanner.actions(for: session)
+    guard case let .appleScript(script)? = actions.last else {
+        throw TestFailure.expectation("Terminal focus did not produce AppleScript")
+    }
+    try expect(
+        script.contains("if (tty of aTab) is \"/dev/ttys1\""),
+        equals: true,
+        "Terminal compares normalized TTY exactly"
+    )
+    try expect(
+        script.contains("if matchCount is not 1 then error"),
+        equals: true,
+        "Terminal rejects missing or ambiguous targets"
+    )
+    try expect(
+        script.contains("set frontmost of targetWindow to true"),
+        equals: true,
+        "Terminal raises the containing window"
+    )
+}
+
+func testGhosttyMatcherPrefersProcessAndTTYOverRememberedHeuristics() throws {
+    let legacyTerminalData = Data(
+        #"[{"id":"legacy","name":"project","cwd":"/tmp/shared"}]"#.utf8
+    )
+    let legacyTerminal = try JSONDecoder().decode(
+        [GhosttyTerminal].self,
+        from: legacyTerminalData
+    ).first.unwrap(or: "legacy Ghostty terminal did not decode")
+    try expect(legacyTerminal.pid, equals: nil, "Ghostty 1.3 terminal has no PID")
+    try expect(legacyTerminal.tty, equals: nil, "Ghostty 1.3 terminal has no TTY")
+
+    let first = DetectedAgentProcess(
+        tool: .claude,
+        processID: 101,
+        processIdentity: ProcessIdentity(processID: 101, kernelStartTimeMicroseconds: 1),
+        cwd: "/tmp/shared",
+        terminal: TerminalContext(termProgram: "ghostty", tty: "/dev/ttys101")
+    )
+    let second = DetectedAgentProcess(
+        tool: .claude,
+        processID: 102,
+        processIdentity: ProcessIdentity(processID: 102, kernelStartTimeMicroseconds: 2),
+        cwd: "/tmp/shared",
+        terminal: TerminalContext(termProgram: "ghostty", tty: "/dev/ttys102")
+    )
+    let terminals = [
+        GhosttyTerminal(
+            id: "surface-second", name: "claude", cwd: "/tmp/shared",
+            pid: 102, tty: "/dev/ttys102"
+        ),
+        GhosttyTerminal(
+            id: "surface-first", name: "claude", cwd: "/tmp/shared",
+            pid: 101, tty: "/dev/ttys101"
+        ),
+    ]
+    let staleAssignments = [
+        GhosttySessionMatcher.assignmentKey(for: first): "surface-second",
+        GhosttySessionMatcher.assignmentKey(for: second): "surface-first",
+    ]
+
+    let matched = GhosttySessionMatcher.match(
+        processes: [first, second],
+        terminals: terminals,
+        previousAssignments: staleAssignments
+    )
+    let terminalByPID = Dictionary(uniqueKeysWithValues: matched.map {
+        ($0.processID, $0.terminal.ghosttyTerminalID)
+    })
+    try expect(terminalByPID[101]!, equals: "surface-first", "PID corrects stale first assignment")
+    try expect(terminalByPID[102]!, equals: "surface-second", "PID corrects stale second assignment")
 }
 
 func testGhosttyMatcherExcludesOrphanedProcessesAndAssignsExactTerminals() throws {
@@ -6302,6 +6992,7 @@ let tests: [(String, () throws -> Void)] = [
     ("reaper reaps against provided scan", testReaperReapsAgainstProvidedScan),
     ("reaper rebinds daemon-hosted session to visible process", testReaperRebindsDaemonHostedSessionToVisibleProcess),
     ("reaper adopts scanned Ghostty terminal for native session", testReaperAdoptsScannedGhosttyTerminalForNativeSession),
+    ("reaper adopts controlling TTY without Ghostty surface", testReaperAdoptsControllingTTYWithoutGhosttySurface),
     ("terminal enrichment preserves concurrent lifecycle write", testTerminalEnrichmentPreservesConcurrentLifecycleWrite),
     ("terminal enrichment does not replace lifecycle write after reload", testTerminalEnrichmentDoesNotReplaceLifecycleWriteAfterReload),
     ("terminal enrichment rejects concurrent process generation change", testTerminalEnrichmentRejectsConcurrentProcessGenerationChange),
@@ -6396,8 +7087,20 @@ let tests: [(String, () throws -> Void)] = [
     ("convoy watcher rejects unsafe metadata file types and sizes", testConvoyWatcherRejectsUnsafeMetadataFileTypesAndSizes),
     ("convoy watcher ignores runs not owned by live process", testConvoyWatcherIgnoresRunsNotOwnedByLiveProcess),
     ("convoy watcher suppresses pipeline-owned opencode sessions", testConvoyWatcherSuppressesPipelineOwnedOpenCodeSessions),
+    ("state repository keeps Convoy-owned OpenCode hidden after producer rewrite", testStateRepositoryKeepsConvoyOwnedOpenCodeHiddenAfterProducerRewrite),
+    ("Convoy ownership index rejects links and FIFOs without blocking", testConvoyOwnershipIndexRejectsLinksAndFIFOsWithoutBlocking),
+    ("corrupt ownership index waits for complete metadata inventory", testCorruptOwnershipIndexWaitsForCompleteMetadataInventory),
+    ("Convoy ownership watchers are bounded", testConvoyOwnershipWatchersAreBounded),
+    ("initial reconciliation indexes serverless Convoy ownership", testInitialReconciliationIndexesServerlessConvoyOwnership),
+    ("initial reconciliation watches live Convoy ownership before baseline", testInitialReconciliationWatchesLiveConvoyOwnershipBeforeBaseline),
+    ("initial baseline waits for concurrent Convoy metadata", testInitialBaselineWaitsForConcurrentConvoyMetadata),
     ("convoy watcher suppresses embedded server reaper fallback by directory", testConvoyWatcherSuppressesEmbeddedServerReaperFallbackByDirectory),
     ("focus planner prioritizes tmux then terminal", testFocusPlannerPrioritizesTmuxThenTerminal),
+    ("focus planner requires one exact Ghostty target", testFocusPlannerRequiresOneExactGhosttyTarget),
+    ("focus planner normalizes iTerm identity and selects its window", testFocusPlannerNormalizesITermIdentityAndSelectsItsWindow),
+    ("focus planner rejects empty iTerm identity without TTY", testFocusPlannerRejectsEmptyITermIdentityWithoutTTY),
+    ("focus planner matches Terminal TTY exactly and raises its window", testFocusPlannerMatchesTerminalTTYExactlyAndRaisesItsWindow),
+    ("Ghostty matcher prefers process and TTY over remembered heuristics", testGhosttyMatcherPrefersProcessAndTTYOverRememberedHeuristics),
     ("Ghostty matcher excludes orphaned processes and assigns exact terminals", testGhosttyMatcherExcludesOrphanedProcessesAndAssignsExactTerminals),
     ("Ghostty matcher prefers same-directory terminal naming the tool", testGhosttyMatcherPrefersSameDirectoryTerminalNamingTheTool),
     ("Ghostty matcher resolves retitled tabs by signature and foreign commands", testGhosttyMatcherResolvesRetitledTabsBySignatureAndForeignCommands),

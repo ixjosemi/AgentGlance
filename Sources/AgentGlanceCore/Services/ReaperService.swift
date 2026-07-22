@@ -121,7 +121,7 @@ public struct ReaperService: Sendable {
     }
 
     /// Applies optional terminal enrichment after liveness reconciliation.
-    /// Ghostty Apple Events must never sit in front of the reaper, so the
+    /// Terminal automation must never sit in front of the reaper, so the
     /// scheduler calls this only after the basic libproc pass has completed.
     /// Missing enrichment is not evidence that a basic detection has died.
     public func applyTerminalEnrichment(
@@ -311,40 +311,42 @@ public struct ReaperService: Sendable {
         ), updating: &snapshot)
     }
 
-    /// Hook- and plugin-written documents cannot see which Ghostty surface
-    /// hosts their process (hooks capture env, which carries no surface ID;
-    /// plugins run in daemons), so focusing them falls back to title
-    /// heuristics that break as soon as agents rewrite tab titles. The
-    /// process scan resolves the exact surface per process — the document
-    /// adopts its identifier and keeps following the live tab title, while
-    /// keeping its own tty/tmux context and its updatedAt: enrichment is
-    /// not activity.
+    /// Hook- and plugin-written documents often lack the controlling TTY and
+    /// cannot see which Ghostty surface hosts their process. The process scan
+    /// supplies those exact identifiers without changing lifecycle activity.
     private func adoptScannedTerminal(
         _ session: AgentSession,
         from process: DetectedAgentProcess,
         snapshot: inout StateSnapshot
     ) throws {
-        guard session.source != .reaper,
-              let scannedTerminalID = process.terminal.ghosttyTerminalID else {
-            return
-        }
+        guard session.source != .reaper else { return }
         guard let session = try repository.reload(session, updating: &snapshot),
               session.source != .reaper,
               processMatches(session, process) else {
             return
         }
-        let adoptsIdentifier = session.terminal.ghosttyTerminalID != scannedTerminalID
+        let scannedTerminalID = process.terminal.ghosttyTerminalID
+        let adoptsIdentifier = scannedTerminalID != nil
+            && session.terminal.ghosttyTerminalID != scannedTerminalID
+        let adoptsProgram = session.terminal.termProgram == nil
+            && process.terminal.termProgram != nil
+        let adoptsTmuxPane = session.terminal.tmuxPane == nil
+            && process.terminal.tmuxPane != nil
+        let adoptsTTY = session.terminal.tty == nil
+            && process.terminal.tty != nil
         let adoptsTitle = session.tool != .convoy && titleMeaningfullyChanged(
             scanned: process.terminal.windowTitleHint,
             current: session.terminal.windowTitleHint
         )
-        guard adoptsIdentifier || adoptsTitle else { return }
+        guard adoptsIdentifier || adoptsProgram || adoptsTmuxPane || adoptsTTY || adoptsTitle else {
+            return
+        }
         _ = try repository.saveEnrichment(
             for: session,
             process: process,
             terminal: TerminalContext(
                 termProgram: process.terminal.termProgram ?? session.terminal.termProgram,
-                ghosttyTerminalID: scannedTerminalID,
+                ghosttyTerminalID: scannedTerminalID ?? session.terminal.ghosttyTerminalID,
                 itermSessionID: session.terminal.itermSessionID,
                 tmuxPane: session.terminal.tmuxPane ?? process.terminal.tmuxPane,
                 tty: session.terminal.tty ?? process.terminal.tty,

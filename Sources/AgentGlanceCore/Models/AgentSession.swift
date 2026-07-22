@@ -130,7 +130,7 @@ public struct AgentSession: Codable, Identifiable, Equatable, Sendable {
             cwd: cwd,
             startedAt: startedAt,
             updatedAt: updatedAt,
-            terminal: terminal,
+            terminal: process.terminal,
             source: source,
             currentStep: currentStep
         )

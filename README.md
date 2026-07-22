@@ -104,16 +104,16 @@ Then quit AgentGlance and delete the app bundle. Review your Claude or Codex con
 
 | Host | Focus strategy | Notes |
 | --- | --- | --- |
-| Ghostty | exact surface ID resolved by the process scan, then project/title fallback | Requires Ghostty 1.3+ |
-| iTerm2 | native session ID | Uses iTerm2 AppleScript |
-| Terminal | TTY | Uses Terminal AppleScript |
+| Ghostty | exact surface ID, foreground PID, or TTY; unique project/title fallback | Requires Ghostty 1.3+ |
+| iTerm2 | exact normalized session ID, then TTY | Selects the split, tab, and window |
+| Terminal | exact TTY | Selects the tab and raises its containing window |
 | tmux | validated pane ID, then host activation | `tmux` must be in a trusted standard install location |
 
 macOS asks for Automation access the first time AgentGlance controls a terminal. If denied, enable it under **System Settings → Privacy & Security → Automation**.
 
 ## How it works
 
-Claude hooks, an OpenCode plugin, a Pi extension, the Codex rollout watcher, the Convoy runs watcher, and a process fallback produce versioned session documents under `~/.agentglance/state`. The app observes that directory and renders active sessions. State is written atomically with user-only permissions. Convoy needs no hook at all: its run metadata under `~/.convoy/runs` is read directly, and a run is only shown while its recorded server process is verifiably alive.
+Claude hooks, an OpenCode plugin, a Pi extension, the Codex rollout watcher, the Convoy runs watcher, and a process fallback produce versioned session documents under `~/.agentglance/state`. The app observes that directory and renders active sessions. State is written atomically with user-only permissions. Convoy needs no hook at all: its run metadata under `~/.convoy/runs` is read directly, and a run is only shown while its recorded server process is verifiably alive. OpenCode phase IDs named by Convoy are retained in a private ownership index and filtered at repository load time, so internal phases stay hidden even after a plugin rewrite or app restart.
 
 Everything is event-driven and off the main thread: a libproc-based scanner (no subprocesses, ~2 ms per full sweep) runs on a 5-second heartbeat, kernel `EVFILT_PROC` exit watchers reap closed sessions instantly, and directory observation with debounce delivers state changes to the UI. A native session that has been quiet for a full scan interval is also checked against the detected agent set; removal requires two consecutive misses, so one transient metadata-read failure cannot hide a live session. Terminal identity disambiguates agents sharing a project directory. Claude and OpenCode status changes land in well under a second; Codex and Convoy ride the heartbeat. Session titles follow the live Ghostty tab title — cleaned of status decorations and capped at 20 characters — and a manual rename (persisted in `~/.agentglance/session-names.json`) always wins. Agent matching accepts either the kernel-resolved executable path or `argv[0]`, so versioned symlink installs like `~/.local/bin/claude → …/versions/x.y.z` are detected correctly.
 

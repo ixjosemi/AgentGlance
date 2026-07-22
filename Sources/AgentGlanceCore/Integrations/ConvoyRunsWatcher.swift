@@ -9,6 +9,7 @@ public final class ConvoyRunsWatcher {
     /// Tolerance between a process's kernel start time and the server
     /// timestamp convoy records, guarding pid reuse across old runs.
     private static let processStartSlack: TimeInterval = 120
+    package static let maximumOwnershipWatchDirectoryCount = 64
 
     private let runsDirectoryURL: URL
     private let repository: StateRepository
@@ -18,6 +19,7 @@ public final class ConvoyRunsWatcher {
     /// parsed at most once per process lifetime.
     private var parsedRunsByFileURL: [URL: (fingerprint: MetadataFingerprint, run: ConvoyRun?)] = [:]
     private var trackedRuns: [String: TrackedRun] = [:]
+    package private(set) var ownershipWatchDirectoryURLs: Set<URL> = []
 
     public struct ScanResult {
         public let preservingSessionIDs: Set<String>
@@ -84,6 +86,7 @@ public final class ConvoyRunsWatcher {
     }
 
     public func scan(detected: [DetectedAgentProcess]) throws {
+        try refreshOpenCodeOwnershipIndex()
         var snapshot = try repository.loadSnapshot()
         let result = try observe(
             detected: detected,
@@ -102,6 +105,7 @@ public final class ConvoyRunsWatcher {
         isHeartbeat: Bool,
         invalidatedMetadataURLs: Set<URL> = []
     ) throws -> ScanResult {
+        try refreshOpenCodeOwnershipIndex()
         var snapshot = try repository.loadSnapshot()
         return try observe(
             detected: detected,
@@ -184,6 +188,96 @@ public final class ConvoyRunsWatcher {
         )
     }
 
+    /// Phase IDs are durable ownership evidence even after Convoy clears its
+    /// transient `server` field or the app restarts. Index every securely
+    /// readable run, independently from the smaller set that can currently be
+    /// correlated to a live Convoy process and shown as a pipeline row.
+    @discardableResult
+    package func refreshOpenCodeOwnershipIndex() throws -> Bool {
+        let inventory = try openCodeOwnershipInventory()
+        ownershipWatchDirectoryURLs = Set(
+            inventory.watchDirectoryURLs
+                .sorted { $0.lastPathComponent > $1.lastPathComponent }
+                .prefix(Self.maximumOwnershipWatchDirectoryCount)
+        )
+        return try repository.mergeConvoyOwnedOpenCodeSessionIDs(
+            inventory.sessionIDs,
+            allowingInvalidIndexRepair: inventory.isComplete
+        )
+    }
+
+    private func openCodeOwnershipInventory() throws -> (
+        sessionIDs: Set<String>,
+        watchDirectoryURLs: Set<URL>,
+        isComplete: Bool
+    ) {
+        let runDirectoryURLs: [URL]
+        do {
+            runDirectoryURLs = try FileManager.default.contentsOfDirectory(
+                at: runsDirectoryURL,
+                includingPropertiesForKeys: nil
+            )
+        } catch CocoaError.fileReadNoSuchFile {
+            return ([], [], false)
+        }
+        var sessionIDs: Set<String> = []
+        var watchDirectoryURLs: Set<URL> = []
+        var isComplete = true
+        var availableMetadataURLs: Set<URL> = []
+        for runDirectoryURL in runDirectoryURLs {
+            var directoryMetadata = stat()
+            guard Darwin.lstat(runDirectoryURL.path, &directoryMetadata) == 0 else {
+                isComplete = false
+                continue
+            }
+            guard directoryMetadata.st_mode & S_IFMT == S_IFDIR else {
+                if directoryMetadata.st_mode & S_IFMT == S_IFLNK { isComplete = false }
+                continue
+            }
+            guard directoryMetadata.st_uid == getuid(),
+                  directoryMetadata.st_mode & 0o022 == 0 else {
+                isComplete = false
+                continue
+            }
+            // A just-created run may not have published metadata yet. Keep
+            // its directory armed and never call that transient view complete.
+            watchDirectoryURLs.insert(runDirectoryURL)
+            let metadataURL = runDirectoryURL.appendingPathComponent("metadata.json")
+            var metadata = stat()
+            guard Darwin.lstat(metadataURL.path, &metadata) == 0 else {
+                isComplete = false
+                continue
+            }
+            guard metadata.st_mode & S_IFMT == S_IFREG,
+                  metadata.st_uid == getuid(),
+                  metadata.st_mode & 0o022 == 0 else {
+                isComplete = false
+                continue
+            }
+            availableMetadataURLs.insert(metadataURL)
+            guard let parsed = parsedMetadata(at: metadataURL, modifiedAfter: .distantPast),
+                  let run = parsed.run else {
+                isComplete = false
+                continue
+            }
+            if run.mayStillChange {
+                watchDirectoryURLs.insert(runDirectoryURL)
+            } else {
+                watchDirectoryURLs.remove(runDirectoryURL)
+            }
+            for sessionID in run.phases.compactMap(\.sessionID) {
+                let byteCount = sessionID.utf8.count
+                if byteCount > 0 && byteCount <= 128 {
+                    sessionIDs.insert(sessionID)
+                }
+            }
+        }
+        parsedRunsByFileURL = parsedRunsByFileURL.filter {
+            availableMetadataURLs.contains($0.key)
+        }
+        return (sessionIDs, watchDirectoryURLs, isComplete)
+    }
+
     public func suppressOpenCodeSessions(for result: ScanResult) throws {
         var snapshot = try repository.loadSnapshot()
         try suppressOpenCodeSessions(for: result, snapshot: &snapshot)
@@ -196,11 +290,9 @@ public final class ConvoyRunsWatcher {
         try suppressPipelineOwnedOpenCodeSessions(of: result.runs, snapshot: &snapshot)
     }
 
-    /// Convoy phases run as OpenCode sessions on convoy's embedded server;
-    /// when that server loads the AgentGlance plugin, each phase would also
-    /// surface as a standalone OpenCode row next to the pipeline it belongs
-    /// to. The run metadata names those sessions, so they are removed here —
-    /// and again on every scan, which drains any rewrite by the plugin.
+    /// Exact phase IDs are hidden by StateRepository's durable ownership
+    /// projection. This cleanup remains only for app-owned reaper fallbacks,
+    /// whose synthetic IDs can never occur in Convoy metadata.
     ///
     /// The embedded server shares its cwd with the pipeline's target
     /// directory but is never named by any phase's session ID — Ghostty's
@@ -213,14 +305,13 @@ public final class ConvoyRunsWatcher {
         of runs: [ConvoyRun],
         snapshot: inout StateSnapshot
     ) throws {
-        let pipelineSessionIDs = Set(runs.flatMap { $0.phases.compactMap(\.sessionID) })
         let pipelineTargetDirs = Set(runs.map(\.targetDir))
-        guard !pipelineSessionIDs.isEmpty || !pipelineTargetDirs.isEmpty else { return }
+        guard !pipelineTargetDirs.isEmpty else { return }
         let sessions = snapshot.sessions
         for session in sessions
         where session.tool == .opencode
-            && (pipelineSessionIDs.contains(session.sessionID)
-                || (session.source == .reaper && pipelineTargetDirs.contains(session.cwd))) {
+            && session.source == .reaper
+            && pipelineTargetDirs.contains(session.cwd) {
             try repository.remove(session, updating: &snapshot)
         }
     }
@@ -241,20 +332,30 @@ public final class ConvoyRunsWatcher {
             at: runsDirectoryURL,
             includingPropertiesForKeys: [.isDirectoryKey]
         )) ?? []
-        var currentMetadataURLs: Set<URL> = []
+        var availableMetadataURLs: Set<URL> = []
         var runs: [DiscoveredRun] = []
         for runDirectoryURL in runDirectoryURLs {
+            var directoryMetadata = stat()
+            guard Darwin.lstat(runDirectoryURL.path, &directoryMetadata) == 0,
+                  directoryMetadata.st_mode & S_IFMT == S_IFDIR,
+                  directoryMetadata.st_uid == getuid(),
+                  directoryMetadata.st_mode & 0o022 == 0 else {
+                continue
+            }
             let metadataURL = runDirectoryURL.appendingPathComponent("metadata.json")
+            var metadataFileMetadata = stat()
+            guard Darwin.lstat(metadataURL.path, &metadataFileMetadata) == 0 else { continue }
+            availableMetadataURLs.insert(metadataURL)
             guard let parsed = parsedMetadata(at: metadataURL, modifiedAfter: cutoff) else { continue }
-            currentMetadataURLs.insert(metadataURL)
             if let run = parsed.run {
                 runs.append(DiscoveredRun(metadataURL: metadataURL, run: run))
             }
         }
-        // Runs aging out of the cutoff never come back; their cached parses
-        // would otherwise accumulate for the lifetime of the app.
+        // Ownership indexing needs historical runs while live publication
+        // uses a recent cutoff. Retain fingerprints across both passes and
+        // prune only metadata paths that actually disappeared.
         parsedRunsByFileURL = parsedRunsByFileURL.filter {
-            currentMetadataURLs.contains($0.key)
+            availableMetadataURLs.contains($0.key)
         }
         return runs
     }
@@ -263,13 +364,14 @@ public final class ConvoyRunsWatcher {
         at url: URL,
         modifiedAfter cutoff: Date
     ) -> ParsedMetadata? {
-        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW)
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
         guard descriptor >= 0 else { return nil }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         var metadata = stat()
         guard Darwin.fstat(descriptor, &metadata) == 0,
                metadata.st_mode & S_IFMT == S_IFREG,
-               metadata.st_uid == getuid() else { return nil }
+               metadata.st_uid == getuid(),
+               metadata.st_mode & 0o022 == 0 else { return nil }
         let fingerprint = MetadataFingerprint(metadata)
         guard fingerprint.modifiedAt >= cutoff else { return nil }
         if let cached = parsedRunsByFileURL[url], cached.fingerprint == fingerprint {
@@ -393,6 +495,12 @@ struct ConvoyRun {
     /// Ordered by phase start so the earliest-started phase leads displays.
     let phases: [Phase]
     let humanStepNames: Set<String>
+
+    var mayStillChange: Bool {
+        serverPid != nil || phases.contains {
+            $0.status == "pending" || $0.status == "running" || $0.status == "thinking"
+        }
+    }
 
     func sessionState() -> (
         status: SessionStatus,

@@ -8,6 +8,8 @@ public enum FocusAction: Equatable, Sendable {
 
 public enum FocusError: Error, Equatable, Sendable {
     case invalidTmuxPane(String)
+    case missingTerminalTarget
+    case sessionUnavailable
     case commandFailed(String, Int32)
 }
 
@@ -21,80 +23,138 @@ public enum FocusPlanner {
             actions.append(.run(executable: "tmux", arguments: ["select-window", "-t", pane]))
             actions.append(.run(executable: "tmux", arguments: ["select-pane", "-t", pane]))
         }
-        actions.append(terminalAction(for: session))
+        actions.append(try terminalAction(for: session))
         return actions
     }
 
-    private static func terminalAction(for session: AgentSession) -> FocusAction {
+    private static func terminalAction(for session: AgentSession) throws -> FocusAction {
         if session.terminal.termProgram?.lowercased() == "ghostty" {
             return .appleScript(ghosttyScript(for: session))
         }
         if let identifier = session.terminal.itermSessionID {
-            return .appleScript(iTermScript(identifier: identifier))
+            let normalizedIdentifier = normalizedITermIdentifier(identifier)
+            if !normalizedIdentifier.isEmpty {
+                return .appleScript(iTermScript(
+                    identifier: normalizedIdentifier,
+                    tty: session.terminal.tty
+                ))
+            }
+            if let tty = session.terminal.tty {
+                return .appleScript(iTermScript(identifier: nil, tty: tty))
+            }
+            throw FocusError.missingTerminalTarget
+        }
+        if session.terminal.termProgram == "iTerm.app",
+           let tty = session.terminal.tty {
+            return .appleScript(iTermScript(identifier: nil, tty: tty))
         }
         if let tty = session.terminal.tty,
            session.terminal.termProgram == "Apple_Terminal" {
             return .appleScript(terminalScript(tty: tty))
         }
-        let application = applicationName(for: session.terminal.termProgram)
-        return .run(executable: "/usr/bin/open", arguments: ["-a", application])
+        throw FocusError.missingTerminalTarget
     }
 
     private static func ghosttyScript(for session: AgentSession) -> String {
         let cwd = appleScriptString(session.cwd)
         let hint = appleScriptString(session.terminal.windowTitleHint ?? session.projectName)
         let identifier = session.terminal.ghosttyTerminalID.map(appleScriptString)
-        let initialMatch = identifier.map {
-            "set matches to every terminal whose id is \"\($0)\""
-        } ?? "set matches to every terminal whose working directory contains \"\(cwd)\""
+        if let identifier {
+            // A surface ID is strong identity. If it disappeared, choosing a
+            // different same-project tab would be worse than reporting that
+            // the target is stale.
+            return """
+            tell application "Ghostty"
+              set matches to every terminal whose id is "\(identifier)"
+              if (count of matches) is not 1 then error "AgentGlance could not uniquely identify the Ghostty terminal"
+              focus item 1 of matches
+              activate
+            end tell
+            """
+        }
+        // Ghostty 1.3 exposes surface ID, title, and working directory but not
+        // TTY/PID. Newer versions let the scanner use those fields to obtain
+        // an exact ID; focus itself remains compatible with 1.3.
         return """
         tell application "Ghostty"
-          \(initialMatch)
-          if (count of matches) = 0 then set matches to every terminal whose working directory contains "\(cwd)"
-          if (count of matches) is not 1 then set matches to every terminal whose name contains "\(hint)"
-          if (count of matches) > 0 then focus item 1 of matches
+          set matches to every terminal whose working directory is "\(cwd)"
+          if (count of matches) is not 1 then
+            set titleMatches to every terminal whose name contains "\(hint)"
+            if (count of titleMatches) is 1 then set matches to titleMatches
+          end if
+          if (count of matches) is not 1 then error "AgentGlance could not uniquely identify the Ghostty terminal"
+          focus item 1 of matches
           activate
         end tell
         """
     }
 
-    private static func iTermScript(identifier: String) -> String {
-        let value = appleScriptString(identifier)
+    private static func iTermScript(identifier: String?, tty: String?) -> String {
+        let predicate: String
+        if let identifier, !identifier.isEmpty {
+            predicate = "unique ID of aSession is \"\(appleScriptString(identifier))\""
+        } else if let tty {
+            predicate = "tty of aSession is \"\(appleScriptString(tty))\""
+        } else {
+            // terminalAction never plans this form, but keep generation
+            // fail-closed if a future caller violates that invariant.
+            predicate = "false"
+        }
         return """
         tell application "iTerm2"
+          set matchCount to 0
+          set targetWindow to missing value
+          set targetTab to missing value
+          set targetSession to missing value
           repeat with aWindow in windows
             repeat with aTab in tabs of aWindow
               repeat with aSession in sessions of aTab
-                if unique ID of aSession contains "\(value)" then select aTab
+                if \(predicate) then
+                  set matchCount to matchCount + 1
+                  set targetWindow to aWindow
+                  set targetTab to aTab
+                  set targetSession to aSession
+                end if
               end repeat
             end repeat
           end repeat
+          if matchCount is not 1 then error "AgentGlance could not uniquely identify the iTerm session"
+          select targetSession
+          select targetTab
+          select targetWindow
           activate
         end tell
         """
     }
 
     private static func terminalScript(tty: String) -> String {
-        let value = appleScriptString(tty.replacingOccurrences(of: "/dev/", with: ""))
+        let normalizedTTY = tty.hasPrefix("/dev/") ? tty : "/dev/\(tty)"
+        let value = appleScriptString(normalizedTTY)
         return """
         tell application "Terminal"
+          set matchCount to 0
+          set targetWindow to missing value
+          set targetTab to missing value
           repeat with aWindow in windows
             repeat with aTab in tabs of aWindow
-              if tty of aTab contains "\(value)" then set selected tab of aWindow to aTab
+              if (tty of aTab) is "\(value)" then
+                set matchCount to matchCount + 1
+                set targetWindow to aWindow
+                set targetTab to aTab
+              end if
             end repeat
           end repeat
+          if matchCount is not 1 then error "AgentGlance could not uniquely identify the Terminal tab"
+          set selected tab of targetWindow to targetTab
+          set frontmost of targetWindow to true
           activate
         end tell
         """
     }
 
-    private static func applicationName(for termProgram: String?) -> String {
-        switch termProgram {
-        case "Apple_Terminal": "Terminal"
-        case "iTerm.app": "iTerm"
-        case "ghostty": "Ghostty"
-        default: "Terminal"
-        }
+    private static func normalizedITermIdentifier(_ identifier: String) -> String {
+        identifier.split(separator: ":", omittingEmptySubsequences: false).last.map(String.init)
+            ?? identifier
     }
 
     static func appleScriptString(_ value: String) -> String {

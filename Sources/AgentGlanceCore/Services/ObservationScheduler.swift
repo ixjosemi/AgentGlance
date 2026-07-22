@@ -39,6 +39,7 @@ public final class ObservationScheduler {
     private var pendingConvoyMetadataURLs: Set<URL> = []
     private var lastVerifiedProcesses: [DetectedAgentProcess]?
     private var generation = 0
+    private var convoyMetadataRevision: UInt64 = 0
 
     private struct TickReasons: OptionSet {
         let rawValue: Int
@@ -90,6 +91,7 @@ public final class ObservationScheduler {
         workQueue.async { [weak self] in
             guard let self else { return }
             self.startObservationSources()
+            self.refreshConvoyOwnershipIndex()
             do {
                 _ = try self.reaper.reap(
                     detected: self.processScanner.basicActiveProcesses()
@@ -99,6 +101,30 @@ public final class ObservationScheduler {
                     "AgentGlance initial process reconciliation failed: %@",
                     String(describing: error)
                 )
+            }
+            self.finishInitialReconciliationWhenConvoyMetadataIsQuiet(
+                startupGeneration: startupGeneration,
+                completion: completion
+            )
+        }
+    }
+
+    private func finishInitialReconciliationWhenConvoyMetadataIsQuiet(
+        startupGeneration: Int,
+        completion: (@MainActor @Sendable () -> Void)?
+    ) {
+        dispatchPrecondition(condition: .onQueue(workQueue))
+        let finalizationGeneration = generation
+        let inventoryRevision = convoyMetadataRevision
+        refreshConvoyOwnershipIndex()
+        workQueue.asyncAfter(deadline: .now() + debounceInterval) { [weak self] in
+            guard let self, self.generation == finalizationGeneration else { return }
+            guard self.convoyMetadataRevision == inventoryRevision else {
+                self.finishInitialReconciliationWhenConvoyMetadataIsQuiet(
+                    startupGeneration: startupGeneration,
+                    completion: completion
+                )
+                return
             }
             if let completion {
                 DispatchQueue.main.async { [weak self] in
@@ -137,7 +163,11 @@ public final class ObservationScheduler {
     }
 
     package func requestConvoyMetadataTick() {
-        workQueue.async { [weak self] in self?.scheduleCoalescedTick(reason: .convoyMetadata) }
+        workQueue.async { [weak self] in
+            guard let self else { return }
+            self.convoyMetadataRevision &+= 1
+            self.scheduleCoalescedTick(reason: .convoyMetadata)
+        }
     }
 
     package func requestHeartbeatTick() {
@@ -197,6 +227,7 @@ public final class ObservationScheduler {
         invalidatedConvoyMetadataURLs: Set<URL>
     ) {
         dispatchPrecondition(condition: .onQueue(workQueue))
+        refreshConvoyOwnershipIndex()
         if reasons == .convoyMetadata, let detected = lastVerifiedProcesses {
             tickConvoyMetadata(
                 detected: detected,
@@ -246,7 +277,7 @@ public final class ObservationScheduler {
             NSLog("AgentGlance terminal enrichment failed: %@", String(describing: error))
         }
         refreshCodexWatcher(detected: enriched, snapshot: &snapshot)
-        if let convoyResult {
+            if let convoyResult {
             do {
                 try convoyWatcher?.suppressOpenCodeSessions(
                     for: convoyResult,
@@ -255,7 +286,11 @@ public final class ObservationScheduler {
             } catch {
                 NSLog("AgentGlance convoy suppression failed: %@", String(describing: error))
             }
-            refreshConvoyRunDirectorySources(convoyResult.runDirectoryURLs)
+            refreshConvoyRunDirectorySources(
+                convoyResult.runDirectoryURLs.union(
+                    convoyWatcher?.ownershipWatchDirectoryURLs ?? []
+                )
+            )
         }
         refreshExitWatchers(detected: detected)
     }
@@ -289,7 +324,11 @@ public final class ObservationScheduler {
         } catch {
             NSLog("AgentGlance convoy suppression failed: %@", String(describing: error))
         }
-        refreshConvoyRunDirectorySources(convoyResult.runDirectoryURLs)
+        refreshConvoyRunDirectorySources(
+            convoyResult.runDirectoryURLs.union(
+                convoyWatcher?.ownershipWatchDirectoryURLs ?? []
+            )
+        )
     }
 
     /// Convoy metadata events are primary; the heartbeat remains a backstop
@@ -318,6 +357,25 @@ public final class ObservationScheduler {
             NSLog("AgentGlance convoy watcher failed: %@", String(describing: error))
         }
         return nil
+    }
+
+    /// Ownership inventory is independent from process detection: completed
+    /// runs clear their server metadata, and an app restart must still know
+    /// that their OpenCode phase documents are internal implementation state.
+    /// Run this before every state materialization so a plugin rewrite can
+    /// never race a snapshot back into the UI.
+    private func refreshConvoyOwnershipIndex() {
+        let watcher = convoyWatcher ?? ConvoyRunsWatcher(
+            runsDirectoryURL: convoyRunsDirectoryURL,
+            repository: repository
+        )
+        convoyWatcher = watcher
+        do {
+            try watcher.refreshOpenCodeOwnershipIndex()
+        } catch {
+            NSLog("AgentGlance Convoy ownership indexing failed: %@", String(describing: error))
+        }
+        refreshConvoyRunDirectorySources(watcher.ownershipWatchDirectoryURLs)
     }
 
     /// Registers a kernel exit notification (EVFILT_PROC) per tracked agent
@@ -418,6 +476,7 @@ public final class ObservationScheduler {
         )
         source.setEventHandler { [weak self] in
             guard let self else { return }
+            self.convoyMetadataRevision &+= 1
             if !source.data.intersection([.rename, .delete]).isEmpty {
                 source.cancel()
                 self.convoyRunsDirectorySource = nil
@@ -444,6 +503,7 @@ public final class ObservationScheduler {
             )
             source.setEventHandler { [weak self] in
                 guard let self else { return }
+                self.convoyMetadataRevision &+= 1
                 if !source.data.intersection([.rename, .delete]).isEmpty {
                     source.cancel()
                     self.convoyRunDirectorySources[url] = nil

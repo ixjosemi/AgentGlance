@@ -119,6 +119,7 @@ struct NotchWidgetView: View {
                     if isExpanded {
                         SessionMenuCard(
                             sessions: store.sessions,
+                            stateDirectoryURL: store.stateDirectoryURL,
                             dismiss: collapseMenu,
                             acknowledge: { store.acknowledge($0) },
                             sessionTitle: { store.displayName(for: $0) },
@@ -635,6 +636,7 @@ private struct AgentIconView: View {
 
 private struct SessionMenuCard: View {
     let sessions: [AgentSession]
+    let stateDirectoryURL: URL
     let dismiss: () -> Void
     let acknowledge: (AgentSession) -> Void
     let sessionTitle: (AgentSession) -> String
@@ -769,9 +771,13 @@ private struct SessionMenuCard: View {
         // menu stays responsive.
         Task.detached(priority: .userInitiated) {
             do {
-                try FocusService.focus(session)
+                let latest = try StateRepository(directoryURL: stateDirectoryURL)
+                    .loadSessions()
+                    .first { $0.id == session.id }
+                guard let latest else { throw FocusError.sessionUnavailable }
+                try FocusService.focus(latest)
                 await MainActor.run {
-                    acknowledge(session)
+                    acknowledge(latest)
                     dismiss()
                 }
             } catch {

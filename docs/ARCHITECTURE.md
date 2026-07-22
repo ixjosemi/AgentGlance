@@ -10,7 +10,7 @@ AgentGlance is a local, layered macOS application.
 
 ## Data flow
 
-Claude hooks, the OpenCode plugin, the Codex watcher, and the process reaper normalize lifecycle information into versioned `AgentSession` documents. `StateRepository` atomically publishes those documents under `~/.agentglance/state`. `StateStore` observes the directory and exposes active sessions to the notch UI. Selecting a session creates a constrained focus action for tmux or a supported terminal.
+Claude hooks, the OpenCode and Pi integrations, the Codex watcher, the Convoy runs watcher, and the process reaper normalize lifecycle information into versioned `AgentSession` documents. `StateRepository` atomically publishes those documents under `~/.agentglance/state`. Convoy phase ownership is applied as a repository projection so its internal OpenCode documents never become global rows, even if their producer rewrites them. `StateStore` observes the directory and exposes active sessions to the notch UI. Selecting a session reloads its latest process and terminal enrichment before creating a constrained focus action for tmux or a supported terminal.
 
 ## Presentation
 
@@ -26,7 +26,9 @@ Hook payloads, JSONL rollouts, process output, state files, terminal metadata, a
 | --- | --- | --- |
 | Claude Code | lifecycle hooks | process scanner |
 | OpenCode | local plugin events | process scanner |
+| Pi | local extension events | process scanner |
 | Codex CLI | rollout JSONL + notify | process scanner |
+| Convoy | run metadata | process scanner |
 
 The reaper removes dead sessions and creates fallback state for detectable processes. It also verifies native documents that have been quiet for a full five-second observation interval against the detected agent set, but requires two consecutive misses before removing an otherwise live PID. Process identity combines PID with kernel start time, so PID reuse and zombies cannot preserve old state. Daemon-hosted sessions are rebound globally one-to-one by terminal identity when available, then by an unambiguous same-tool working-directory match. Basic libproc reconciliation runs before optional, time-bounded Ghostty enrichment. Convoy metadata changes are watched directly; a verified run keeps a one-heartbeat final-state grace after its process exits. Every removal posts the Darwin state-change notification as well as changing the directory, so the UI refreshes without waiting for its polling fallback.
 
@@ -35,3 +37,5 @@ The reaper removes dead sessions and creates fallback state for detectable proce
 Schema version 1 records tool, session ID, PID, lifecycle status, project path, timestamps, terminal context, and optional source. AgentGlance may add an optional `process_identity` containing that PID and its kernel start time in microseconds; older integration documents remain valid and are enriched during reconciliation. Unsupported schema versions fail closed.
 
 Integration-owned lifecycle documents remain the authority for status, attention reason, step, and activity timestamps. Reconciliation never replaces those documents to add process or Ghostty metadata. App-owned enrichment is stored separately as `enrichment-<tool>-<base64url-session-id>.overlay`, using internal overlay schema version 1. The bounded overlay contains only its lifecycle binding (PID, optional identity, and start time), one verified target process identity, and optional terminal metadata. Overlay files are atomically replaced with mode `0600`; reads require a private owner-controlled regular file and reject links, oversized data, unknown schemas, changed lifecycle bindings, and recycled process generations. Invalid and orphaned overlays are ignored and pruned, and removing a lifecycle session removes its overlay. Loads merge a valid overlay in memory, leaving concurrent integration lifecycle writes untouched.
+
+Convoy's durable OpenCode phase ownership is stored separately as `convoy-opencode-ownership.index`, using internal ownership schema version 1. The index is an exact, monotonic set of OpenCode session IDs collected from securely read `~/.convoy/runs/*/metadata.json` files; it contains no prompts or responses. It is atomically replaced with mode `0600`, bounded by entry count and file size, and read with the same owner, regular-file, no-follow, and stable-fingerprint checks as enrichment. A corrupt owner-controlled regular index is rebuilt only after a complete metadata inventory; transient I/O, unsafe metadata, links, FIFOs, and incomplete runs fail closed. Potentially live or not-yet-published run directories are watched before the startup baseline, with a fixed 64-watcher bound and the heartbeat as backstop. Repository snapshots retain the producer lifecycle document but omit indexed IDs from effective sessions, so plugin rewrites cannot race an internal phase back into the UI. This sidecar does not change `AgentSession` schema version 1.

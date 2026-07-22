@@ -69,6 +69,10 @@ public final class StateStore {
         }
     }
 
+    /// Focus resolves against the latest on-disk lifecycle and enrichment,
+    /// rather than the value captured when SwiftUI rendered a row.
+    public var stateDirectoryURL: URL { repository.directoryURL }
+
     /// Reloading is strictly a read: ended sessions are filtered from the UI
     /// but their files stay on disk for the reaper to delete on its own
     /// queue. A reload that writes would re-trigger this store's directory
