@@ -41,6 +41,7 @@ final class NotchPointerTracker: ObservableObject {
 struct NotchWidgetView: View {
     @Bindable var store: StateStore
     @AppStorage("hideWhenEmpty") private var hideWhenEmpty = false
+    @Environment(\.openSettings) private var openSettings
     let layout: NotchLayout
     @ObservedObject var pointerTracker: NotchPointerTracker
     let requestPointerRefresh: () -> Void
@@ -89,6 +90,7 @@ struct NotchWidgetView: View {
         )
         let menuWidth = layout.width
         let menuContentWidth = NotchLayout.contentWidth(forExpandedPanelWidth: menuWidth)
+        let headerWings = layout.expandedHeaderWingWidths()
         let compactInteractiveFrame = DisplayFrame(
             minX: barLeadingOffset,
             minY: 0,
@@ -104,20 +106,40 @@ struct NotchWidgetView: View {
         ZStack(alignment: .topLeading) {
             if !shouldHide {
                 VStack(alignment: .leading, spacing: 0) {
-                    Button(action: openMenu) {
-                        barRow(
-                            leftEntries: leftEntries,
-                            rightEntries: rightEntries,
-                            showsIdleMark: showsIdleMark,
-                            leftWidth: leftWidth,
-                            rightWidth: rightWidth
+                    // The top row swaps between the compact status bar and the
+                    // expanded header living in the wings beside the camera.
+                    // Both layers stay resident: each inner offset cancels the
+                    // outer animated offset, so every camera cutout remains
+                    // pinned over the housing for the whole spring and the
+                    // swap reads as a pure cross-fade. Opacity-0 views still
+                    // hit-test, hence the explicit gates.
+                    ZStack(alignment: .topLeading) {
+                        Button(action: openMenu) {
+                            barRow(
+                                leftEntries: leftEntries,
+                                rightEntries: rightEntries,
+                                showsIdleMark: showsIdleMark,
+                                leftWidth: leftWidth,
+                                rightWidth: rightWidth
+                            )
+                            .contentShape(silhouette)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Show active sessions")
+                        .frame(width: barWidth, height: layout.height)
+                        .offset(x: isExpanded ? barLeadingOffset : 0)
+                        .opacity(isExpanded ? 0 : 1)
+                        .allowsHitTesting(!isExpanded)
+
+                        expandedHeaderRow(
+                            sessionCount: store.sessions.count,
+                            wings: headerWings
                         )
-                        .contentShape(silhouette)
+                        .frame(width: menuWidth, height: layout.height)
+                        .offset(x: isExpanded ? 0 : -barLeadingOffset)
+                        .opacity(isExpanded ? 1 : 0)
+                        .allowsHitTesting(isExpanded)
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Show active sessions")
-                    .frame(width: barWidth, height: layout.height)
-                    .offset(x: isExpanded ? barLeadingOffset : 0)
                     if isExpanded {
                         SessionMenuCard(
                             sessions: store.sessions,
@@ -321,6 +343,49 @@ struct NotchWidgetView: View {
             }
             .frame(width: rightWidth, height: layout.height, alignment: .trailing)
         }
+    }
+
+    /// Expanded replacement for the compact bar row: the menu header claims
+    /// the wings beside the camera cutout instead of a row below it, so the
+    /// space flanking the housing carries information rather than padding.
+    /// Fixed-height frames center the content vertically in both bar heights.
+    private func expandedHeaderRow(
+        sessionCount: Int,
+        wings: (left: CGFloat, right: CGFloat)
+    ) -> some View {
+        HStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "rectangle.stack.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.55))
+                Text("Active sessions")
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.55))
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, SessionMenuLayout.expandedHeaderLeadingInset)
+            .frame(width: wings.left, height: layout.height, alignment: .leading)
+            Color.clear
+                .frame(width: layout.notchWidth, height: layout.height)
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                Text(sessionCount, format: .number)
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.white.opacity(0.35))
+                SettingsGearButton {
+                    // The settings window is a normal app window: activate
+                    // first so it opens frontmost and key — the notch panel
+                    // itself never takes that role.
+                    NSApp.activate(ignoringOtherApps: true)
+                    openSettings()
+                    collapseMenu()
+                }
+            }
+            .padding(.trailing, SessionMenuLayout.expandedHeaderTrailingInset)
+            .frame(width: wings.right, height: layout.height, alignment: .trailing)
+        }
+        .lineLimit(1)
     }
 
     /// Bar and menu share one hanging-drop silhouette: the top shoulders
@@ -643,35 +708,9 @@ private struct SessionMenuCard: View {
     // At most one row shows its inline actions; opening another closes it.
     @State private var actionsSessionID: String?
     @State private var branchCoordinator = GitBranchResolutionCoordinator()
-    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         VStack(alignment: .leading, spacing: SessionMenuLayout.cardStackSpacing) {
-            HStack(spacing: 6) {
-                Image(systemName: "rectangle.stack.fill")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.55))
-                Text("Active sessions")
-                    .font(.system(size: 12.5, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.55))
-                Spacer()
-                Text(sessions.count, format: .number)
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(.white.opacity(0.35))
-                SettingsGearButton {
-                    // The settings window is a normal app window: activate
-                    // first so it opens frontmost and key — the notch panel
-                    // itself never takes that role.
-                    NSApp.activate(ignoringOtherApps: true)
-                    openSettings()
-                    dismiss()
-                }
-            }
-            .padding(.horizontal, 14)
-            .padding(.top, SessionMenuLayout.headerTopPadding)
-            .padding(.bottom, SessionMenuLayout.headerBottomPadding)
-
             if sessions.isEmpty {
                 Text("No active sessions")
                     .font(.system(size: 13))
@@ -717,6 +756,7 @@ private struct SessionMenuCard: View {
         }
         .padding(.horizontal, SessionMenuLayout.contentHorizontalInset)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, SessionMenuLayout.listTopPadding)
         .padding(.bottom, SessionMenuLayout.cardBottomPadding)
         // The whole panel can collapse while a row interaction is open;
         // the interaction lock must not outlive the card.
@@ -1038,9 +1078,9 @@ private struct SessionRow: View {
     }
 }
 
-/// The visible route into the native Settings window, living in the menu
-/// header; the silhouette's right-click menu stays as the fallback for when
-/// no sessions exist and no menu can open.
+/// The visible route into the native Settings window, living in the expanded
+/// bar's right wing; the silhouette's right-click menu stays as the fallback
+/// for when no sessions exist and no menu can open.
 private struct SettingsGearButton: View {
     let action: () -> Void
     @State private var isHovered = false

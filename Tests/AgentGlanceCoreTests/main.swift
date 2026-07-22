@@ -3373,7 +3373,7 @@ func testNotchLayoutExtendsFromLeftSideOfHardwareNotch() throws {
     try expect(layout.presentation, equals: .notch, "a screen with a camera housing keeps the notch")
     try expect(layout.width, equals: 800, "wide expanded panel leaves room for smooth side curves")
     try expect(layout.height, equals: 38, "collapsed panel height")
-    try expect(layout.expandedHeight, equals: 406, "expanded panel height")
+    try expect(layout.expandedHeight, equals: 354, "expanded panel height")
     try expect(layout.originX, equals: 356, "expanded panel x")
     try expect(layout.originY, equals: 944, "panel y")
     try expect(layout.notchWidth, equals: 180, "hardware notch width")
@@ -3418,6 +3418,63 @@ func testNotchLayoutPinsCompactBarToPhysicalNotchWhenExpandedPanelIsClamped() th
         layout.barLeadingOffset(leftWidth: 0, rightWidth: 42),
         equals: 350,
         "same-width status transition still moves the interactive origin"
+    )
+}
+
+func testNotchLayoutExpandedHeaderWingsFlankTheCamera() throws {
+    let notched = NotchLayout(
+        screenMinX: 0,
+        screenWidth: 1_512,
+        screenMaxY: 982,
+        safeAreaTop: 38,
+        leftNotchEdgeX: 666,
+        rightNotchEdgeX: 846
+    )
+    let notchedWings = notched.expandedHeaderWingWidths()
+    try expect(notchedWings.left, equals: 310, "left wing spans the panel edge to the camera")
+    try expect(notchedWings.right, equals: 310, "right wing spans the camera to the panel edge")
+    try expect(
+        notchedWings.left + notched.notchWidth + notchedWings.right,
+        equals: notched.width,
+        "wings and camera cutout tile the expanded panel exactly"
+    )
+
+    // A panel clamped to a narrow display keeps the camera cutout pinned to
+    // the physical notch, so the wings become asymmetric but still tile.
+    let clamped = NotchLayout(
+        screenMinX: 0,
+        screenWidth: 600,
+        screenMaxY: 900,
+        safeAreaTop: 32,
+        leftNotchEdgeX: 350,
+        rightNotchEdgeX: 430
+    )
+    let clampedWings = clamped.expandedHeaderWingWidths()
+    try expect(clampedWings.left, equals: 350, "clamped left wing reaches the physical notch edge")
+    try expect(
+        clampedWings.left + clamped.notchWidth + clampedWings.right,
+        equals: clamped.width,
+        "clamped wings and cutout still tile the panel"
+    )
+
+    let pill = NotchLayout(
+        screenMinX: 0,
+        screenWidth: 2_560,
+        screenMaxY: 1_440,
+        safeAreaTop: 0,
+        leftNotchEdgeX: nil,
+        rightNotchEdgeX: nil,
+        menuBarHeight: 24
+    )
+    let pillWings = pill.expandedHeaderWingWidths()
+    try expect(pillWings.left, equals: 400, "pill has no cutout so the wings split the panel")
+    try expect(pillWings.right, equals: 400, "pill wings stay symmetric")
+    try expect(pill.notchWidth, equals: 0, "no phantom camera gap between pill wings")
+
+    try expect(
+        SessionMenuLayout.maximumCardHeight,
+        equals: 316,
+        "headerless card holds only the list and its vertical insets"
     )
 }
 
@@ -3510,7 +3567,7 @@ func testNotchLayoutUsesPillStyleOnNotchlessScreen() throws {
     try expect(layout.originY + layout.height, equals: 1_440, "pill and notch share the top edge")
     try expect(layout.width, equals: 800, "panel wide enough for session details and side curves")
     try expect(layout.originX, equals: 880, "centered on screen")
-    try expect(layout.expandedHeight, equals: 392, "menu hangs below the pill")
+    try expect(layout.expandedHeight, equals: 340, "menu hangs below the pill")
 }
 
 func testNotchLayoutPillFallsBackToStandardMenuBarHeight() throws {
@@ -7099,6 +7156,7 @@ let tests: [(String, () throws -> Void)] = [
     ("notch layout extends from left side of hardware notch", testNotchLayoutExtendsFromLeftSideOfHardwareNotch),
     ("notch layout keeps expanded content close to the side edges", testNotchLayoutKeepsExpandedContentCloseToTheSideEdges),
     ("notch layout pins compact bar to physical notch when panel is clamped", testNotchLayoutPinsCompactBarToPhysicalNotchWhenExpandedPanelIsClamped),
+    ("notch layout expanded header wings flank the camera", testNotchLayoutExpandedHeaderWingsFlankTheCamera),
     ("notch layout adds only a minimal fixed right wing", testNotchLayoutAddsOnlyAMinimalFixedRightWing),
     ("notch layout reserves right outer curve clearance for blocked count", testNotchLayoutReservesRightOuterCurveClearanceForBlockedCount),
     ("notch layout uses pill style on notchless screen", testNotchLayoutUsesPillStyleOnNotchlessScreen),

@@ -214,6 +214,19 @@ public struct NotchLayout: Equatable, Sendable {
         }
     }
 
+    /// Widths of the expanded header wings flanking the camera cutout,
+    /// measured inside the expanded panel. Pill mode has no cutout
+    /// (notchWidth == 0), so the wings simply split the panel.
+    public func expandedHeaderWingWidths() -> (left: CGFloat, right: CGFloat) {
+        switch presentation {
+        case .notch:
+            let left = max(0, (notchLeadingX ?? originX) - originX)
+            return (left, max(0, width - left - notchWidth))
+        case .pill:
+            return (width / 2, width / 2)
+        }
+    }
+
     /// When statuses exist only to the left of the camera, add a simple empty
     /// right wing for a finished silhouette. The real left wing stays intact;
     /// no width is mirrored back into it, and a real right status takes over
