@@ -279,8 +279,8 @@ func testStateRepositoryDoesNotPreserveIdentityFromOversizedDocument() throws {
     )
 }
 
-/// A freshly launched Claude sits at the prompt waiting for input, so
-/// SessionStart must not paint the session green.
+/// A freshly launched Claude sits at the prompt waiting for input, so its
+/// lifecycle starts idle rather than pretending the agent is already working.
 func testClaudeSessionStartCreatesIdleState() throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -2522,6 +2522,21 @@ func testSessionStatusSummarySilencesAcknowledgedBlockedSessions() throws {
     try expect(summary.waitingCount, equals: 1, "visited session remains visible as a quiet wait")
 }
 
+func testIdleStatusIndicatorsUseTheGreenDotStyle() throws {
+    try expect(
+        SessionStatus.idle.indicatorStyle,
+        equals: .greenDot,
+        "an idle session row uses a green dot"
+    )
+    try expect(
+        SessionStatusSummary.StatusEntry.Kind.waiting.indicatorStyle,
+        equals: .greenDot,
+        "the compact waiting summary uses the same green dot"
+    )
+    try expect(SessionStatus.working.indicatorStyle, equals: .spinner, "working remains animated")
+    try expect(SessionStatus.needsAttention.indicatorStyle, equals: .redDot, "attention remains red")
+}
+
 func testPointerMovementGateStaysLockedUntilPointerMoves() throws {
     var gate = PointerMovementGate()
 
@@ -3416,6 +3431,7 @@ func testNotchLayoutAddsOnlyAMinimalFixedRightWing() throws {
         rightNotchEdgeX: 846
     )
     let activeNotchWing = notched.statusWingWidth(
+        side: .left,
         visibleIndicatorCount: 1,
         showsIdleMark: false
     )
@@ -3423,7 +3439,7 @@ func testNotchLayoutAddsOnlyAMinimalFixedRightWing() throws {
     try expect(notched.leftStatusWingLeadingPadding, equals: 8, "left wing has a small outer margin")
     try expect(notched.leftStatusWingTrailingPadding, equals: 12, "left wing leaves a small camera-facing gap")
     try expect(notched.rightStatusWingLeadingPadding, equals: 12, "right wing mirrors the small camera gap")
-    try expect(notched.rightStatusWingTrailingPadding, equals: 8, "right wing has a small outer margin")
+    try expect(notched.rightStatusWingTrailingPadding, equals: 14, "right count clears the curved outer shoulder")
     try expect(activeNotchWing, equals: 50, "hardware-notch counter leaves a 12-point camera gap")
     let balanced = notched.balancedStatusWingWidths(leftWidth: activeNotchWing, rightWidth: 0)
 
@@ -3443,6 +3459,34 @@ func testNotchLayoutAddsOnlyAMinimalFixedRightWing() throws {
     let unbalanced = pill.balancedStatusWingWidths(leftWidth: 54, rightWidth: 0)
     try expect(unbalanced.left, equals: 54, "notchless drop preserves its real left content")
     try expect(unbalanced.right, equals: 0, "notchless drop adds no phantom status wing")
+}
+
+func testNotchLayoutReservesRightOuterCurveClearanceForBlockedCount() throws {
+    let layout = NotchLayout(
+        screenMinX: 0,
+        screenWidth: 1_512,
+        screenMaxY: 982,
+        safeAreaTop: 38,
+        leftNotchEdgeX: 666,
+        rightNotchEdgeX: 846
+    )
+
+    try expect(
+        layout.rightStatusWingTrailingPadding,
+        equals: HangingNotchMetrics.topShoulderRadius,
+        "the outer blocked count stays inside the curved right shoulder"
+    )
+    try expect(
+        layout.statusWingWidth(
+            side: .right,
+            visibleIndicatorCount: 1,
+            showsIdleMark: false
+        ),
+        equals: NotchLayout.statusIndicatorSlotWidth
+            + layout.rightStatusWingLeadingPadding
+            + layout.rightStatusWingTrailingPadding,
+        "the right wing width is calculated from its own mirrored paddings"
+    )
 }
 
 func testNotchLayoutUsesPillStyleOnNotchlessScreen() throws {
@@ -3684,6 +3728,7 @@ func testNotchLayoutUsesNormalizedCameraClearance() throws {
     )
 
     let leftWingWidth = layout.statusWingWidth(
+        side: .left,
         visibleIndicatorCount: 2,
         showsIdleMark: false
     )
@@ -7027,6 +7072,7 @@ let tests: [(String, () throws -> Void)] = [
     ("session status summary counts global running waiting and blocked sessions", testSessionStatusSummaryCountsGlobalRunningWaitingAndBlockedSessions),
     ("session status summary visible entries omit zero counts", testSessionStatusSummaryVisibleEntriesOmitsZeroCounts),
     ("session status summary silences acknowledged blocked sessions", testSessionStatusSummarySilencesAcknowledgedBlockedSessions),
+    ("idle status indicators use the green dot style", testIdleStatusIndicatorsUseTheGreenDotStyle),
     ("pointer movement gate stays locked until pointer moves", testPointerMovementGateStaysLockedUntilPointerMoves),
     ("pointer samples publish only containment transitions", testPointerSamplesPublishOnlyContainmentTransitions),
     ("hover interaction ignores synthetic exit while pointer remains inside", testHoverInteractionIgnoresSyntheticExitWhilePointerRemainsInside),
@@ -7054,6 +7100,7 @@ let tests: [(String, () throws -> Void)] = [
     ("notch layout keeps expanded content close to the side edges", testNotchLayoutKeepsExpandedContentCloseToTheSideEdges),
     ("notch layout pins compact bar to physical notch when panel is clamped", testNotchLayoutPinsCompactBarToPhysicalNotchWhenExpandedPanelIsClamped),
     ("notch layout adds only a minimal fixed right wing", testNotchLayoutAddsOnlyAMinimalFixedRightWing),
+    ("notch layout reserves right outer curve clearance for blocked count", testNotchLayoutReservesRightOuterCurveClearanceForBlockedCount),
     ("notch layout uses pill style on notchless screen", testNotchLayoutUsesPillStyleOnNotchlessScreen),
     ("notch layout pill falls back to standard menu bar height", testNotchLayoutPillFallsBackToStandardMenuBarHeight),
     ("hanging notch geometry creates concave shoulders and rounded base", testHangingNotchGeometryCreatesConcaveShouldersAndRoundedBase),

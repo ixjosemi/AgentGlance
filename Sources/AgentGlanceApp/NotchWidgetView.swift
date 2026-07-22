@@ -67,10 +67,12 @@ struct NotchWidgetView: View {
         let rightEntries = summary.visibleEntries.filter { $0.kind == .blocked }
         let showsIdleMark = summary.activeSessionCount == 0
         let naturalLeftWidth = layout.statusWingWidth(
+            side: .left,
             visibleIndicatorCount: leftEntries.count,
             showsIdleMark: showsIdleMark
         )
         let naturalRightWidth = layout.statusWingWidth(
+            side: .right,
             visibleIndicatorCount: rightEntries.count,
             showsIdleMark: false
         )
@@ -525,24 +527,20 @@ private extension SessionStatus {
 
 /// One compact status counter. Zero-count states never reach this view —
 /// the summary filters them out — so every glyph on the bar earns its
-/// space. Waiting and blocked share the same dot size: state reads through
-/// color alone, keeping red as the only hue with meaning.
+/// space. Waiting and blocked share the same dot size: green marks an idle
+/// session ready for input, while red remains reserved for attention.
 private struct StatusSummaryIndicator: View {
     let kind: SessionStatusSummary.StatusEntry.Kind
     let count: Int
 
     var body: some View {
         HStack(spacing: 3) {
-            switch kind {
-            case .running:
+            switch kind.indicatorStyle {
+            case .spinner:
                 WorkingPixelSpinner()
-            case .waiting:
+            case .greenDot, .redDot, .mutedDot:
                 Circle()
-                    .fill(.white.opacity(0.45))
-                    .frame(width: 8, height: 8)
-            case .blocked:
-                Circle()
-                    .fill(.red)
+                    .fill(indicatorColor(for: kind.indicatorStyle))
                     .frame(width: 8, height: 8)
             }
             Text(count, format: .number)
@@ -551,7 +549,7 @@ private struct StatusSummaryIndicator: View {
         }
         .foregroundStyle(.white.opacity(0.94))
         // Fixed slot: the wing-width formula in NotchLayout adds up to
-        // exactly the rendered bar, keeping outer padding symmetric.
+        // exactly the rendered bar, preserving each side's intended padding.
         .frame(width: NotchLayout.statusIndicatorSlotWidth)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(count) \(kind.accessibilityName) sessions")
@@ -560,8 +558,8 @@ private struct StatusSummaryIndicator: View {
 
 /// The classic braille dot-matrix spinner used across CLI tools (ora,
 /// Convoy's own progress indicator) — several dots lit per frame rather
-/// than one pixel chasing itself. Monochrome by design: red stays the only
-/// color with meaning, reserved for needsAttention.
+/// than one pixel chasing itself. Monochrome by design so the green and red
+/// dots remain easy to distinguish from active work.
 private struct WorkingPixelSpinner: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private static let stepInterval: TimeInterval = 0.08
@@ -586,16 +584,13 @@ private struct WorkingPixelSpinner: View {
     }
 }
 
-/// Shared dot color for the per-session menu rows: red for needsAttention,
-/// a neutral dim white for idle — the resting state carries no color of its
-/// own, only reduced brightness. `.working` rows render a spinner instead
-/// (see `mainRow`) so this branch is unreachable for that case.
-private func semaphoreColor(for status: SessionStatus) -> Color {
-    switch status {
-    case .working: .white
-    case .idle: .white.opacity(0.3)
-    case .needsAttention: .red
-    case .ended: .gray
+/// Shared colors for compact and per-session status dots.
+private func indicatorColor(for style: StatusIndicatorStyle) -> Color {
+    switch style {
+    case .spinner: .white
+    case .mutedDot: .gray
+    case .greenDot: .green
+    case .redDot: .red
     }
 }
 
@@ -864,11 +859,11 @@ private struct SessionRow: View {
     private var mainRow: some View {
         HStack(spacing: 12) {
             AgentIconView(tool: session.tool)
-            if session.status == .working {
+            if session.status.indicatorStyle == .spinner {
                 WorkingPixelSpinner()
             } else {
                 Circle()
-                    .fill(semaphoreColor(for: session.status))
+                    .fill(indicatorColor(for: session.status.indicatorStyle))
                     .frame(width: 9, height: 9)
             }
             VStack(alignment: .leading, spacing: 3) {

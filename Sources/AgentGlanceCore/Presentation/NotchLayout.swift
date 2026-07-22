@@ -9,6 +9,11 @@ public struct NotchLayout: Equatable, Sendable {
         case pill
     }
 
+    public enum StatusWingSide: Equatable, Sendable {
+        case left
+        case right
+    }
+
     public let presentation: Presentation
     public let width: CGFloat
     public let height: CGFloat
@@ -99,16 +104,17 @@ public struct NotchLayout: Equatable, Sendable {
     public static let statusWingEdgePadding: CGFloat = 18
     /// The camera-facing edge of a hardware-notch wing reserves enough room
     /// to keep the counter cluster fully clear of the physical camera cutout.
-    /// Hardware-notch counters keep a small outer margin and enough camera
-    /// clearance that the trailing session count remains fully visible.
+    /// The right wing ends in a wider count glyph rather than the left wing's
+    /// small status glyph, so its outer inset must also clear the shoulder.
     public static let hardwareNotchOuterWingPadding: CGFloat = 8
+    public static let hardwareNotchRightOuterWingPadding = HangingNotchMetrics.topShoulderRadius
     public static let hardwareNotchInnerWingPadding: CGFloat = 12
     /// A small empty continuation after a physical notch, just enough to
     /// finish the hanging silhouette without mirroring a status wing.
     public static let hardwareNotchFakeRightWingWidth: CGFloat = 28
 
-    /// The outer edge padding for a compact status wing. Hardware-notch wings
-    /// use larger inset on the camera side; see the side-specific properties.
+    /// The left outer-edge padding for a compact status wing. See the
+    /// side-specific properties for the wider right counter clearance.
     public var statusWingEdgePadding: CGFloat {
         switch presentation {
         case .notch: Self.hardwareNotchOuterWingPadding
@@ -131,11 +137,11 @@ public struct NotchLayout: Equatable, Sendable {
     }
 
     public var rightStatusWingTrailingPadding: CGFloat {
-        presentation == .notch ? Self.hardwareNotchOuterWingPadding : Self.statusWingEdgePadding
+        presentation == .notch ? Self.hardwareNotchRightOuterWingPadding : Self.statusWingEdgePadding
     }
 
     /// Compact status-bar wing sizing: one slot per *visible* indicator —
-    /// zero-count kinds claim nothing — plus equal padding on both ends.
+    /// zero-count kinds claim nothing — plus the requested edge padding.
     /// A completely quiet bar keeps the same minimum outer clearance as a
     /// populated wing. The optional padding lets the physical notch stay
     /// compact while the virtual pill remains comfortably spaced.
@@ -153,8 +159,8 @@ public struct NotchLayout: Equatable, Sendable {
     }
 
     /// Compact status-wing width with independently controllable leading and
-    /// trailing insets. Hardware-notch wings use opposite values on each side
-    /// so their counter clusters stay visually symmetric around the cutout.
+    /// trailing insets. Hardware-notch wings use side-specific values so the
+    /// camera gap and each outer glyph both receive the required clearance.
     public static func statusWingWidth(
         visibleIndicatorCount: Int,
         showsIdleMark: Bool,
@@ -171,13 +177,28 @@ public struct NotchLayout: Equatable, Sendable {
             + leading + trailing
     }
 
-    /// Status-wing width for this layout's presentation.
-    public func statusWingWidth(visibleIndicatorCount: Int, showsIdleMark: Bool) -> CGFloat {
-        Self.statusWingWidth(
+    /// Side-aware status-wing width. Keeping the side explicit prevents the
+    /// mirrored right wing from accidentally reusing the left wing's insets.
+    public func statusWingWidth(
+        side: StatusWingSide,
+        visibleIndicatorCount: Int,
+        showsIdleMark: Bool
+    ) -> CGFloat {
+        let leadingPadding: CGFloat
+        let trailingPadding: CGFloat
+        switch side {
+        case .left:
+            leadingPadding = leftStatusWingLeadingPadding
+            trailingPadding = leftStatusWingTrailingPadding
+        case .right:
+            leadingPadding = rightStatusWingLeadingPadding
+            trailingPadding = rightStatusWingTrailingPadding
+        }
+        return Self.statusWingWidth(
             visibleIndicatorCount: visibleIndicatorCount,
             showsIdleMark: showsIdleMark,
-            leadingPadding: leftStatusWingLeadingPadding,
-            trailingPadding: leftStatusWingTrailingPadding
+            leadingPadding: leadingPadding,
+            trailingPadding: trailingPadding
         )
     }
 
