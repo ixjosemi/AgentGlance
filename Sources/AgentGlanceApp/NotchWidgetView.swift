@@ -1,12 +1,12 @@
 import AppKit
+import Combine
 import SwiftUI
 
 import AgentGlanceCore
 
 struct NotchPointerSnapshot: Equatable {
     let isInside: Bool
-    let location: DisplayPoint
-    let sequence: UInt
+    let revision: UInt
 }
 
 /// The AppKit hosting view owns one fixed tracking area for its entire
@@ -16,16 +16,25 @@ struct NotchPointerSnapshot: Equatable {
 final class NotchPointerTracker: ObservableObject {
     @Published private(set) var snapshot = NotchPointerSnapshot(
         isInside: false,
-        location: DisplayPoint(x: 0, y: 0),
-        sequence: 0
+        revision: 0
     )
+    let hoverExpansionRequests = PassthroughSubject<DisplayPoint, Never>()
+    private var reducer = PointerSampleReducer()
 
-    func update(isInside: Bool, location: DisplayPoint) {
-        snapshot = NotchPointerSnapshot(
-            isInside: isInside,
-            location: location,
-            sequence: snapshot.sequence &+ 1
-        )
+    @discardableResult
+    func update(isInside: Bool, location: DisplayPoint) -> DisplayPoint {
+        let reduction = reducer.reduce(isInside: isInside, location: location)
+        if let containment = reduction.containmentChange {
+            snapshot = NotchPointerSnapshot(
+                isInside: containment.isInside,
+                revision: containment.revision
+            )
+        }
+        return reduction.location
+    }
+
+    func requestHoverExpansion(at location: DisplayPoint) {
+        hoverExpansionRequests.send(location)
     }
 }
 
@@ -33,10 +42,6 @@ struct NotchWidgetView: View {
     @Bindable var store: StateStore
     @AppStorage("hideWhenEmpty") private var hideWhenEmpty = false
     let layout: NotchLayout
-    /// After a screen jump the controller keeps hover-expansion locked until
-    /// the pointer actually moves; this closure answers whether a hover at
-    /// the given global position may open the menu. Clicks bypass it.
-    let allowHoverExpansion: (DisplayPoint) -> Bool
     @ObservedObject var pointerTracker: NotchPointerTracker
     let requestPointerRefresh: () -> Void
     let onInteractiveRegionChange: (HangingNotchInteractionRegion) -> Void
@@ -195,7 +200,10 @@ struct NotchWidgetView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: isExpanded)
         .onChange(of: pointerTracker.snapshot) { _, snapshot in
-            handlePointerUpdate(snapshot, compactFrame: compactInteractiveFrame)
+            handlePointerContainmentChange(snapshot)
+        }
+        .onReceive(pointerTracker.hoverExpansionRequests) { location in
+            handleHoverExpansionRequest(location, compactFrame: compactInteractiveFrame)
         }
         .onAppear {
             publishInteractiveRegion(
@@ -404,32 +412,32 @@ struct NotchWidgetView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: workItem)
     }
 
-    private func handlePointerUpdate(
-        _ snapshot: NotchPointerSnapshot,
-        compactFrame: DisplayFrame
-    ) {
+    private func handlePointerContainmentChange(_ snapshot: NotchPointerSnapshot) {
         if snapshot.isInside {
             isHoveringPanel = true
             cancelPendingCollapse()
-            // After a screen jump the bar can materialize under a stationary
-            // cursor. The fixed AppKit tracking area supplies every actual
-            // pointer movement to this gate; clicks still bypass it.
-            guard HoverInteraction.shouldScheduleExpansion(
-                pointer: snapshot.location,
-                compactFrame: compactFrame,
-                panelOriginX: layout.originX,
-                panelTopY: layout.originY + layout.height,
-                isExpanded: isExpanded,
-                topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
-                bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
-            ) else { return }
-            if allowHoverExpansion(snapshot.location) { scheduleExpansion() }
         } else {
             isHoveringPanel = false
             hoverExpandWorkItem?.cancel()
             hoverExpandWorkItem = nil
             scheduleCollapseOnHoverExit()
         }
+    }
+
+    private func handleHoverExpansionRequest(
+        _ location: DisplayPoint,
+        compactFrame: DisplayFrame
+    ) {
+        guard HoverInteraction.shouldScheduleExpansion(
+            pointer: location,
+            compactFrame: compactFrame,
+            panelOriginX: layout.originX,
+            panelTopY: layout.originY + layout.height,
+            isExpanded: isExpanded,
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
+        ) else { return }
+        scheduleExpansion()
     }
 
     private func settleAfterDetachedInteraction() {
@@ -637,6 +645,7 @@ private struct SessionMenuCard: View {
     @State private var errorMessage: String?
     // At most one row shows its inline actions; opening another closes it.
     @State private var actionsSessionID: String?
+    @State private var branchCoordinator = GitBranchResolutionCoordinator()
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
@@ -678,7 +687,7 @@ private struct SessionMenuCard: View {
                 // past the panel and clipping the lower controls.
                 ScrollViewReader { proxy in
                     ScrollView(showsIndicators: false) {
-                        VStack(spacing: 0) {
+                        LazyVStack(spacing: 0) {
                             ForEach(sessions) { session in
                                 row(for: session)
                                     .id(session.id)
@@ -727,7 +736,8 @@ private struct SessionMenuCard: View {
             focus: focusSession,
             rename: rename,
             kill: killSession,
-            setKeyboardFocus: setKeyboardFocus
+            setKeyboardFocus: setKeyboardFocus,
+            branchCoordinator: branchCoordinator
         )
     }
 
@@ -783,6 +793,7 @@ private struct SessionRow: View {
     let rename: (AgentSession, String) -> Void
     let kill: (AgentSession) -> Void
     let setKeyboardFocus: (Bool) -> Void
+    let branchCoordinator: GitBranchResolutionCoordinator
 
     /// Sub-modes of the inline action area: the button strip, the rename
     /// field, or the kill confirmation. All live inside the row itself so
@@ -831,14 +842,15 @@ private struct SessionRow: View {
             mode = .menu
         }
         .onDisappear { endRenameKeyboard() }
-        // Resolving the branch reads .git/HEAD from disk; the render path
-        // must not pay for it on every body evaluation. Menu rows are
-        // transient, so a branch switched mid-display refreshes on the
-        // next open.
-        .task(id: session.cwd) { [cwd = session.cwd] in
-            branchName = await Task.detached {
-                GitWorkspaceInspector.branchName(forWorkingDirectory: cwd)
-            }.value
+        // Lazy rows request branch data only while visible. Disappearance
+        // cancels queued work through the coordinator; the menu-scoped cache
+        // is discarded on close so a later open sees branch switches.
+        .task(id: session.currentStep == nil ? session.cwd : nil) { [cwd = session.cwd] in
+            branchName = nil
+            guard session.currentStep == nil else { return }
+            let resolved = await branchCoordinator.branchName(forWorkingDirectory: cwd)
+            guard !Task.isCancelled else { return }
+            branchName = resolved
         }
         .accessibilityLabel("\(title), \(session.status.accessibilityName)")
     }

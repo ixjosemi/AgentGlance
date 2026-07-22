@@ -28,7 +28,7 @@ public struct CodexNotifyProcessor: Sendable {
         guard event.type == "agent-turn-complete" else {
             throw CodexNotifyError.unsupportedEvent(event.type)
         }
-        let existing = try repository.loadSessions().first {
+        let existing = try repository.loadLifecycleSessions().first {
             $0.tool == .codex && $0.sessionID == event.threadID
         }
         let session = AgentSession(

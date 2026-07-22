@@ -136,6 +136,24 @@ public struct AgentSession: Codable, Identifiable, Equatable, Sendable {
         )
     }
 
+    func replacingProcessIdentity(_ processIdentity: ProcessIdentity) -> AgentSession {
+        AgentSession(
+            schemaVersion: schemaVersion,
+            tool: tool,
+            sessionID: sessionID,
+            pid: pid,
+            processIdentity: processIdentity,
+            status: status,
+            attentionReason: attentionReason,
+            cwd: cwd,
+            startedAt: startedAt,
+            updatedAt: updatedAt,
+            terminal: terminal,
+            source: source,
+            currentStep: currentStep
+        )
+    }
+
     public init(
         schemaVersion: Int = 1,
         tool: AgentTool,

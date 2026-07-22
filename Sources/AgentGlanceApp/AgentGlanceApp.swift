@@ -46,13 +46,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
             return
         }
-        let scheduler = ObservationScheduler(repository: repository)
-        observationScheduler = scheduler
-        do {
-            try scheduler.performInitialReconciliation()
-        } catch {
-            NSLog("AgentGlance initial process reconciliation failed: %@", String(describing: error))
-        }
         // Session names live next to — never inside — the state directory:
         // the store watches that directory and decode-attempts every .json.
         let store = StateStore(
@@ -85,12 +78,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             store.stopObserving()
             NSLog("AgentGlance failed to start state observation: %@", String(describing: error))
         }
+        // State observation is armed before the scheduler can save or remove
+        // anything. The completion is a final main-thread baseline after the
+        // asynchronous reconciliation, independent of event coalescing.
+        let scheduler = ObservationScheduler(repository: repository)
+        observationScheduler = scheduler
+        scheduler.startWithInitialReconciliation { [weak self, weak scheduler, weak store] in
+            guard let self,
+                  self.observationScheduler === scheduler,
+                  self.store === store else { return }
+            store?.reloadRecordingError()
+        }
         panelController = NotchPanelController(store: store)
         panelController?.show()
-        scheduler.start()
         let focusObserver = FocusAcknowledgmentObserver(store: store)
         focusAcknowledgmentObserver = focusObserver
         focusObserver.start()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        focusAcknowledgmentObserver?.stop()
+        observationScheduler?.stop()
+        store?.stopObserving()
     }
 
 }

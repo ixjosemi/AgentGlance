@@ -43,7 +43,20 @@ public struct ReaperService: Sendable {
         detected activeProcesses: [DetectedAgentProcess],
         preservingSessionIDs: Set<String>
     ) throws -> ReaperResult {
-        let sessions = try repository.loadSessions()
+        var snapshot = try repository.loadSnapshot()
+        return try reap(
+            detected: activeProcesses,
+            preservingSessionIDs: preservingSessionIDs,
+            snapshot: &snapshot
+        )
+    }
+
+    package func reap(
+        detected activeProcesses: [DetectedAgentProcess],
+        preservingSessionIDs: Set<String>,
+        snapshot: inout StateSnapshot
+    ) throws -> ReaperResult {
+        let sessions = snapshot.sessions
         nativeMisses.retain(sessionIDs: Set(sessions.map(\.id)))
         let activeProcessKeys = Set(activeProcesses.map(processKey))
         var removedSessionIDs: [String] = []
@@ -58,23 +71,29 @@ public struct ReaperService: Sendable {
                 activeProcessKeys: activeProcessKeys,
                 activeProcesses: activeProcesses
             ) {
-                try repository.remove(session)
+                try repository.remove(session, updating: &snapshot)
                 removedSessionIDs.append(session.sessionID)
             } else {
                 survivors.append(session)
             }
         }
-        let remaining = try rebindDaemonHostedSessions(survivors, to: activeProcesses)
+        let remaining = try rebindDaemonHostedSessions(
+            survivors,
+            to: activeProcesses,
+            snapshot: &snapshot
+        )
         let tracked = try pruneSupersededSessions(
             remaining,
-            removedSessionIDs: &removedSessionIDs
+            removedSessionIDs: &removedSessionIDs,
+            snapshot: &snapshot
         )
         var createdSessionIDs: [String] = []
         for process in activeProcesses {
             let processKey = processKey(process)
-            if let existing = tracked[processKey] {
-                try refreshFallback(existing, from: process)
-                try adoptScannedTerminal(existing, from: process)
+            if let existing = tracked[processKey]
+                ?? tracked.values.first(where: { processMatches($0, process) }) {
+                try refreshFallback(existing, from: process, snapshot: &snapshot)
+                try adoptScannedTerminal(existing, from: process, snapshot: &snapshot)
                 continue
             }
             // No plugin/hook has spoken for this process yet — idle (the
@@ -92,7 +111,7 @@ public struct ReaperService: Sendable {
                 updatedAt: Date(),
                 terminal: process.terminal,
                 source: .reaper
-            ))
+            ), updating: &snapshot)
             createdSessionIDs.append(sessionID)
         }
         return ReaperResult(
@@ -104,22 +123,24 @@ public struct ReaperService: Sendable {
     /// Applies optional terminal enrichment after liveness reconciliation.
     /// Ghostty Apple Events must never sit in front of the reaper, so the
     /// scheduler calls this only after the basic libproc pass has completed.
+    /// Missing enrichment is not evidence that a basic detection has died.
     public func applyTerminalEnrichment(
         basic: [DetectedAgentProcess],
         enriched: [DetectedAgentProcess]
     ) throws {
-        let enrichedKeys = Set(enriched.map { "\($0.tool.rawValue)-\($0.processID)" })
-        let basicKeys = Set(basic.map { "\($0.tool.rawValue)-\($0.processID)" })
-        for session in try repository.loadSessions() {
-            let key = "\(session.tool.rawValue)-\(session.pid)"
-            if session.source == .reaper,
-               basicKeys.contains(key),
-               !enrichedKeys.contains(key) {
-                try repository.remove(session)
-                continue
-            }
+        var snapshot = try repository.loadSnapshot()
+        try applyTerminalEnrichment(basic: basic, enriched: enriched, snapshot: &snapshot)
+    }
+
+    package func applyTerminalEnrichment(
+        basic: [DetectedAgentProcess],
+        enriched: [DetectedAgentProcess],
+        snapshot: inout StateSnapshot
+    ) throws {
+        let sessions = snapshot.sessions
+        for session in sessions {
             guard let process = enriched.first(where: { processMatches(session, $0) }) else { continue }
-            try adoptScannedTerminal(session, from: process)
+            try adoptScannedTerminal(session, from: process, snapshot: &snapshot)
         }
     }
 
@@ -130,7 +151,8 @@ public struct ReaperService: Sendable {
     /// process. Keep the winner per process, delete the noise.
     private func pruneSupersededSessions(
         _ sessions: [AgentSession],
-        removedSessionIDs: inout [String]
+        removedSessionIDs: inout [String],
+        snapshot: inout StateSnapshot
     ) throws -> [String: AgentSession] {
         var tracked: [String: AgentSession] = [:]
         for session in sessions {
@@ -146,7 +168,7 @@ public struct ReaperService: Sendable {
             } else {
                 loser = session
             }
-            try repository.remove(loser)
+            try repository.remove(loser, updating: &snapshot)
             removedSessionIDs.append(loser.sessionID)
         }
         return tracked
@@ -208,7 +230,8 @@ public struct ReaperService: Sendable {
     /// and process liveness track the terminal the user actually sees.
     private func rebindDaemonHostedSessions(
         _ sessions: [AgentSession],
-        to activeProcesses: [DetectedAgentProcess]
+        to activeProcesses: [DetectedAgentProcess],
+        snapshot: inout StateSnapshot
     ) throws -> [AgentSession] {
         let processesByTool = Dictionary(grouping: activeProcesses, by: \.tool)
         var reserved = Set<String>()
@@ -248,19 +271,26 @@ public struct ReaperService: Sendable {
                       let exact = activeProcesses.first(where: {
                           $0.tool == session.tool && $0.processID == session.pid
                       }), exact.processIdentity != nil else { return session }
-                let identified = session.replacingProcess(exact)
-                try repository.save(identified)
-                return identified
+                return try repository.saveEnrichment(
+                    for: session,
+                    process: exact,
+                    terminal: nil,
+                    updating: &snapshot
+                ) ?? session
             }
-            let rebound = session.replacingProcess(process)
-            try repository.save(rebound)
-            return rebound
+            return try repository.saveEnrichment(
+                for: session,
+                process: process,
+                terminal: nil,
+                updating: &snapshot
+            ) ?? session
         }
     }
 
     private func refreshFallback(
         _ session: AgentSession,
-        from process: DetectedAgentProcess
+        from process: DetectedAgentProcess,
+        snapshot: inout StateSnapshot
     ) throws {
         guard session.source == .reaper,
               session.terminal != process.terminal || session.cwd != process.cwd else {
@@ -278,7 +308,7 @@ public struct ReaperService: Sendable {
             updatedAt: Date(),
             terminal: process.terminal,
             source: .reaper
-        ))
+        ), updating: &snapshot)
     }
 
     /// Hook- and plugin-written documents cannot see which Ghostty surface
@@ -291,10 +321,16 @@ public struct ReaperService: Sendable {
     /// not activity.
     private func adoptScannedTerminal(
         _ session: AgentSession,
-        from process: DetectedAgentProcess
+        from process: DetectedAgentProcess,
+        snapshot: inout StateSnapshot
     ) throws {
         guard session.source != .reaper,
               let scannedTerminalID = process.terminal.ghosttyTerminalID else {
+            return
+        }
+        guard let session = try repository.reload(session, updating: &snapshot),
+              session.source != .reaper,
+              processMatches(session, process) else {
             return
         }
         let adoptsIdentifier = session.terminal.ghosttyTerminalID != scannedTerminalID
@@ -303,16 +339,9 @@ public struct ReaperService: Sendable {
             current: session.terminal.windowTitleHint
         )
         guard adoptsIdentifier || adoptsTitle else { return }
-        try repository.save(AgentSession(
-            tool: session.tool,
-            sessionID: session.sessionID,
-            pid: session.pid,
-            processIdentity: session.processIdentity,
-            status: session.status,
-            attentionReason: session.attentionReason,
-            cwd: session.cwd,
-            startedAt: session.startedAt,
-            updatedAt: session.updatedAt,
+        _ = try repository.saveEnrichment(
+            for: session,
+            process: process,
             terminal: TerminalContext(
                 termProgram: process.terminal.termProgram ?? session.terminal.termProgram,
                 ghosttyTerminalID: scannedTerminalID,
@@ -323,9 +352,8 @@ public struct ReaperService: Sendable {
                     ? nil
                     : process.terminal.windowTitleHint ?? session.terminal.windowTitleHint
             ),
-            source: session.source,
-            currentStep: session.currentStep
-        ))
+            updating: &snapshot
+        )
     }
 
     /// Agents decorate tab titles with spinners and status emoji that churn

@@ -6,11 +6,14 @@ AgentGlance is local-only. It does not contain networking code, telemetry, analy
 
 - running Claude Code, OpenCode, and Codex process metadata;
 - process identifiers, working directories, terminal names, TTYs, and terminal session identifiers;
+- when focused-window display selection is enabled, the frontmost application's PID and normal on-screen window bounds, but never window names, images, or content;
 - AgentGlance hook events from Claude Code and OpenCode;
 - Codex JSONL rollout files under `~/.codex/sessions`, which may contain conversation content;
 - the configuration files modified when the user explicitly runs `agentglance install`.
 
 AgentGlance scans Codex rollout lines locally but extracts and retains only session and lifecycle metadata. Prompt and response fields are discarded. It does not inspect project source files, environment secrets, or API credentials.
+
+Focused-window geometry is sampled locally, reused for up to half a second, and never stored. AgentGlance does not request Accessibility or Screen Recording access; if macOS withholds the geometry, display selection falls back to the pointer, then the last selected display, then the first connected display.
 
 ## Data stored
 

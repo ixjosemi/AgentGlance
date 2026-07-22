@@ -52,6 +52,8 @@ public final class StateStore {
     private var pollingTimer: Timer?
     private var directorySource: DispatchSourceFileSystemObject?
     private var observesDarwinNotifications = false
+    private var isObserving = false
+    private var observationGeneration = 0
     private var reloadScheduled = false
 
     /// The overrides file must live outside the repository's directory: the
@@ -166,26 +168,42 @@ public final class StateStore {
     ) throws {
         stopObserving()
         try repository.prepareDirectory()
-        try reload()
-        if layers.contains(.darwinNotification) {
-            startDarwinObservation()
-        }
-        if layers.contains(.fileSystem) {
-            try startDirectoryObservation()
-        }
-        if layers.contains(.polling), let pollInterval {
-            let timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) {
-                [weak self] _ in
-                self?.reloadRecordingError()
+        isObserving = true
+        do {
+            // Arm event capture before reading the baseline. A write during
+            // that read is then either present in the snapshot or schedules a
+            // follow-up reload; there is no unobserved gap between the two.
+            if layers.contains(.darwinNotification) {
+                startDarwinObservation()
             }
-            // Polling is only a safety net behind the event-driven layers;
-            // tolerance lets the kernel coalesce the wakeup with other timers.
-            timer.tolerance = pollInterval / 5
-            pollingTimer = timer
+            if layers.contains(.fileSystem) {
+                try startDirectoryObservation()
+            }
+            try reload()
+            if layers.contains(.polling), let pollInterval {
+                let pollingGeneration = observationGeneration
+                let timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) {
+                    [weak self] _ in
+                    guard let self,
+                          self.isObserving,
+                          self.observationGeneration == pollingGeneration else { return }
+                    self.reloadRecordingError()
+                }
+                // Polling is only a safety net behind the event-driven layers;
+                // tolerance lets the kernel coalesce the wakeup with other timers.
+                timer.tolerance = pollInterval / 5
+                pollingTimer = timer
+            }
+        } catch {
+            stopObserving()
+            throw error
         }
     }
 
     public func stopObserving() {
+        observationGeneration += 1
+        isObserving = false
+        reloadScheduled = false
         pollingTimer?.invalidate()
         pollingTimer = nil
         directorySource?.cancel()
@@ -202,6 +220,7 @@ public final class StateStore {
     }
 
     private func startDarwinObservation() {
+        guard !observesDarwinNotifications else { return }
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(),
             Unmanaged.passUnretained(self).toOpaque(),
@@ -214,6 +233,7 @@ public final class StateStore {
     }
 
     private func startDirectoryObservation() throws {
+        guard directorySource == nil else { return }
         let descriptor = Darwin.open(repository.directoryURL.path, O_EVTONLY)
         guard descriptor >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
@@ -233,16 +253,19 @@ public final class StateStore {
     /// so that an aggressive writer — another process, or a misbehaving
     /// integration — can never storm the main thread with reloads.
     fileprivate func scheduleCoalescedReload() {
-        guard !reloadScheduled else { return }
+        guard isObserving, !reloadScheduled else { return }
         reloadScheduled = true
+        let scheduledGeneration = observationGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self else { return }
+            guard let self,
+                  self.isObserving,
+                  self.observationGeneration == scheduledGeneration else { return }
             self.reloadScheduled = false
             self.reloadRecordingError()
         }
     }
 
-    fileprivate func reloadRecordingError() {
+    package func reloadRecordingError() {
         do {
             try reload()
             lastErrorDescription = nil

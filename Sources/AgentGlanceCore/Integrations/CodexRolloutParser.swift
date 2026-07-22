@@ -33,7 +33,7 @@ public struct CodexRolloutParser: Sendable {
         guard let envelope = try? Self.decoder.decode(Envelope.self, from: line) else {
             return nil
         }
-        let updatedAt = Self.parseDate(envelope.timestamp) ?? Date()
+        guard let updatedAt = Self.parseDate(envelope.timestamp) else { return nil }
         if envelope.type == "session_meta" {
             sessionID = envelope.payload.id
             cwd = envelope.payload.cwd

@@ -32,7 +32,9 @@ public struct ClaudeHookProcessor: Sendable {
         now: Date = Date()
     ) throws {
         let input = try JSONDecoder().decode(Payload.self, from: payload)
-        let existing = try repository.loadSessions().first { $0.sessionID == input.sessionID }
+        let existing = try repository.loadLifecycleSessions().first {
+            $0.sessionID == input.sessionID
+        }
         let state = try state(for: event, notificationType: input.notificationType, existing: existing)
         let session = AgentSession(
             tool: .claude,

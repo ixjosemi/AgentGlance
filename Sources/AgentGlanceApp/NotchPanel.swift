@@ -124,6 +124,7 @@ private final class NotchDisplayPanel {
     private var hostingView: NotchHostingView<NotchWidgetView>?
     private var pointerGate = PointerMovementGate()
     private let pointerTracker = NotchPointerTracker()
+    private var hoverExpansionIntentSent = false
     private let onMenuVisibilityChanged: () -> Void
 
     private(set) var menuIsVisible = false
@@ -168,6 +169,7 @@ private final class NotchDisplayPanel {
 
     func lockHoverExpansion(at point: DisplayPoint) {
         pointerGate.lock(at: point)
+        hoverExpansionIntentSent = false
     }
 
     private func applyLayout() {
@@ -175,8 +177,8 @@ private final class NotchDisplayPanel {
             hostingView.rootView = makeRootView()
         } else {
             let hostingView = NotchHostingView(rootView: makeRootView())
-            hostingView.onPointerUpdate = { [weak pointerTracker] isInside, location in
-                pointerTracker?.update(isInside: isInside, location: location)
+            hostingView.onPointerUpdate = { [weak self] isInside, location in
+                self?.handlePointerUpdate(isInside: isInside, location: location)
             }
             self.hostingView = hostingView
             panel.contentView = hostingView
@@ -192,13 +194,22 @@ private final class NotchDisplayPanel {
         )
     }
 
+    private func handlePointerUpdate(isInside: Bool, location: DisplayPoint) {
+        let location = pointerTracker.update(isInside: isInside, location: location)
+        guard isInside else {
+            hoverExpansionIntentSent = false
+            return
+        }
+        guard !hoverExpansionIntentSent,
+              pointerGate.update(pointerLocation: location) else { return }
+        hoverExpansionIntentSent = true
+        pointerTracker.requestHoverExpansion(at: location)
+    }
+
     private func makeRootView() -> NotchWidgetView {
         NotchWidgetView(
             store: store,
             layout: layout,
-            allowHoverExpansion: { [weak self] point in
-                self?.pointerGate.update(pointerLocation: point) ?? false
-            },
             pointerTracker: pointerTracker,
             requestPointerRefresh: { [weak self] in
                 self?.hostingView?.refreshPointerLocation()
@@ -230,8 +241,13 @@ private final class NotchDisplayPanel {
 @MainActor
 final class NotchPanelController {
     private let store: StateStore
+    private let focusedWindowProvider = ExternalFocusedWindowProvider()
     private var displayPanels: [UInt32: NotchDisplayPanel] = [:]
     private var selectedDisplayID: UInt32?
+    private var selectionMode: ScreenSelectionMode
+    private var displaySnapshots: [DisplaySnapshot] = []
+    private var pointerDisplayChanges = PointerDisplayChangeReducer(initialDisplayID: nil)
+    private var synchronizationPolicy = PanelSynchronizationPolicy()
     private var panelsAreVisible = false
     /// A pointer/focus move waits for the current menu to close. All-displays
     /// mode has no selected display and therefore never needs this deferral.
@@ -240,10 +256,13 @@ final class NotchPanelController {
     private var activationObserver: NSObjectProtocol?
     private var spaceObserver: NSObjectProtocol?
     private var defaultsObserver: NSObjectProtocol?
-    private var screenTrackingTimer: Timer?
+    private var localPointerMonitor: Any?
+    private var globalPointerMonitor: Any?
+    private var focusedWindowFallbackTimer: Timer?
 
     init(store: StateStore) {
         self.store = store
+        selectionMode = Self.configuredSelectionMode
         synchronizePanels()
         // Display changes — docking, resolution switches, lid state —
         // invalidate every notch metric, so every panel re-derives its layout
@@ -254,6 +273,7 @@ final class NotchPanelController {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
+                self?.focusedWindowProvider.invalidate()
                 self?.synchronizePanels()
             }
         }
@@ -266,7 +286,9 @@ final class NotchPanelController {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                DispatchQueue.main.async { self?.synchronizePanels() }
+                DispatchQueue.main.async {
+                    self?.handleWorkspaceContextChange()
+                }
             }
         }
         spaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
@@ -275,7 +297,7 @@ final class NotchPanelController {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.synchronizePanels()
+                self?.handleWorkspaceContextChange()
             }
         }
         defaultsObserver = NotificationCenter.default.addObserver(
@@ -284,16 +306,10 @@ final class NotchPanelController {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.synchronizePanels()
+                self?.handleDefaultsChange()
             }
         }
-        let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.synchronizePanels()
-            }
-        }
-        timer.tolerance = 0.05
-        screenTrackingTimer = timer
+        transitionSynchronizationResources(to: selectionMode)
     }
 
     deinit {
@@ -309,7 +325,13 @@ final class NotchPanelController {
         if let defaultsObserver {
             NotificationCenter.default.removeObserver(defaultsObserver)
         }
-        screenTrackingTimer?.invalidate()
+        if let localPointerMonitor {
+            NSEvent.removeMonitor(localPointerMonitor)
+        }
+        if let globalPointerMonitor {
+            NSEvent.removeMonitor(globalPointerMonitor)
+        }
+        focusedWindowFallbackTimer?.invalidate()
     }
 
     func show() {
@@ -335,24 +357,38 @@ final class NotchPanelController {
                 )
             )
         }
-        let mode = ScreenSelectionMode(
-            rawValue: UserDefaults.standard.string(forKey: "screenSelectionMode") ?? ""
-        ) ?? .pointer
-        // AgentGlance deliberately does not activate for notch clicks. If its
-        // own Settings window is key, treating NSScreen.main as user focus
-        // would move a single selected helper for an internal UI action.
-        let focusedDisplayID = NSApp.isActive ? nil : Self.displayID(for: NSScreen.main)
+        displaySnapshots = displays
         let mouseLocation = NSEvent.mouseLocation
+        let pointerLocation = DisplayPoint(x: mouseLocation.x, y: mouseLocation.y)
+        _ = pointerDisplayChanges.update(
+            displayID: Self.displayID(containing: pointerLocation, displays: displays)
+        )
+        let pointerIsOnDisplay = displays.contains { $0.frame.contains(pointerLocation) }
+        let needsFocusedWindow = selectionMode == .focusedWindow
+            || (selectionMode == .pointer && !pointerIsOnDisplay)
+        let focusedDisplayID: UInt32?
+        if needsFocusedWindow {
+            // CGWindow bounds and CGDisplayBounds share Quartz's top-left
+            // coordinate space, avoiding a fragile AppKit Y-axis conversion.
+            let quartzDisplays = displays.map(Self.quartzDisplaySnapshot)
+            focusedDisplayID = focusedWindowProvider
+                .focusedWindowFrame(on: quartzDisplays)
+                .flatMap {
+                    ScreenSelection.displayID(containingMostOf: $0, displays: quartzDisplays)
+                }
+        } else {
+            focusedDisplayID = nil
+        }
         let desiredIDs = ScreenSelection.selectDisplayIDs(
-            mode: mode,
-            pointerLocation: DisplayPoint(x: mouseLocation.x, y: mouseLocation.y),
+            mode: selectionMode,
+            pointerLocation: pointerLocation,
             focusedDisplayID: focusedDisplayID,
             lastSelectedDisplayID: selectedDisplayID,
             displays: displays
         )
         let desiredIDSet = Set(desiredIDs)
 
-        if mode != .allDisplays,
+        if selectionMode != .allDisplays,
            let desiredID = desiredIDs.first,
            let currentID = selectedDisplayID,
            currentID != desiredID,
@@ -362,7 +398,7 @@ final class NotchPanelController {
         }
 
         let previousSelectedDisplayID = selectedDisplayID
-        selectedDisplayID = mode == .allDisplays ? nil : desiredIDs.first
+        selectedDisplayID = selectionMode == .allDisplays ? nil : desiredIDs.first
         hasPendingSelectedDisplay = false
 
         for displayID in desiredIDs {
@@ -382,7 +418,7 @@ final class NotchPanelController {
                 if panelsAreVisible {
                     displayPanel.show()
                 }
-                if mode != .allDisplays,
+                if selectionMode != .allDisplays,
                    let previousSelectedDisplayID,
                    previousSelectedDisplayID != displayID {
                     let mouse = NSEvent.mouseLocation
@@ -396,6 +432,112 @@ final class NotchPanelController {
             displayPanels[displayID]?.hide()
             displayPanels.removeValue(forKey: displayID)
         }
+    }
+
+    private func handleDefaultsChange() {
+        let mode = Self.configuredSelectionMode
+        guard mode != selectionMode else { return }
+        selectionMode = mode
+        focusedWindowProvider.invalidate()
+        transitionSynchronizationResources(to: mode)
+        synchronizePanels()
+    }
+
+    private func handleWorkspaceContextChange() {
+        switch selectionMode {
+        case .focusedWindow:
+            break
+        case .pointer:
+            let pointer = NSEvent.mouseLocation
+            guard Self.displayID(
+                containing: DisplayPoint(x: pointer.x, y: pointer.y),
+                displays: displaySnapshots
+            ) == nil else { return }
+        case .allDisplays:
+            return
+        }
+        focusedWindowProvider.invalidate()
+        synchronizePanels()
+    }
+
+    private func transitionSynchronizationResources(to mode: ScreenSelectionMode) {
+        let transition = synchronizationPolicy.transition(to: mode)
+        for resource in transition.removed {
+            switch resource {
+            case .pointerEventMonitor:
+                removePointerEventMonitors()
+            case .focusedWindowFallbackTimer:
+                stopFocusedWindowFallbackTimer()
+            }
+        }
+        for resource in transition.installed {
+            switch resource {
+            case .pointerEventMonitor:
+                installPointerEventMonitors()
+            case .focusedWindowFallbackTimer:
+                startFocusedWindowFallbackTimer()
+            }
+        }
+    }
+
+    private func installPointerEventMonitors() {
+        guard localPointerMonitor == nil, globalPointerMonitor == nil else { return }
+        let mask: NSEvent.EventTypeMask = [
+            .mouseMoved,
+            .leftMouseDragged,
+            .rightMouseDragged,
+            .otherMouseDragged,
+        ]
+        localPointerMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+            MainActor.assumeIsolated {
+                self?.handlePointerMovement()
+            }
+            return event
+        }
+        globalPointerMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handlePointerMovement()
+            }
+        }
+    }
+
+    private func removePointerEventMonitors() {
+        if let localPointerMonitor {
+            NSEvent.removeMonitor(localPointerMonitor)
+            self.localPointerMonitor = nil
+        }
+        if let globalPointerMonitor {
+            NSEvent.removeMonitor(globalPointerMonitor)
+            self.globalPointerMonitor = nil
+        }
+    }
+
+    private func handlePointerMovement() {
+        let location = NSEvent.mouseLocation
+        let displayID = Self.displayID(
+            containing: DisplayPoint(x: location.x, y: location.y),
+            displays: displaySnapshots
+        )
+        guard pointerDisplayChanges.update(displayID: displayID) else { return }
+        synchronizePanels()
+    }
+
+    private func startFocusedWindowFallbackTimer() {
+        guard focusedWindowFallbackTimer == nil else { return }
+        let interval = PanelSynchronizationPolicy.focusedWindowFallbackInterval
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.focusedWindowProvider.invalidate()
+                self?.synchronizePanels()
+            }
+        }
+        timer.tolerance = interval * 0.25
+        focusedWindowFallbackTimer = timer
+    }
+
+    private func stopFocusedWindowFallbackTimer() {
+        focusedWindowFallbackTimer?.invalidate()
+        focusedWindowFallbackTimer = nil
     }
 
     private func handleMenuVisibilityChange() {
@@ -423,5 +565,31 @@ final class NotchPanelController {
     private static func displayID(for screen: NSScreen?) -> UInt32? {
         (screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)
             .map { $0.uint32Value }
+    }
+
+    private static func displayID(
+        containing point: DisplayPoint,
+        displays: [DisplaySnapshot]
+    ) -> UInt32? {
+        displays.first { $0.frame.contains(point) }?.id
+    }
+
+    private static var configuredSelectionMode: ScreenSelectionMode {
+        ScreenSelectionMode(
+            rawValue: UserDefaults.standard.string(forKey: "screenSelectionMode") ?? ""
+        ) ?? .pointer
+    }
+
+    private static func quartzDisplaySnapshot(_ display: DisplaySnapshot) -> DisplaySnapshot {
+        let bounds = CGDisplayBounds(CGDirectDisplayID(display.id))
+        return DisplaySnapshot(
+            id: display.id,
+            frame: DisplayFrame(
+                minX: bounds.minX,
+                minY: bounds.minY,
+                width: bounds.width,
+                height: bounds.height
+            )
+        )
     }
 }

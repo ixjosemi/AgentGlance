@@ -197,6 +197,88 @@ func testStateRepositoryIgnoresSymbolicLinks() throws {
     try expect(sessions.isEmpty, equals: true, "symbolic-link states")
 }
 
+func testStateRepositoryRejectsFIFOWithoutBlocking() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let directory = root.appendingPathComponent("state", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let fifoURL = directory.appendingPathComponent("claude-fifo.json")
+    guard Darwin.mkfifo(fifoURL.path, 0o600) == 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+    process.arguments = ["--load-state-directory", directory.path]
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    let completion = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in completion.signal() }
+    try process.run()
+
+    let completedPromptly = completion.wait(timeout: .now() + 0.5) == .success
+    if !completedPromptly {
+        process.terminate()
+    }
+    process.waitUntilExit()
+
+    try expect(completedPromptly, equals: true, "FIFO state read returns without a writer")
+    try expect(process.terminationStatus, equals: 0, "FIFO state read child status")
+}
+
+func testStateRepositoryDoesNotPreserveIdentityFromOversizedDocument() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let processID = Int32(getpid())
+    let identity = try SystemProcessScanner.processIdentity(of: processID)
+        .unwrap(or: "test process identity was unavailable")
+    let sessionID = "oversized-identity"
+    let existing = AgentSession(
+        tool: .claude,
+        sessionID: sessionID,
+        pid: processID,
+        processIdentity: identity,
+        status: .working,
+        cwd: "/tmp/project",
+        startedAt: Date(timeIntervalSince1970: 100),
+        updatedAt: Date(timeIntervalSince1970: 100)
+    )
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    var oversizedData = try encoder.encode(existing)
+    oversizedData.append(Data(repeating: 0x20, count: 1_048_577 - oversizedData.count))
+    let encodedIdentifier = Data(sessionID.utf8).base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "")
+    let stateURL = directory.appendingPathComponent("claude-\(encodedIdentifier).json")
+    try oversizedData.write(to: stateURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateURL.path)
+
+    try repository.save(AgentSession(
+        tool: .claude,
+        sessionID: sessionID,
+        pid: processID,
+        status: .idle,
+        cwd: "/tmp/project",
+        startedAt: Date(timeIntervalSince1970: 100),
+        updatedAt: Date(timeIntervalSince1970: 200)
+    ))
+
+    let saved = try repository.loadSessions().first.unwrap(or: "replacement state was not saved")
+    try expect(saved.processIdentity, equals: nil, "oversized document identity has no authority")
+    let savedSize = try FileManager.default.attributesOfItem(atPath: stateURL.path)[.size] as? NSNumber
+    try expect(
+        (savedSize?.intValue ?? Int.max) <= 1_048_576,
+        equals: true,
+        "replacement state remains within the secure-read limit"
+    )
+}
+
 /// A freshly launched Claude sits at the prompt waiting for input, so
 /// SessionStart must not paint the session green.
 func testClaudeSessionStartCreatesIdleState() throws {
@@ -254,6 +336,77 @@ func testClaudeSessionStartPreservesExistingStatus() throws {
     let session = try repository.loadSessions().first.unwrap(or: "session was not saved")
     try expect(session.status, equals: .working, "status preserved across auto-compact")
     try expect(session.startedAt, equals: Date(timeIntervalSince1970: 100), "original start time")
+}
+
+func testClaudeLifecycleUpdatePreservesOnlyMatchingProcessIdentity() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let processID = Int32(getpid())
+    let identity = try SystemProcessScanner.processIdentity(of: processID)
+        .unwrap(or: "test process identity was unavailable")
+    try repository.save(AgentSession(
+        tool: .claude,
+        sessionID: "claude-identity",
+        pid: identity.processID,
+        processIdentity: identity,
+        status: .working,
+        cwd: "/tmp/project",
+        startedAt: Date(timeIntervalSince1970: 100),
+        updatedAt: Date(timeIntervalSince1970: 100)
+    ))
+    let processor = ClaudeHookProcessor(repository: repository)
+    let payload = Data(#"{"session_id":"claude-identity","cwd":"/tmp/project"}"#.utf8)
+
+    try processor.process(
+        event: "Stop",
+        payload: payload,
+        environment: [:],
+        processID: processID,
+        now: Date(timeIntervalSince1970: 200)
+    )
+
+    let updated = try repository.loadSessions().first.unwrap(or: "session was not saved")
+    try expect(updated.status, equals: .idle, "lifecycle status")
+    try expect(updated.processIdentity, equals: identity, "same-process identity")
+
+    try processor.process(
+        event: "UserPromptSubmit",
+        payload: payload,
+        environment: [:],
+        processID: 5432,
+        now: Date(timeIntervalSince1970: 300)
+    )
+
+    let rebound = try repository.loadSessions().first.unwrap(or: "rebound session was not saved")
+    try expect(rebound.pid, equals: 5432, "rebound process ID")
+    try expect(rebound.processIdentity, equals: nil, "stale identity after process change")
+
+    let staleIdentity = ProcessIdentity(
+        processID: processID,
+        kernelStartTimeMicroseconds: identity.kernelStartTimeMicroseconds + 1
+    )
+    try repository.save(AgentSession(
+        tool: .claude,
+        sessionID: "claude-identity",
+        pid: processID,
+        processIdentity: staleIdentity,
+        status: .working,
+        cwd: "/tmp/project",
+        startedAt: Date(timeIntervalSince1970: 100),
+        updatedAt: Date(timeIntervalSince1970: 400)
+    ))
+    try processor.process(
+        event: "Stop",
+        payload: payload,
+        environment: [:],
+        processID: processID,
+        now: Date(timeIntervalSince1970: 500)
+    )
+
+    let recycled = try repository.loadSessions().first.unwrap(or: "recycled session was not saved")
+    try expect(recycled.processIdentity, equals: nil, "stale identity for recycled PID")
 }
 
 func testClaudePermissionNotificationRequestsAttention() throws {
@@ -679,6 +832,11 @@ func testReaperAdoptsScannedGhosttyTerminalForNativeSession() throws {
             windowTitleHint: "oc-project — opencode"
         )
     ))
+    let lifecycleURL = try FileManager.default.contentsOfDirectory(
+        at: directory,
+        includingPropertiesForKeys: nil
+    ).first { $0.pathExtension == "json" }.unwrap(or: "lifecycle file missing")
+    let lifecycleDataBeforeEnrichment = try Data(contentsOf: lifecycleURL)
     let scannedProcess = DetectedAgentProcess(
         tool: .opencode,
         processID: Int32(getpid()),
@@ -697,20 +855,58 @@ func testReaperAdoptsScannedGhosttyTerminalForNativeSession() throws {
     try expect(session.terminal.tty, equals: "/dev/ttys009", "document tty preserved")
     try expect(session.terminal.windowTitleHint, equals: "🟢 live agent title", "live title adopted")
     try expect(session.updatedAt, equals: writtenAt, "enrichment is not activity")
+    try expect(
+        try Data(contentsOf: lifecycleURL),
+        equals: lifecycleDataBeforeEnrichment,
+        "enrichment does not replace integration lifecycle bytes"
+    )
+    let enrichmentFileURLs = try FileManager.default.contentsOfDirectory(
+        at: directory,
+        includingPropertiesForKeys: nil
+    )
+    let enrichmentURL = try enrichmentFileURLs.first { $0.pathExtension == "overlay" }
+        .unwrap(or: "enrichment overlay missing from \(enrichmentFileURLs.map(\.lastPathComponent))")
+    try expect(
+        enrichmentURL.lastPathComponent,
+        equals: "enrichment-opencode-bmF0aXZlLWRvYw.overlay",
+        "enrichment uses canonical encoded filename"
+    )
+    let enrichmentMode = try FileManager.default.attributesOfItem(
+        atPath: enrichmentURL.path
+    )[.posixPermissions] as? NSNumber
+    try expect(enrichmentMode?.intValue, equals: 0o600, "enrichment overlay permissions")
+    let enrichmentJSON = try JSONSerialization.jsonObject(
+        with: Data(contentsOf: enrichmentURL)
+    ) as? [String: Any]
+    try expect(enrichmentJSON?["schema_version"] as? Int, equals: 1, "enrichment schema")
 
     // A second pass with the same scan must not rewrite the document.
-    let fileURL = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-        .first { $0.pathExtension == "json" }
-        .unwrap(or: "state file missing")
-    let firstPassData = try Data(contentsOf: fileURL)
-    let firstPassModifiedAt = try fileURL.resourceValues(forKeys: [.contentModificationDateKey])
+    let firstPassData = try Data(contentsOf: lifecycleURL)
+    let firstPassModifiedAt = try lifecycleURL.resourceValues(forKeys: [.contentModificationDateKey])
         .contentModificationDate
+    let firstEnrichmentData = try Data(contentsOf: enrichmentURL)
+    let firstEnrichmentModifiedAt = try enrichmentURL.resourceValues(
+        forKeys: [.contentModificationDateKey]
+    ).contentModificationDate
     usleep(100_000)
     _ = try ReaperService(repository: repository).reap(detected: [scannedProcess])
-    try expect(try Data(contentsOf: fileURL), equals: firstPassData, "document content stable")
-    let secondPassModifiedAt = try fileURL.resourceValues(forKeys: [.contentModificationDateKey])
+    try expect(try Data(contentsOf: lifecycleURL), equals: firstPassData, "document content stable")
+    let secondPassModifiedAt = try lifecycleURL.resourceValues(forKeys: [.contentModificationDateKey])
         .contentModificationDate
     try expect(secondPassModifiedAt, equals: firstPassModifiedAt, "document not rewritten")
+    try expect(
+        try Data(contentsOf: enrichmentURL),
+        equals: firstEnrichmentData,
+        "unchanged enrichment content stable"
+    )
+    let secondEnrichmentModifiedAt = try enrichmentURL.resourceValues(
+        forKeys: [.contentModificationDateKey]
+    ).contentModificationDate
+    try expect(
+        secondEnrichmentModifiedAt,
+        equals: firstEnrichmentModifiedAt,
+        "unchanged enrichment not rewritten"
+    )
 
     // The tab title feeds the row title, so a meaningful rename must land
     // in the document even though the surface id is already adopted.
@@ -735,7 +931,8 @@ func testReaperAdoptsScannedGhosttyTerminalForNativeSession() throws {
 
     // Spinner and status-emoji churn cleans to the same display title and
     // must not rewrite the document every tick.
-    let decoratedData = try Data(contentsOf: fileURL)
+    let decoratedData = try Data(contentsOf: lifecycleURL)
+    let decoratedEnrichmentData = try Data(contentsOf: enrichmentURL)
     let spinnerProcess = DetectedAgentProcess(
         tool: .opencode,
         processID: Int32(getpid()),
@@ -747,7 +944,447 @@ func testReaperAdoptsScannedGhosttyTerminalForNativeSession() throws {
         )
     )
     _ = try ReaperService(repository: repository).reap(detected: [spinnerProcess])
-    try expect(try Data(contentsOf: fileURL), equals: decoratedData, "decoration churn not persisted")
+    try expect(
+        try Data(contentsOf: lifecycleURL),
+        equals: decoratedData,
+        "decoration churn not persisted to lifecycle"
+    )
+    try expect(
+        try Data(contentsOf: enrichmentURL),
+        equals: decoratedEnrichmentData,
+        "decoration churn not persisted to enrichment"
+    )
+}
+
+func testTerminalEnrichmentPreservesConcurrentLifecycleWrite() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let processIdentity = ProcessIdentity(
+        processID: 424_242,
+        kernelStartTimeMicroseconds: 1_000
+    )
+    let staleUpdatedAt = Date(timeIntervalSince1970: 1_000)
+    let lifecycleUpdatedAt = Date(timeIntervalSince1970: 2_000)
+    let stale = AgentSession(
+        tool: .opencode,
+        sessionID: "concurrent-native-doc",
+        pid: processIdentity.processID,
+        processIdentity: processIdentity,
+        status: .working,
+        cwd: "/tmp/concurrent-enrichment",
+        startedAt: staleUpdatedAt,
+        updatedAt: staleUpdatedAt,
+        terminal: TerminalContext(
+            termProgram: "ghostty",
+            tty: "/dev/ttys009",
+            windowTitleHint: "old title"
+        )
+    )
+    try repository.save(stale)
+    var staleSnapshot = try repository.loadSnapshot()
+
+    // Simulate permission.asked landing while the scheduler is blocked in
+    // Ghostty. Enrichment must merge into this newer document, not its snapshot.
+    try repository.save(AgentSession(
+        tool: stale.tool,
+        sessionID: stale.sessionID,
+        pid: stale.pid,
+        processIdentity: stale.processIdentity,
+        status: .needsAttention,
+        attentionReason: .permission,
+        cwd: stale.cwd,
+        startedAt: stale.startedAt,
+        updatedAt: lifecycleUpdatedAt,
+        terminal: stale.terminal
+    ))
+    let enrichedProcess = DetectedAgentProcess(
+        tool: stale.tool,
+        processID: stale.pid,
+        processIdentity: processIdentity,
+        cwd: stale.cwd,
+        terminal: TerminalContext(
+            termProgram: "ghostty",
+            ghosttyTerminalID: "term-concurrent",
+            windowTitleHint: "new live title"
+        )
+    )
+
+    try ReaperService(repository: repository).applyTerminalEnrichment(
+        basic: [enrichedProcess],
+        enriched: [enrichedProcess],
+        snapshot: &staleSnapshot
+    )
+
+    let merged = try repository.loadSessions().first
+        .unwrap(or: "concurrently updated session disappeared")
+    try expect(merged.status, equals: .needsAttention, "newer lifecycle status survives")
+    try expect(merged.attentionReason, equals: .permission, "newer lifecycle reason survives")
+    try expect(merged.updatedAt, equals: lifecycleUpdatedAt, "newer lifecycle timestamp survives")
+    try expect(
+        merged.terminal.ghosttyTerminalID,
+        equals: "term-concurrent",
+        "terminal identifier is enriched"
+    )
+    try expect(
+        merged.terminal.windowTitleHint,
+        equals: "new live title",
+        "terminal title is enriched"
+    )
+}
+
+func testTerminalEnrichmentDoesNotReplaceLifecycleWriteAfterReload() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let lifecycleRepository = StateRepository(directoryURL: directory)
+    let processID = Int32(getpid())
+    let processIdentity = try SystemProcessScanner.processIdentity(of: processID)
+        .unwrap(or: "test process identity was unavailable")
+    let initialUpdatedAt = Date(timeIntervalSince1970: 1_000)
+    let lifecycleUpdatedAt = Date(timeIntervalSince1970: 2_000)
+    let initial = AgentSession(
+        tool: .opencode,
+        sessionID: "reload-rename-race",
+        pid: processID,
+        processIdentity: processIdentity,
+        status: .working,
+        cwd: "/tmp/reload-rename-race",
+        startedAt: initialUpdatedAt,
+        updatedAt: initialUpdatedAt,
+        terminal: TerminalContext(termProgram: "ghostty", tty: "/dev/ttys009")
+    )
+    try lifecycleRepository.save(initial)
+    var staleSnapshot = try lifecycleRepository.loadSnapshot()
+    let lifecycleUpdate = AgentSession(
+        tool: initial.tool,
+        sessionID: initial.sessionID,
+        pid: initial.pid,
+        processIdentity: initial.processIdentity,
+        status: .needsAttention,
+        attentionReason: .permission,
+        cwd: initial.cwd,
+        startedAt: initial.startedAt,
+        updatedAt: lifecycleUpdatedAt,
+        terminal: initial.terminal
+    )
+    let enrichmentRepository = StateRepository(
+        directoryURL: directory,
+        reloadObserver: {
+            try lifecycleRepository.save(lifecycleUpdate)
+        }
+    )
+    let enrichedProcess = DetectedAgentProcess(
+        tool: initial.tool,
+        processID: processID,
+        processIdentity: processIdentity,
+        cwd: initial.cwd,
+        terminal: TerminalContext(
+            termProgram: "ghostty",
+            ghosttyTerminalID: "term-after-reload",
+            windowTitleHint: "live title after reload"
+        )
+    )
+
+    try ReaperService(repository: enrichmentRepository).applyTerminalEnrichment(
+        basic: [enrichedProcess],
+        enriched: [enrichedProcess],
+        snapshot: &staleSnapshot
+    )
+
+    let merged = try lifecycleRepository.loadSessions().first
+        .unwrap(or: "concurrently updated session disappeared")
+    try expect(merged.status, equals: .needsAttention, "post-read lifecycle status survives")
+    try expect(merged.attentionReason, equals: .permission, "post-read lifecycle reason survives")
+    try expect(merged.updatedAt, equals: lifecycleUpdatedAt, "post-read lifecycle timestamp survives")
+    try expect(
+        merged.terminal.ghosttyTerminalID,
+        equals: "term-after-reload",
+        "post-read terminal identifier is enriched"
+    )
+    try expect(
+        merged.terminal.windowTitleHint,
+        equals: "live title after reload",
+        "post-read terminal title is enriched"
+    )
+}
+
+func testTerminalEnrichmentRejectsConcurrentProcessGenerationChange() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let processID: Int32 = 424_243
+    let staleIdentity = ProcessIdentity(
+        processID: processID,
+        kernelStartTimeMicroseconds: 1_000
+    )
+    let replacementIdentity = ProcessIdentity(
+        processID: processID,
+        kernelStartTimeMicroseconds: 2_000
+    )
+    let stale = AgentSession(
+        tool: .opencode,
+        sessionID: "recycled-native-doc",
+        pid: processID,
+        processIdentity: staleIdentity,
+        status: .working,
+        cwd: "/tmp/recycled-enrichment",
+        startedAt: Date(timeIntervalSince1970: 1_000),
+        updatedAt: Date(timeIntervalSince1970: 1_000),
+        terminal: TerminalContext(termProgram: "ghostty")
+    )
+    try repository.save(stale)
+    var staleSnapshot = try repository.loadSnapshot()
+
+    let replacement = AgentSession(
+        tool: stale.tool,
+        sessionID: stale.sessionID,
+        pid: processID,
+        processIdentity: replacementIdentity,
+        status: .idle,
+        cwd: stale.cwd,
+        startedAt: Date(timeIntervalSince1970: 2_000),
+        updatedAt: Date(timeIntervalSince1970: 2_000),
+        terminal: TerminalContext(termProgram: "ghostty", windowTitleHint: "replacement")
+    )
+    try repository.save(replacement)
+    let staleEnrichment = DetectedAgentProcess(
+        tool: stale.tool,
+        processID: processID,
+        processIdentity: staleIdentity,
+        cwd: stale.cwd,
+        terminal: TerminalContext(
+            termProgram: "ghostty",
+            ghosttyTerminalID: "stale-terminal",
+            windowTitleHint: "stale generation"
+        )
+    )
+
+    try ReaperService(repository: repository).applyTerminalEnrichment(
+        basic: [staleEnrichment],
+        enriched: [staleEnrichment],
+        snapshot: &staleSnapshot
+    )
+
+    let preserved = try repository.loadSessions().first
+        .unwrap(or: "replacement generation disappeared")
+    try expect(
+        preserved.processIdentity,
+        equals: replacementIdentity,
+        "replacement process identity survives"
+    )
+    try expect(preserved.status, equals: .idle, "replacement lifecycle survives")
+    try expect(
+        preserved.terminal.ghosttyTerminalID,
+        equals: nil,
+        "stale generation terminal is rejected"
+    )
+    try expect(
+        preserved.terminal.windowTitleHint,
+        equals: "replacement",
+        "replacement terminal title survives"
+    )
+}
+
+func testStateRepositoryValidatesAndPrunesEnrichmentOverlays() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let directory = root.appendingPathComponent("state", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let repository = StateRepository(directoryURL: directory)
+    let processID = Int32(getpid())
+    let processIdentity = try SystemProcessScanner.processIdentity(of: processID)
+        .unwrap(or: "test process identity was unavailable")
+    let session = AgentSession(
+        tool: .opencode,
+        sessionID: "overlay-security",
+        pid: processID,
+        status: .working,
+        cwd: "/tmp/overlay-security",
+        startedAt: Date(timeIntervalSince1970: 1_000),
+        updatedAt: Date(timeIntervalSince1970: 1_000),
+        terminal: TerminalContext(termProgram: "ghostty")
+    )
+    try repository.save(session)
+    let process = DetectedAgentProcess(
+        tool: session.tool,
+        processID: processID,
+        processIdentity: processIdentity,
+        cwd: session.cwd,
+        terminal: TerminalContext(
+            termProgram: "ghostty",
+            ghosttyTerminalID: "secure-terminal",
+            windowTitleHint: "secure title"
+        )
+    )
+    _ = try ReaperService(repository: repository).reap(detected: [process])
+    let fileURLs = try FileManager.default.contentsOfDirectory(
+        at: directory,
+        includingPropertiesForKeys: nil
+    )
+    let lifecycleURL = try fileURLs.first { $0.pathExtension == "json" }
+        .unwrap(or: "lifecycle file missing")
+    let enrichmentURL = try fileURLs.first { $0.pathExtension == "overlay" }
+        .unwrap(or: "enrichment overlay missing")
+    let validEnrichment = try Data(contentsOf: enrichmentURL)
+
+    var staleJSON = try JSONSerialization.jsonObject(with: validEnrichment) as? [String: Any]
+    var staleIdentity = staleJSON?["process_identity"] as? [String: Any]
+    staleIdentity?["kernel_start_time_us"] = NSNumber(
+        value: processIdentity.kernelStartTimeMicroseconds + 1
+    )
+    staleJSON?["process_identity"] = staleIdentity
+    try JSONSerialization.data(withJSONObject: staleJSON ?? [:], options: [.sortedKeys])
+        .write(to: enrichmentURL)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o600],
+        ofItemAtPath: enrichmentURL.path
+    )
+    let recycled = try repository.loadSessions().first
+        .unwrap(or: "lifecycle session disappeared with stale overlay")
+    try expect(recycled.processIdentity, equals: nil, "stale overlay grants no process identity")
+    try expect(
+        recycled.terminal.ghosttyTerminalID,
+        equals: nil,
+        "stale overlay grants no terminal identity"
+    )
+    try expect(
+        FileManager.default.fileExists(atPath: enrichmentURL.path),
+        equals: false,
+        "stale generation overlay is pruned"
+    )
+
+    var unknownSchemaJSON = try JSONSerialization.jsonObject(
+        with: validEnrichment
+    ) as? [String: Any]
+    unknownSchemaJSON?["schema_version"] = 2
+    try JSONSerialization.data(
+        withJSONObject: unknownSchemaJSON ?? [:],
+        options: [.sortedKeys]
+    ).write(to: enrichmentURL)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o600],
+        ofItemAtPath: enrichmentURL.path
+    )
+    _ = try repository.loadSessions()
+    try expect(
+        FileManager.default.fileExists(atPath: enrichmentURL.path),
+        equals: false,
+        "unknown overlay schema is pruned"
+    )
+
+    try Data("not-json".utf8).write(to: enrichmentURL)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o600],
+        ofItemAtPath: enrichmentURL.path
+    )
+    _ = try repository.loadSessions()
+    try expect(
+        FileManager.default.fileExists(atPath: enrichmentURL.path),
+        equals: false,
+        "malformed overlay is pruned"
+    )
+
+    try validEnrichment.write(to: enrichmentURL)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o644],
+        ofItemAtPath: enrichmentURL.path
+    )
+    _ = try repository.loadSessions()
+    try expect(
+        FileManager.default.fileExists(atPath: enrichmentURL.path),
+        equals: false,
+        "non-private overlay is pruned"
+    )
+
+    let externalURL = root.appendingPathComponent("external-overlay")
+    try validEnrichment.write(to: externalURL)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o600],
+        ofItemAtPath: externalURL.path
+    )
+    try FileManager.default.createSymbolicLink(
+        at: enrichmentURL,
+        withDestinationURL: externalURL
+    )
+    _ = try repository.loadSessions()
+    try expect(
+        FileManager.default.fileExists(atPath: enrichmentURL.path),
+        equals: false,
+        "symlinked overlay is pruned without following it"
+    )
+    try expect(
+        FileManager.default.fileExists(atPath: externalURL.path),
+        equals: true,
+        "symlink target is untouched"
+    )
+
+    var oversized = validEnrichment
+    oversized.append(Data(
+        repeating: 0x20,
+        count: max(0, 16_385 - validEnrichment.count)
+    ))
+    try oversized.write(to: enrichmentURL)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o600],
+        ofItemAtPath: enrichmentURL.path
+    )
+    _ = try repository.loadSessions()
+    try expect(
+        FileManager.default.fileExists(atPath: enrichmentURL.path),
+        equals: false,
+        "oversized overlay is pruned"
+    )
+
+    _ = try ReaperService(repository: repository).reap(detected: [process])
+    let merged = try repository.loadSessions().first
+        .unwrap(or: "enriched session was not restored")
+    try repository.remove(merged)
+    try expect(
+        FileManager.default.fileExists(atPath: lifecycleURL.path),
+        equals: false,
+        "session removal deletes lifecycle document"
+    )
+    try expect(
+        FileManager.default.fileExists(atPath: enrichmentURL.path),
+        equals: false,
+        "session removal deletes enrichment overlay"
+    )
+
+    try repository.save(session)
+    _ = try ReaperService(repository: repository).reap(detected: [process])
+    try FileManager.default.removeItem(at: lifecycleURL)
+    try expect(try repository.loadSessions(), equals: [], "orphan overlay creates no session")
+    try expect(
+        FileManager.default.fileExists(atPath: enrichmentURL.path),
+        equals: false,
+        "orphan overlay is pruned"
+    )
+}
+
+func testTerminalEnrichmentPreservesLiveFallbackWhenGhosttyOmitsProcess() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let liveProcess = DetectedAgentProcess(
+        tool: .opencode,
+        processID: Int32(getpid()),
+        cwd: "/tmp/ghostty-enrichment-failure",
+        terminal: TerminalContext(termProgram: "ghostty", tty: "/dev/ttys001")
+    )
+    let scanner = SystemProcessScanner(ghosttyTerminalSource: { [] })
+    let enriched = scanner.enrichTerminalContexts(in: [liveProcess])
+    try expect(enriched.isEmpty, equals: true, "failed Ghostty match omits enrichment")
+
+    let reaper = ReaperService(repository: repository)
+    _ = try reaper.reap(detected: [liveProcess])
+    try reaper.applyTerminalEnrichment(basic: [liveProcess], enriched: enriched)
+
+    let sessions = try repository.loadSessions()
+    try expect(sessions.map(\.sessionID), equals: ["reaper-\(getpid())"], "live fallback survives optional enrichment miss")
 }
 
 func testReaperPrunesSupersededSessionsForSameProcess() throws {
@@ -845,6 +1482,60 @@ func testObservationSchedulerTickPersistsFallbackState() throws {
     try expect(sessions.first?.cwd, equals: "/tmp/scheduler-project", "fallback cwd")
 }
 
+func testCodexRecoveryDoesNotAuthorizeHistoricalRolloutForReplacementProcess() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let sessionsDirectory = root.appendingPathComponent("codex", isDirectory: true)
+    let stateDirectory = root.appendingPathComponent("state", isDirectory: true)
+    try FileManager.default.createDirectory(at: sessionsDirectory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let cwd = "/tmp/codex-reused-directory"
+    let processID = Int32(getpid())
+    let processIdentity = try SystemProcessScanner.processIdentity(of: processID)
+        .unwrap(or: "replacement process identity unavailable")
+    let processStartedAt = Date(
+        timeIntervalSince1970: TimeInterval(processIdentity.kernelStartTimeMicroseconds) / 1_000_000
+    )
+    // Process A wrote this rollout and exited. Its recent mtime still puts it
+    // inside the watcher's one-hour recovery window when process B appears.
+    let oldActivityAt = processStartedAt.addingTimeInterval(-60)
+    let oldTimestamp = ISO8601DateFormatter().string(from: oldActivityAt)
+    let oldMetadata = #"{"timestamp":"\#(oldTimestamp)","type":"session_meta","payload":{"id":"process-a-session","cwd":"/tmp/codex-reused-directory","timestamp":"\#(oldTimestamp)"}}"#
+    let rolloutURL = sessionsDirectory.appendingPathComponent("rollout-process-a.jsonl")
+    try Data("\(oldMetadata)\n".utf8).write(to: rolloutURL)
+    try FileManager.default.setAttributes(
+        [.modificationDate: oldActivityAt],
+        ofItemAtPath: rolloutURL.path
+    )
+    let processB = DetectedAgentProcess(
+        tool: .codex,
+        processID: processID,
+        processIdentity: processIdentity,
+        cwd: cwd,
+        terminal: TerminalContext(tty: "/dev/ttys009")
+    )
+    let repository = StateRepository(directoryURL: stateDirectory)
+    let reaper = ReaperService(repository: repository)
+    _ = try reaper.reap(detected: [processB])
+    let watcher = CodexSessionsWatcher(
+        sessionsDirectoryURL: sessionsDirectory,
+        repository: repository,
+        ingestionWindow: 3600,
+        processResolver: { session in session.cwd == cwd ? processB : nil }
+    )
+
+    try watcher.scan()
+    _ = try reaper.reap(detected: [processB])
+
+    let recovered = try repository.loadSessions()
+    let fallback = try recovered.first {
+        $0.sessionID == "reaper-\(processID)"
+    }.unwrap(or: "replacement process lost its safe fallback")
+    try expect(fallback.processIdentity, equals: processIdentity, "replacement fallback identity")
+    let historical = recovered.first { $0.sessionID == "process-a-session" }
+    try expect(historical?.processIdentity, equals: nil, "historical rollout has no destructive authority")
+}
+
 func testObservationSchedulerPublishesConvoyRunOnTick() throws {
     let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
     defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
@@ -878,14 +1569,139 @@ func testObservationSchedulerPublishesConvoyRunOnTick() throws {
     try expect(session.currentStep, equals: "implementer", "current step")
 }
 
-final class CountingProcessScanner: ProcessScanning, @unchecked Sendable {
+final class StateMaterializationCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
+
+    var materializationCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+}
+
+func testObservationSchedulerMaterializesStateOncePerTick() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let phaseStateURL = stateDirectoryURL.appendingPathComponent("opencode-c2VzX2ltcGw.json")
+    try validStateJSON(
+        sessionID: "ses_impl",
+        status: "working",
+        pid: Int32(getpid()),
+        tool: "opencode",
+        cwd: "/tmp/phase-session"
+    ).write(to: phaseStateURL)
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: "20260722-171717-materialization",
+        serverPid: Int32(getpid()),
+        serverStartedAt: Date().addingTimeInterval(-300),
+        phases: [("implementer", "running", "ses_impl")]
+    )
+    let embeddedServer = DetectedAgentProcess(
+        tool: .opencode,
+        processID: Int32(getppid()),
+        cwd: "/tmp/convoy-target",
+        terminal: TerminalContext()
+    )
+    let counter = StateMaterializationCounter()
+    let scheduler = ObservationScheduler(
+        repository: StateRepository(
+            directoryURL: stateDirectoryURL,
+            materializationObserver: { counter.increment() }
+        ),
+        processScanner: TestProcessScanner([detectedConvoyProcess(), embeddedServer]),
+        codexSessionsDirectoryURL: stateDirectoryURL.appendingPathComponent("codex", isDirectory: true),
+        convoyRunsDirectoryURL: runsDirectoryURL,
+        debounceInterval: 0.01
+    )
+
+    scheduler.requestTick()
+
+    let deadline = Date().addingTimeInterval(2)
+    while FileManager.default.fileExists(atPath: phaseStateURL.path), Date() < deadline {
+        usleep(1_000)
+    }
+    try expect(
+        FileManager.default.fileExists(atPath: phaseStateURL.path),
+        equals: false,
+        "tick completed Convoy phase suppression"
+    )
+    try expect(
+        counter.materializationCount,
+        equals: 1,
+        "one verified state snapshot per observation tick"
+    )
+    let sessions = try StateRepository(directoryURL: stateDirectoryURL).loadSessions()
+    try expect(
+        sessions.filter { $0.tool == .opencode }.isEmpty,
+        equals: true,
+        "later suppression sees the reaper fallback added to the snapshot"
+    )
+    try expect(
+        sessions.contains { $0.sessionID == "20260722-171717-materialization" },
+        equals: true,
+        "reaper sees the Convoy session added to the snapshot"
+    )
+}
+
+final class CountingProcessScanner: ProcessScanning, @unchecked Sendable {
+    private let lock = NSLock()
+    private let detected: [DetectedAgentProcess]
+    private var count = 0
+
+    init(_ detected: [DetectedAgentProcess] = []) {
+        self.detected = detected
+    }
 
     func activeProcesses() throws -> [DetectedAgentProcess] {
         lock.lock()
         defer { lock.unlock() }
         count += 1
+        return detected
+    }
+
+    var scanCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+}
+
+final class StartupOrderingProcessScanner: ProcessScanning, @unchecked Sendable {
+    let baselineStarted = DispatchSemaphore(value: 0)
+    let releaseBaseline = DispatchSemaphore(value: 0)
+    let recurringScanStarted = DispatchSemaphore(value: 0)
+
+    private let lock = NSLock()
+    private var count = 0
+    private var firstScanWasOnMain = false
+
+    func activeProcesses() throws -> [DetectedAgentProcess] {
+        try basicActiveProcesses()
+    }
+
+    func basicActiveProcesses() throws -> [DetectedAgentProcess] {
+        lock.lock()
+        count += 1
+        let currentCount = count
+        if currentCount == 1 {
+            firstScanWasOnMain = Thread.isMainThread
+        }
+        lock.unlock()
+
+        if currentCount == 1 {
+            baselineStarted.signal()
+            _ = releaseBaseline.wait(timeout: .now() + 2)
+        } else {
+            recurringScanStarted.signal()
+        }
         return []
     }
 
@@ -894,6 +1710,145 @@ final class CountingProcessScanner: ProcessScanning, @unchecked Sendable {
         defer { lock.unlock() }
         return count
     }
+
+    var baselineRanOnMain: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return firstScanWasOnMain
+    }
+}
+
+func testObservationSchedulerQueuesInitialReconciliationBeforeRecurringWork() throws {
+    try expect(Thread.isMainThread, equals: true, "startup API is invoked from main")
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let scanner = StartupOrderingProcessScanner()
+    let scheduler = ObservationScheduler(
+        repository: StateRepository(directoryURL: directory),
+        processScanner: scanner,
+        codexSessionsDirectoryURL: directory.appendingPathComponent("codex", isDirectory: true),
+        convoyRunsDirectoryURL: directory.appendingPathComponent("convoy", isDirectory: true),
+        debounceInterval: 0.01
+    )
+    defer {
+        scanner.releaseBaseline.signal()
+        scheduler.stop()
+        scheduler.waitUntilIdle()
+    }
+
+    scheduler.startWithInitialReconciliation()
+
+    guard scanner.baselineStarted.wait(timeout: .now() + 2) == .success else {
+        throw TestFailure.expectation("queued initial reconciliation never started")
+    }
+    try expect(scanner.baselineRanOnMain, equals: false, "baseline process scan runs off main")
+    usleep(100_000)
+    try expect(scanner.scanCount, equals: 1, "recurring work waits for baseline reconciliation")
+
+    scanner.releaseBaseline.signal()
+    guard scanner.recurringScanStarted.wait(timeout: .now() + 2) == .success else {
+        throw TestFailure.expectation("normal startup tick never followed initial reconciliation")
+    }
+    try expect(scanner.scanCount, equals: 2, "normal startup tick follows baseline reconciliation")
+}
+
+final class StartupCompletionProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didRun = false
+    private var ranOnMain = false
+
+    func record() {
+        lock.lock()
+        didRun = true
+        ranOnMain = Thread.isMainThread
+        lock.unlock()
+    }
+
+    var completionRan: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return didRun
+    }
+
+    var completionRanOnMain: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return ranOnMain
+    }
+}
+
+func testStartupReconciliationCompletionRefreshesStoreWithoutPolling() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let repository = StateRepository(directoryURL: directory)
+    let store = StateStore(repository: repository)
+    try store.startObserving(pollInterval: nil, layers: [])
+    defer { store.stopObserving() }
+    let process = DetectedAgentProcess(
+        tool: .opencode,
+        processID: Int32(getpid()),
+        cwd: "/tmp/startup-handshake",
+        terminal: TerminalContext()
+    )
+    let scheduler = ObservationScheduler(
+        repository: repository,
+        processScanner: TestProcessScanner([process]),
+        codexSessionsDirectoryURL: directory.appendingPathComponent("codex", isDirectory: true),
+        convoyRunsDirectoryURL: directory.appendingPathComponent("convoy", isDirectory: true),
+        debounceInterval: 0.01
+    )
+    defer {
+        scheduler.stop()
+        scheduler.waitUntilIdle()
+    }
+    let completion = StartupCompletionProbe()
+
+    scheduler.startWithInitialReconciliation {
+        store.reloadRecordingError()
+        completion.record()
+    }
+
+    let deadline = Date().addingTimeInterval(2)
+    while !completion.completionRan, Date() < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+    }
+    try expect(completion.completionRan, equals: true, "startup reconciliation completion")
+    try expect(completion.completionRanOnMain, equals: true, "startup completion runs on main")
+    try expect(
+        store.sessions.map(\.sessionID),
+        equals: ["reaper-\(getpid())"],
+        "post-reconciliation baseline converges without polling or notifications"
+    )
+}
+
+func testStoppingSchedulerSuppressesLateStartupCompletion() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let scanner = StartupOrderingProcessScanner()
+    let scheduler = ObservationScheduler(
+        repository: StateRepository(directoryURL: directory),
+        processScanner: scanner,
+        codexSessionsDirectoryURL: directory.appendingPathComponent("codex", isDirectory: true),
+        convoyRunsDirectoryURL: directory.appendingPathComponent("convoy", isDirectory: true),
+        debounceInterval: 0.01
+    )
+    let completion = StartupCompletionProbe()
+    scheduler.startWithInitialReconciliation {
+        completion.record()
+    }
+    guard scanner.baselineStarted.wait(timeout: .now() + 2) == .success else {
+        throw TestFailure.expectation("stoppable initial reconciliation never started")
+    }
+
+    scheduler.stop()
+    scanner.releaseBaseline.signal()
+    scheduler.waitUntilIdle()
+    RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+
+    try expect(completion.completionRan, equals: false, "stop invalidates late startup completion")
 }
 
 /// Reports the process only while it is actually alive, mimicking a real
@@ -970,6 +1925,183 @@ func testObservationSchedulerCoalescesTickBursts() throws {
         scanner.scanCount,
         equals: 1,
         "a burst of tick requests must coalesce into a single scan"
+    )
+}
+
+func testConvoyMetadataTickReusesLastVerifiedProcessScan() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let runID = "20260722-181818-metadata-tick"
+    let process = detectedConvoyProcess()
+    let serverStartedAt = Date().addingTimeInterval(-300)
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: runID,
+        serverPid: process.processID,
+        serverStartedAt: serverStartedAt,
+        phases: [("implementer", "running", "ses_impl")]
+    )
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    let materializationCounter = StateMaterializationCounter()
+    let scanner = CountingProcessScanner([process])
+    let scheduler = ObservationScheduler(
+        repository: StateRepository(
+            directoryURL: stateDirectoryURL,
+            materializationObserver: { materializationCounter.increment() }
+        ),
+        processScanner: scanner,
+        codexSessionsDirectoryURL: stateDirectoryURL.appendingPathComponent("codex", isDirectory: true),
+        convoyRunsDirectoryURL: runsDirectoryURL,
+        debounceInterval: 0.01
+    )
+    defer {
+        scheduler.stop()
+        scheduler.waitUntilIdle()
+    }
+
+    scheduler.requestTick()
+    var deadline = Date().addingTimeInterval(2)
+    while (try repository.loadSessions()).first?.status != .working, Date() < deadline {
+        usleep(1_000)
+    }
+    scheduler.waitUntilIdle()
+    try expect(scanner.scanCount, equals: 1, "initial explicit tick scans processes")
+    try expect(materializationCounter.materializationCount, equals: 1, "explicit tick snapshot")
+
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: runID,
+        serverPid: process.processID,
+        serverStartedAt: serverStartedAt,
+        phases: [("implementer", "completed", "ses_impl")]
+    )
+    try FileManager.default.setAttributes(
+        [.modificationDate: Date().addingTimeInterval(60)],
+        ofItemAtPath: runsDirectoryURL
+            .appendingPathComponent(runID, isDirectory: true)
+            .appendingPathComponent("metadata.json").path
+    )
+    scheduler.requestConvoyMetadataTick()
+    deadline = Date().addingTimeInterval(2)
+    while (try repository.loadSessions()).first?.status != .idle, Date() < deadline {
+        usleep(1_000)
+    }
+    scheduler.waitUntilIdle()
+
+    try expect(
+        (try repository.loadSessions()).first?.status,
+        equals: .idle,
+        "metadata-only tick processes the changed run"
+    )
+    try expect(scanner.scanCount, equals: 1, "metadata-only tick reuses the verified process snapshot")
+    try expect(materializationCounter.materializationCount, equals: 2, "metadata-only tick snapshot")
+
+    scheduler.requestHeartbeatTick()
+    deadline = Date().addingTimeInterval(2)
+    while scanner.scanCount < 2, Date() < deadline {
+        usleep(1_000)
+    }
+    scheduler.waitUntilIdle()
+    try expect(scanner.scanCount, equals: 2, "heartbeat still refreshes process liveness")
+    try expect(materializationCounter.materializationCount, equals: 3, "heartbeat tick snapshot")
+}
+
+func testConvoyMetadataTickRemovesSupersededRunImmediately() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    let processID = Int32(getpid())
+    let processIdentity = try SystemProcessScanner.processIdentity(of: processID)
+        .unwrap(or: "test process identity was unavailable")
+    let process = DetectedAgentProcess(
+        tool: .convoy,
+        processID: processID,
+        processIdentity: processIdentity,
+        cwd: "/tmp/convoy-target",
+        terminal: TerminalContext(termProgram: "ghostty"),
+        elapsedSeconds: 120
+    )
+    let scanner = CountingProcessScanner([process])
+    let scheduler = ObservationScheduler(
+        repository: repository,
+        processScanner: scanner,
+        codexSessionsDirectoryURL: stateDirectoryURL.appendingPathComponent("codex", isDirectory: true),
+        convoyRunsDirectoryURL: runsDirectoryURL,
+        debounceInterval: 0.01
+    )
+    defer {
+        scheduler.stop()
+        scheduler.waitUntilIdle()
+    }
+    let firstRunID = "20260722-191000-first"
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: firstRunID,
+        serverPid: processID,
+        serverStartedAt: Date().addingTimeInterval(-60),
+        phases: [("implementer", "running", "ses_first")]
+    )
+
+    scheduler.requestTick()
+    var deadline = Date().addingTimeInterval(2)
+    while !(try repository.loadSessions()).contains(where: { $0.sessionID == firstRunID }),
+          Date() < deadline {
+        usleep(1_000)
+    }
+    scheduler.waitUntilIdle()
+    try expect(scanner.scanCount, equals: 1, "initial tick verifies the live process generation")
+
+    let now = Date()
+    let otherGenerationID = "other-generation"
+    try repository.save(AgentSession(
+        tool: .convoy,
+        sessionID: otherGenerationID,
+        pid: processID,
+        processIdentity: ProcessIdentity(
+            processID: processID,
+            kernelStartTimeMicroseconds: processIdentity.kernelStartTimeMicroseconds + 1
+        ),
+        status: .working,
+        cwd: "/tmp/other-generation",
+        startedAt: now,
+        updatedAt: now
+    ))
+    let otherProcessID = "other-pid"
+    try repository.save(AgentSession(
+        tool: .convoy,
+        sessionID: otherProcessID,
+        pid: processID + 1,
+        processIdentity: ProcessIdentity(
+            processID: processID + 1,
+            kernelStartTimeMicroseconds: 987_654_321
+        ),
+        status: .working,
+        cwd: "/tmp/other-pid",
+        startedAt: now,
+        updatedAt: now
+    ))
+
+    let secondRunID = "20260722-191100-second"
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: secondRunID,
+        serverPid: processID,
+        serverStartedAt: Date().addingTimeInterval(-30),
+        phases: [("implementer", "running", "ses_second")]
+    )
+    scheduler.requestConvoyMetadataTick()
+    deadline = Date().addingTimeInterval(2)
+    while !(try repository.loadSessions()).contains(where: { $0.sessionID == secondRunID }),
+          Date() < deadline {
+        usleep(1_000)
+    }
+    scheduler.waitUntilIdle()
+
+    try expect(scanner.scanCount, equals: 1, "supersession runs on a metadata-only observation")
+    try expect(
+        Set(try repository.loadSessions().map(\.sessionID)),
+        equals: [secondRunID, otherGenerationID, otherProcessID],
+        "metadata-only supersession removes only the old same-generation run"
     )
 }
 
@@ -1135,6 +2267,74 @@ func testStateStoreReloadFiltersEndedSessionsWithoutWriting() throws {
     )
 }
 
+final class StartupStateMutationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didPublish = false
+    private var failureDescription: String?
+
+    func publishOnce(_ data: Data, to fileURL: URL) {
+        lock.lock()
+        guard !didPublish else {
+            lock.unlock()
+            return
+        }
+        didPublish = true
+        lock.unlock()
+
+        do {
+            try data.writeAtomically(to: fileURL)
+            StateChangeNotifier.post()
+        } catch {
+            lock.lock()
+            failureDescription = String(describing: error)
+            lock.unlock()
+        }
+    }
+
+    func checkForFailure() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        if let failureDescription {
+            throw TestFailure.expectation("startup mutation failed: \(failureDescription)")
+        }
+    }
+}
+
+func testStateStoreArmsNotificationsBeforeStartupBaselineMutation() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let stateURL = directory.appendingPathComponent("claude-startup-race.json")
+    let state = validStateJSON(
+        sessionID: "startup-race",
+        status: "working",
+        pid: Int32(getpid())
+    )
+    let mutation = StartupStateMutationProbe()
+    let repository = StateRepository(
+        directoryURL: directory,
+        materializationObserver: {
+            mutation.publishOnce(state, to: stateURL)
+        }
+    )
+    let store = StateStore(repository: repository)
+
+    try store.startObserving(pollInterval: nil, layers: .darwinNotification)
+    defer { store.stopObserving() }
+    try mutation.checkForFailure()
+
+    let deadline = Date().addingTimeInterval(1)
+    while store.sessions.isEmpty, Date() < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+    }
+
+    try expect(
+        store.sessions.map(\.sessionID),
+        equals: ["startup-race"],
+        "startup state converges without polling"
+    )
+}
+
 func testStateStorePollingObservesNewStateFiles() throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1291,6 +2491,47 @@ func testPointerMovementGateStaysLockedUntilPointerMoves() throws {
         equals: true,
         "once unlocked the gate stays open"
     )
+}
+
+func testPointerSamplesPublishOnlyContainmentTransitions() throws {
+    var reducer = PointerSampleReducer()
+    var gate = PointerMovementGate()
+    gate.lock(at: DisplayPoint(x: 100, y: 100))
+    var publications: [PointerContainmentState] = []
+    let outsideBeforeEntry = (0..<50).map { offset in
+        (isInside: false, location: DisplayPoint(x: CGFloat(100 + offset % 2), y: 100))
+    }
+    let insideMoves = (0..<100).map { offset in
+        (isInside: true, location: DisplayPoint(x: CGFloat(102 + offset), y: 100))
+    }
+    let outsideAfterLeave = (0..<50).map { offset in
+        (isInside: false, location: DisplayPoint(x: CGFloat(202 + offset), y: 100))
+    }
+    let samples = outsideBeforeEntry + insideMoves + outsideAfterLeave
+
+    for sample in samples {
+        let reduction = reducer.reduce(
+            isInside: sample.isInside,
+            location: sample.location
+        )
+        if sample.isInside {
+            _ = gate.update(pointerLocation: reduction.location)
+        }
+        if let containment = reduction.containmentChange {
+            publications.append(containment)
+        }
+    }
+
+    try expect(
+        publications,
+        equals: [
+            PointerContainmentState(isInside: true, revision: 1),
+            PointerContainmentState(isInside: false, revision: 2),
+        ],
+        "only entering and leaving publish observable pointer state"
+    )
+    try expect(gate.isUnlocked, equals: true, "unpublished coordinates still reach movement gate")
+    try expect(reducer.revision, equals: 2, "same-containment moves do not advance revision")
 }
 
 func testHoverInteractionIgnoresSyntheticExitWhilePointerRemainsInside() throws {
@@ -1574,6 +2815,108 @@ func testScreenSelectionFollowsThePointerAndFallsBackToFocusedDisplay() throws {
     )
 }
 
+func testFocusedWindowFrameWinsOverPointerAndDefaultDisplay() throws {
+    // Display B is first to model AgentGlance's own main/default screen, while
+    // the frontmost external application's window is on display A.
+    let displays = [
+        DisplaySnapshot(id: 22, frame: DisplayFrame(minX: 1_000, minY: 0, width: 1_000, height: 800)),
+        DisplaySnapshot(id: 11, frame: DisplayFrame(minX: 0, minY: 0, width: 1_000, height: 800)),
+    ]
+
+    try expect(
+        ScreenSelection.selectDisplayID(
+            mode: .focusedWindow,
+            pointerLocation: DisplayPoint(x: 1_500, y: 400),
+            focusedWindowFrame: DisplayFrame(minX: 100, minY: 100, width: 700, height: 500),
+            lastSelectedDisplayID: 22,
+            displays: displays
+        ),
+        equals: 11,
+        "external focused-window frame wins over pointer and app default"
+    )
+}
+
+func testFocusedWindowFrameUsesGreatestIntersectionAndStableTieBreak() throws {
+    let displays = [
+        DisplaySnapshot(id: 40, frame: DisplayFrame(minX: 0, minY: 0, width: 1_000, height: 800)),
+        DisplaySnapshot(id: 20, frame: DisplayFrame(minX: 1_000, minY: 0, width: 1_000, height: 800)),
+    ]
+
+    try expect(
+        ScreenSelection.displayID(
+            containingMostOf: DisplayFrame(minX: 800, minY: 100, width: 900, height: 500),
+            displays: displays
+        ),
+        equals: 20,
+        "spanning window selects the display with the greatest intersection"
+    )
+    try expect(
+        ScreenSelection.displayID(
+            containingMostOf: DisplayFrame(minX: 500, minY: 100, width: 1_000, height: 500),
+            displays: displays
+        ),
+        equals: 20,
+        "equal intersections use the lowest stable display ID"
+    )
+    try expect(
+        ScreenSelection.displayID(
+            containingMostOf: DisplayFrame(minX: 3_000, minY: 100, width: 500, height: 500),
+            displays: displays
+        ),
+        equals: nil,
+        "offscreen window bounds are unavailable"
+    )
+    try expect(
+        ScreenSelection.displayID(
+            containingMostOf: DisplayFrame(minX: .nan, minY: 100, width: 500, height: 500),
+            displays: displays
+        ),
+        equals: nil,
+        "invalid window bounds are unavailable"
+    )
+}
+
+func testFocusedWindowUnavailableFallsBackWithoutChangingPrivacyPermissions() throws {
+    let displays = [
+        DisplaySnapshot(id: 22, frame: DisplayFrame(minX: 1_000, minY: 0, width: 1_000, height: 800)),
+        DisplaySnapshot(id: 11, frame: DisplayFrame(minX: 0, minY: 0, width: 1_000, height: 800)),
+    ]
+
+    try expect(
+        ScreenSelection.selectDisplayID(
+            mode: .focusedWindow,
+            pointerLocation: DisplayPoint(x: 1_500, y: 400),
+            focusedWindowFrame: nil,
+            lastSelectedDisplayID: 11,
+            displays: displays
+        ),
+        equals: 22,
+        "unavailable or restricted window data falls back to the pointer"
+    )
+    try expect(
+        ScreenSelection.selectDisplayID(
+            mode: .focusedWindow,
+            pointerLocation: nil,
+            focusedWindowFrame: nil,
+            lastSelectedDisplayID: 11,
+            displays: displays
+        ),
+        equals: 11,
+        "missing pointer then falls back to the last selected display"
+    )
+    try expect(
+        ScreenSelection.selectDisplayID(
+            mode: .focusedWindow,
+            pointerLocation: nil,
+            focusedWindowFrame: nil,
+            lastSelectedDisplayID: nil,
+            displays: displays
+        ),
+        equals: 22,
+        "missing observations finally fall back to the first available display"
+    )
+}
+
 func testScreenSelectionReturnsEveryDisplayWhenConfiguredForAllDisplays() throws {
     let displays = [
         DisplaySnapshot(id: 11, frame: DisplayFrame(minX: 0, minY: 0, width: 1_512, height: 982)),
@@ -1591,6 +2934,86 @@ func testScreenSelectionReturnsEveryDisplayWhenConfiguredForAllDisplays() throws
         equals: [11, 22],
         "all-displays mode keeps a notch panel on every connected display"
     )
+}
+
+func testPanelSynchronizationSchedulesNoIdlePollingOutsideFocusedWindowMode() throws {
+    let allDisplays = PanelSynchronizationPolicy.schedule(for: .allDisplays)
+    try expect(allDisplays.resources, equals: [], "all-displays resources")
+    try expect(allDisplays.idlePollInterval, equals: nil, "all-displays idle polling")
+
+    let pointer = PanelSynchronizationPolicy.schedule(for: .pointer)
+    try expect(
+        pointer.resources,
+        equals: [.pointerEventMonitor],
+        "pointer mode reacts through pointer events"
+    )
+    try expect(pointer.idlePollInterval, equals: nil, "pointer mode has no fixed-rate work")
+
+    var pointerDisplays = PointerDisplayChangeReducer(initialDisplayID: 11)
+    try expect(
+        pointerDisplays.update(displayID: 11),
+        equals: false,
+        "high-rate movement inside one display is ignored"
+    )
+    try expect(
+        pointerDisplays.update(displayID: 22),
+        equals: true,
+        "crossing a display boundary requests synchronization"
+    )
+    try expect(
+        pointerDisplays.update(displayID: 22),
+        equals: false,
+        "movement after crossing is ignored again"
+    )
+}
+
+func testFocusedWindowSynchronizationUsesOnlyDocumentedSlowFallback() throws {
+    let focused = PanelSynchronizationPolicy.schedule(for: .focusedWindow)
+
+    try expect(
+        focused.resources,
+        equals: [.focusedWindowFallbackTimer],
+        "focused-window mode installs only its fallback resource"
+    )
+    try expect(
+        focused.idlePollInterval,
+        equals: PanelSynchronizationPolicy.focusedWindowFallbackInterval,
+        "focused-window fallback uses the documented cadence"
+    )
+    try expect(
+        (focused.idlePollInterval ?? 0) >= 2,
+        equals: true,
+        "focused-window fallback is substantially slower than the old 250ms poll"
+    )
+}
+
+func testPanelSynchronizationModeTransitionsChangeResourcesExactlyOnce() throws {
+    var policy = PanelSynchronizationPolicy()
+
+    let initialPointer = policy.transition(to: .pointer)
+    try expect(initialPointer.installed, equals: [.pointerEventMonitor], "initial pointer install")
+    try expect(initialPointer.removed, equals: [], "initial pointer removal")
+    let repeatedPointer = policy.transition(to: .pointer)
+    try expect(repeatedPointer.installed, equals: [], "repeated pointer install")
+    try expect(repeatedPointer.removed, equals: [], "repeated pointer removal")
+
+    let focused = policy.transition(to: .focusedWindow)
+    try expect(focused.installed, equals: [.focusedWindowFallbackTimer], "focused install")
+    try expect(focused.removed, equals: [.pointerEventMonitor], "pointer removal")
+    let repeatedFocused = policy.transition(to: .focusedWindow)
+    try expect(repeatedFocused.installed, equals: [], "repeated focused install")
+    try expect(repeatedFocused.removed, equals: [], "repeated focused removal")
+
+    let allDisplays = policy.transition(to: .allDisplays)
+    try expect(allDisplays.installed, equals: [], "all-displays install")
+    try expect(
+        allDisplays.removed,
+        equals: [.focusedWindowFallbackTimer],
+        "focused fallback removal"
+    )
+    let repeatedAllDisplays = policy.transition(to: .allDisplays)
+    try expect(repeatedAllDisplays.installed, equals: [], "repeated all-displays install")
+    try expect(repeatedAllDisplays.removed, equals: [], "repeated all-displays removal")
 }
 
 func testAttentionAcknowledgmentsSilenceVisitedSessionsUntilNewActivity() throws {
@@ -1693,6 +3116,179 @@ func testGitWorkspaceInspectorResolvesBranchNames() throws {
         equals: nil,
         "nil outside any repository"
     )
+}
+
+final class AsyncTestResultBox<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<Value, Error>?
+
+    func store(_ result: Result<Value, Error>) {
+        lock.lock()
+        self.result = result
+        lock.unlock()
+    }
+
+    func load() -> Result<Value, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return result
+    }
+}
+
+func waitForAsync<Value: Sendable>(
+    timeout: TimeInterval = 10,
+    _ operation: @escaping @Sendable () async throws -> Value
+) throws -> Value {
+    let completion = DispatchSemaphore(value: 0)
+    let box = AsyncTestResultBox<Value>()
+    Task.detached {
+        do {
+            box.store(.success(try await operation()))
+        } catch {
+            box.store(.failure(error))
+        }
+        completion.signal()
+    }
+    guard completion.wait(timeout: .now() + timeout) == .success,
+          let result = box.load() else {
+        throw TestFailure.expectation("async test timed out")
+    }
+    return try result.get()
+}
+
+final class GitBranchResolverProbe: @unchecked Sendable {
+    let release = DispatchSemaphore(value: 0)
+
+    private let blocks: Bool
+    private let lock = NSLock()
+    private var invocationCounts: [String: Int] = [:]
+    private var activeCount = 0
+    private var highestActiveCount = 0
+
+    init(blocks: Bool) {
+        self.blocks = blocks
+    }
+
+    func resolve(_ path: String) -> String? {
+        lock.lock()
+        invocationCounts[path, default: 0] += 1
+        activeCount += 1
+        highestActiveCount = max(highestActiveCount, activeCount)
+        lock.unlock()
+
+        if blocks {
+            _ = release.wait(timeout: .now() + 5)
+        }
+
+        lock.lock()
+        activeCount -= 1
+        lock.unlock()
+        return "branch-\(URL(fileURLWithPath: path).lastPathComponent)"
+    }
+
+    var invocationCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return invocationCounts.values.reduce(0, +)
+    }
+
+    func invocations(for path: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return invocationCounts[path, default: 0]
+    }
+
+    var maximumActiveCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return highestActiveCount
+    }
+
+    func waitForInvocations(_ expectedCount: Int) async throws {
+        for _ in 0..<2_000 {
+            if invocationCount >= expectedCount { return }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        throw TestFailure.expectation("Git resolver did not receive \(expectedCount) requests")
+    }
+}
+
+func testGitBranchResolutionCoordinatorCoalescesAndCachesWorkingDirectory() throws {
+    try waitForAsync {
+        let probe = GitBranchResolverProbe(blocks: true)
+        let coordinator = GitBranchResolutionCoordinator(
+            maximumConcurrentResolutions: 4,
+            maximumCacheEntries: 8,
+            resolver: { path in probe.resolve(path) }
+        )
+        let requests = [
+            Task { await coordinator.branchName(forWorkingDirectory: "/tmp/shared-repo") },
+            Task { await coordinator.branchName(forWorkingDirectory: "/tmp/shared-repo/./") },
+        ]
+        try await probe.waitForInvocations(1)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        try expect(probe.invocationCount, equals: 1, "concurrent normalized requests coalesce")
+
+        probe.release.signal()
+        var concurrentResults: [String?] = []
+        for request in requests {
+            concurrentResults.append(await request.value)
+        }
+        try expect(
+            concurrentResults,
+            equals: ["branch-shared-repo", "branch-shared-repo"],
+            "coalesced callers receive the same branch"
+        )
+        let repeated = await coordinator.branchName(forWorkingDirectory: "/tmp/shared-repo")
+        try expect(repeated, equals: "branch-shared-repo", "repeated request returns cached branch")
+        try expect(probe.invocationCount, equals: 1, "repeated request avoids another probe")
+    }
+}
+
+func testGitBranchResolutionCoordinatorBoundsConcurrentProbes() throws {
+    try waitForAsync {
+        let probe = GitBranchResolverProbe(blocks: true)
+        let coordinator = GitBranchResolutionCoordinator(
+            maximumConcurrentResolutions: 2,
+            maximumCacheEntries: 8,
+            resolver: { path in probe.resolve(path) }
+        )
+        let requests = (0..<6).map { index in
+            Task {
+                await coordinator.branchName(forWorkingDirectory: "/tmp/repo-\(index)")
+            }
+        }
+        try await probe.waitForInvocations(2)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        try expect(probe.invocationCount, equals: 2, "queued probes wait for a concurrency slot")
+        try expect(probe.maximumActiveCount, equals: 2, "active Git probes respect the bound")
+
+        for _ in requests { probe.release.signal() }
+        for request in requests { _ = await request.value }
+        try expect(probe.invocationCount, equals: 6, "every distinct directory eventually resolves")
+        try expect(probe.maximumActiveCount, equals: 2, "later probes also respect the bound")
+    }
+}
+
+func testGitBranchResolutionCoordinatorEvictsLeastRecentlyUsedEntry() throws {
+    try waitForAsync {
+        let probe = GitBranchResolverProbe(blocks: false)
+        let coordinator = GitBranchResolutionCoordinator(
+            maximumConcurrentResolutions: 1,
+            maximumCacheEntries: 2,
+            resolver: { path in probe.resolve(path) }
+        )
+        _ = await coordinator.branchName(forWorkingDirectory: "/tmp/repo-a")
+        _ = await coordinator.branchName(forWorkingDirectory: "/tmp/repo-b")
+        _ = await coordinator.branchName(forWorkingDirectory: "/tmp/repo-a")
+        _ = await coordinator.branchName(forWorkingDirectory: "/tmp/repo-c")
+        _ = await coordinator.branchName(forWorkingDirectory: "/tmp/repo-a")
+        _ = await coordinator.branchName(forWorkingDirectory: "/tmp/repo-b")
+
+        try expect(probe.invocations(for: "/tmp/repo-a"), equals: 1, "recent entry stays cached")
+        try expect(probe.invocations(for: "/tmp/repo-b"), equals: 2, "least-recent entry is evicted")
+        try expect(probe.invocations(for: "/tmp/repo-c"), equals: 1, "new entry is cached")
+    }
 }
 
 func testNotchLayoutExtendsFromLeftSideOfHardwareNotch() throws {
@@ -2159,7 +3755,7 @@ func testOpenCodePluginMapsLifecycleEvents() throws {
     let driver = directory.appendingPathComponent("lifecycle.mjs")
     try Data(
         """
-        import { readFile } from "node:fs/promises";
+        import { readFile, writeFile } from "node:fs/promises";
         import { AgentGlancePlugin } from "\(pluginURL.absoluteString)";
         const plugin = await AgentGlancePlugin({
           directory: "/tmp/project",
@@ -2167,11 +3763,19 @@ func testOpenCodePluginMapsLifecycleEvents() throws {
         });
         const event = async (type, properties) => plugin.event({ event: { type, properties } });
         const statuses = [];
+        const stateURL = `${process.env.AGENTGLANCE_HOME}/state/opencode-b3Blbi0x.json`;
         const capture = async () => statuses.push(JSON.parse(
-          await readFile(`${process.env.AGENTGLANCE_HOME}/state/opencode-b3Blbi0x.json`, "utf8")
+          await readFile(stateURL, "utf8")
         ));
         await event("session.created", { info: { id: "open-1", directory: "/tmp/project" } });
+        const reconciled = JSON.parse(await readFile(stateURL, "utf8"));
+        reconciled.process_identity = { pid: reconciled.pid, kernel_start_time_us: 123456 };
+        await writeFile(stateURL, JSON.stringify(reconciled));
         await event("permission.asked", { sessionID: "open-1" }); await capture();
+        const rebound = JSON.parse(await readFile(stateURL, "utf8"));
+        rebound.pid += 1;
+        rebound.process_identity = { pid: rebound.pid, kernel_start_time_us: 654321 };
+        await writeFile(stateURL, JSON.stringify(rebound));
         await event("permission.replied", { sessionID: "open-1" }); await capture();
         await event("session.idle", { sessionID: "open-1" }); await capture();
         await event("session.deleted", { info: { id: "open-1" } }); await capture();
@@ -2199,6 +3803,12 @@ func testOpenCodePluginMapsLifecycleEvents() throws {
         equals: [.needsAttention, .working, .idle, .ended],
         "lifecycle statuses"
     )
+    try expect(
+        states[0].processIdentity?.kernelStartTimeMicroseconds,
+        equals: 123_456,
+        "same-process identity survives OpenCode lifecycle update"
+    )
+    try expect(states[1].processIdentity, equals: nil, "rebound identity is not copied by OpenCode")
 }
 
 func testPiExtensionWritesSessionState() throws {
@@ -2256,7 +3866,7 @@ func testPiExtensionMapsLifecycleEvents() throws {
     let driver = directory.appendingPathComponent("lifecycle.mjs")
     try Data(
         """
-        import { readFile } from "node:fs/promises";
+        import { readFile, writeFile } from "node:fs/promises";
         import agentGlance from "\(extensionURL.absoluteString)";
         const handlers = new Map();
         agentGlance({ on: (event, handler) => handlers.set(event, handler) });
@@ -2266,11 +3876,19 @@ func testPiExtensionMapsLifecycleEvents() throws {
         };
         const fire = async (event, payload = {}) => handlers.get(event)(payload, ctx);
         const states = [];
+        const stateURL = `${process.env.AGENTGLANCE_HOME}/state/pi-cGktMQ.json`;
         const capture = async () => states.push(JSON.parse(
-          await readFile(`${process.env.AGENTGLANCE_HOME}/state/pi-cGktMQ.json`, "utf8")
+          await readFile(stateURL, "utf8")
         ));
         await fire("session_start", { reason: "start" });
+        const reconciled = JSON.parse(await readFile(stateURL, "utf8"));
+        reconciled.process_identity = { pid: reconciled.pid, kernel_start_time_us: 123456 };
+        await writeFile(stateURL, JSON.stringify(reconciled));
         await fire("agent_start"); await capture();
+        const rebound = JSON.parse(await readFile(stateURL, "utf8"));
+        rebound.pid += 1;
+        rebound.process_identity = { pid: rebound.pid, kernel_start_time_us: 654321 };
+        await writeFile(stateURL, JSON.stringify(rebound));
         await fire("agent_end", { messages: [] }); await capture();
         await fire("input", { text: "next prompt" }); await capture();
         await fire("session_shutdown", { reason: "exit" }); await capture();
@@ -2303,6 +3921,12 @@ func testPiExtensionMapsLifecycleEvents() throws {
         equals: [nil, .turnComplete, nil, nil],
         "attention reasons"
     )
+    try expect(
+        states[0].processIdentity?.kernelStartTimeMicroseconds,
+        equals: 123_456,
+        "same-process identity survives Pi lifecycle update"
+    )
+    try expect(states[1].processIdentity, equals: nil, "rebound identity is not copied by Pi")
 }
 
 func testCodexRolloutParserMapsSessionAndTurnEvents() throws {
@@ -2335,9 +3959,13 @@ func testCodexRolloutParserIgnoresMalformedAndUnknownLines() throws {
     let unknown = parser.consume(
         line: Data(#"{"timestamp":"2026-07-18T10:00:00Z","type":"future_event","payload":{}}"#.utf8)
     )
+    let invalidTimestamp = parser.consume(line: Data(
+        #"{"timestamp":"not-a-date","type":"session_meta","payload":{"id":"invalid-time","cwd":"/tmp/project"}}"#.utf8
+    ))
 
     try expect(malformed == nil, equals: true, "malformed line")
     try expect(unknown == nil, equals: true, "unknown line")
+    try expect(invalidTimestamp == nil, equals: true, "invalid timestamp")
 }
 
 func testCodexSessionsWatcherProcessesAppendedLinesIncrementally() throws {
@@ -2348,7 +3976,8 @@ func testCodexSessionsWatcherProcessesAppendedLinesIncrementally() throws {
     try FileManager.default.createDirectory(at: sessionsDirectory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: root) }
     let rollout = sessionsDirectory.appendingPathComponent("rollout.jsonl")
-    let metadata = #"{"timestamp":"2026-07-18T10:00:00Z","type":"session_meta","payload":{"id":"codex-watch","cwd":"/tmp/watched","timestamp":"2026-07-18T10:00:00Z"}}"#
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let metadata = #"{"timestamp":"\#(timestamp)","type":"session_meta","payload":{"id":"codex-watch","cwd":"/tmp/watched","timestamp":"\#(timestamp)"}}"#
     try Data("\(metadata)\n".utf8).write(to: rollout)
     let repository = StateRepository(directoryURL: stateDirectory)
     let watcher = CodexSessionsWatcher(
@@ -2358,7 +3987,8 @@ func testCodexSessionsWatcherProcessesAppendedLinesIncrementally() throws {
     )
 
     try watcher.scan()
-    let approval = #"{"timestamp":"2026-07-18T10:00:01Z","type":"event_msg","payload":{"type":"request_permissions"}}"#
+    let approvalTimestamp = ISO8601DateFormatter().string(from: Date())
+    let approval = #"{"timestamp":"\#(approvalTimestamp)","type":"event_msg","payload":{"type":"request_permissions"}}"#
     let handle = try FileHandle(forWritingTo: rollout)
     try handle.seekToEnd()
     try handle.write(contentsOf: Data("\(approval)\n".utf8))
@@ -2368,6 +3998,11 @@ func testCodexSessionsWatcherProcessesAppendedLinesIncrementally() throws {
     let session = try repository.loadSessions().first.unwrap(or: "Codex state was not saved")
     try expect(session.status, equals: .needsAttention, "appended event status")
     try expect(session.attentionReason, equals: .permission, "appended event reason")
+    try expect(
+        session.processIdentity,
+        equals: SystemProcessScanner.processIdentity(of: Int32(getpid())),
+        "live rollout adopts the current process generation"
+    )
 }
 
 func testCodexSessionsWatcherResavesWhenProcessAppearsLater() throws {
@@ -2381,13 +4016,14 @@ func testCodexSessionsWatcherResavesWhenProcessAppearsLater() throws {
     let stateDirectory = root.appendingPathComponent("state", isDirectory: true)
     try FileManager.default.createDirectory(at: sessionsDirectory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: root) }
-    let metadata = #"{"timestamp":"2026-07-18T10:00:00Z","type":"session_meta","payload":{"id":"codex-late","cwd":"/tmp/late-bound","timestamp":"2026-07-18T10:00:00Z"}}"#
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let metadata = #"{"timestamp":"\#(timestamp)","type":"session_meta","payload":{"id":"codex-late","cwd":"/tmp/late-bound","timestamp":"\#(timestamp)"}}"#
     try Data("\(metadata)\n".utf8).write(to: sessionsDirectory.appendingPathComponent("rollout.jsonl"))
     let repository = StateRepository(directoryURL: stateDirectory)
     let watcher = CodexSessionsWatcher(
         sessionsDirectoryURL: sessionsDirectory,
         repository: repository,
-        processIDResolver: { _ in nil }
+        processResolver: { _ in nil }
     )
 
     try watcher.scan()
@@ -2397,12 +4033,24 @@ func testCodexSessionsWatcherResavesWhenProcessAppearsLater() throws {
         "unresolved session stays unpublished"
     )
 
-    watcher.processIDResolver = { _ in Int32(getpid()) }
+    let processID = Int32(getpid())
+    let processIdentity = try SystemProcessScanner.processIdentity(of: processID)
+        .unwrap(or: "test process identity was unavailable")
+    watcher.processResolver = { session in
+        DetectedAgentProcess(
+            tool: .codex,
+            processID: processID,
+            processIdentity: processIdentity,
+            cwd: session.cwd,
+            terminal: TerminalContext()
+        )
+    }
     try watcher.scan()
 
     let session = try repository.loadSessions().first.unwrap(or: "session was not published")
     try expect(session.sessionID, equals: "codex-late", "published session identity")
     try expect(session.pid, equals: Int32(getpid()), "session adopts the resolved pid")
+    try expect(session.processIdentity, equals: processIdentity, "session adopts the resolved generation")
 }
 
 func testCodexSessionsWatcherSkipsDateDirectoriesOutsideWindow() throws {
@@ -2419,7 +4067,8 @@ func testCodexSessionsWatcherSkipsDateDirectoriesOutsideWindow() throws {
     defer { try? FileManager.default.removeItem(at: root) }
     let oldMetadata = #"{"timestamp":"2026-07-18T10:00:00Z","type":"session_meta","payload":{"id":"codex-old","cwd":"/tmp/old","timestamp":"2026-07-18T10:00:00Z"}}"#
     try Data("\(oldMetadata)\n".utf8).write(to: oldDirectory.appendingPathComponent("rollout.jsonl"))
-    let currentMetadata = #"{"timestamp":"2026-07-18T10:00:00Z","type":"session_meta","payload":{"id":"codex-current","cwd":"/tmp/current","timestamp":"2026-07-18T10:00:00Z"}}"#
+    let currentTimestamp = ISO8601DateFormatter().string(from: Date())
+    let currentMetadata = #"{"timestamp":"\#(currentTimestamp)","type":"session_meta","payload":{"id":"codex-current","cwd":"/tmp/current","timestamp":"\#(currentTimestamp)"}}"#
     try Data("\(currentMetadata)\n".utf8).write(to: sessionsDirectory.appendingPathComponent("rollout.jsonl"))
     let repository = StateRepository(directoryURL: stateDirectory)
     let watcher = CodexSessionsWatcher(
@@ -2440,6 +4089,7 @@ func writeConvoyRunFixture(
     runID: String,
     serverPid: Int32,
     serverStartedAt: Date,
+    updatedAt: Date = Date(),
     targetDir: String = "/tmp/convoy-target",
     phases: [(name: String, status: String, sessionID: String?)],
     humanSteps: Set<String> = [],
@@ -2473,7 +4123,7 @@ func writeConvoyRunFixture(
       "runID": "\(runID)",
       "targetDir": "\(targetDir)",
       "createdAt": \(Int(serverStartedAt.timeIntervalSince1970 * 1000)),
-      "updatedAt": \(Int(Date().timeIntervalSince1970 * 1000)),
+      "updatedAt": \(Int(updatedAt.timeIntervalSince1970 * 1000)),
       \(serverField)
       "phases": { \(phaseEntries) },
       "pipeline": { "name": "test", "steps": [ \(steps) ] }
@@ -2530,6 +4180,217 @@ func testConvoyWatcherPublishesRunningPipelineStep() throws {
     try expect(session.currentStep, equals: "security", "current step")
     try expect(session.cwd, equals: "/tmp/convoy-target", "cwd")
     try expect(session.terminal.termProgram, equals: "ghostty", "terminal context adopted")
+}
+
+func testConvoyWatcherDoesNotRepublishUnchangedObservation() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    let runID = "20260722-101010-stable"
+    let process = detectedConvoyProcess()
+    let serverStartedAt = Date().addingTimeInterval(-300)
+    let runUpdatedAt = Date(timeIntervalSince1970: 2_000_000_000)
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: runID,
+        serverPid: process.processID,
+        serverStartedAt: serverStartedAt,
+        updatedAt: runUpdatedAt,
+        phases: [("implementer", "running", "ses_impl")]
+    )
+    let watcher = ConvoyRunsWatcher(runsDirectoryURL: runsDirectoryURL, repository: repository)
+    _ = try watcher.observe(detected: [process], isHeartbeat: false)
+    let stateFileURL = try FileManager.default.contentsOfDirectory(
+        at: stateDirectoryURL,
+        includingPropertiesForKeys: nil
+    ).first { $0.pathExtension == "json" }.unwrap(or: "Convoy state document missing")
+    let unchangedData = try Data(contentsOf: stateFileURL)
+    let stableModificationDate = Date(timeIntervalSince1970: 1_000)
+    try FileManager.default.setAttributes(
+        [.modificationDate: stableModificationDate],
+        ofItemAtPath: stateFileURL.path
+    )
+
+    let store = StateStore(repository: repository)
+    try store.startObserving(pollInterval: nil, layers: .darwinNotification)
+    defer { store.stopObserving() }
+    try validStateJSON(sessionID: "notification-probe", status: "working")
+        .writeAtomically(to: stateDirectoryURL.appendingPathComponent("notification-probe.json"))
+
+    _ = try watcher.observe(detected: [process], isHeartbeat: true)
+    RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+
+    try expect(try Data(contentsOf: stateFileURL), equals: unchangedData, "unchanged document content")
+    let observedModificationDate = try FileManager.default
+        .attributesOfItem(atPath: stateFileURL.path)[.modificationDate] as? Date
+    try expect(observedModificationDate, equals: stableModificationDate, "unchanged document not rewritten")
+    try expect(
+        store.sessions.map(\.sessionID),
+        equals: [runID],
+        "unchanged observation emits no state-change notification"
+    )
+    store.stopObserving()
+
+    let advancedUpdatedAt = runUpdatedAt.addingTimeInterval(5)
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: runID,
+        serverPid: process.processID,
+        serverStartedAt: serverStartedAt,
+        updatedAt: advancedUpdatedAt,
+        phases: [("implementer", "completed", "ses_impl")]
+    )
+    _ = try watcher.observe(
+        detected: [process],
+        isHeartbeat: false,
+        invalidatedMetadataURLs: [runsDirectoryURL
+            .appendingPathComponent(runID, isDirectory: true)
+            .appendingPathComponent("metadata.json")]
+    )
+    let completed = try repository.loadSessions().first { $0.sessionID == runID }
+        .unwrap(or: "meaningful Convoy update missing")
+    try expect(completed.status, equals: .idle, "status update persists")
+    try expect(completed.updatedAt, equals: advancedUpdatedAt, "timestamp update persists")
+
+    let generation = ProcessIdentity(
+        processID: process.processID,
+        kernelStartTimeMicroseconds: 123_456
+    )
+    let identifiedProcess = DetectedAgentProcess(
+        tool: .convoy,
+        processID: process.processID,
+        processIdentity: generation,
+        cwd: process.cwd,
+        terminal: process.terminal,
+        elapsedSeconds: process.elapsedSeconds
+    )
+    _ = try watcher.observe(detected: [identifiedProcess], isHeartbeat: true)
+    let identified = try repository.loadSessions().first { $0.sessionID == runID }
+        .unwrap(or: "Convoy process-generation update missing")
+    try expect(identified.processIdentity, equals: generation, "process generation update persists")
+}
+
+final class ConvoyMetadataParseCounter {
+    private var countsByPath: [String: Int] = [:]
+
+    func record(_ url: URL) {
+        countsByPath[url.resolvingSymlinksInPath().path, default: 0] += 1
+    }
+
+    func count(for url: URL) -> Int {
+        countsByPath[url.resolvingSymlinksInPath().path, default: 0]
+    }
+}
+
+func testConvoyMetadataInvalidationReparsesOnlyDirtyRun() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let process = detectedConvoyProcess()
+    let olderRunID = "20260722-181000-unaffected"
+    let activeRunID = "20260722-182000-dirty"
+    let olderStartedAt = Date().addingTimeInterval(-400)
+    let activeStartedAt = Date().addingTimeInterval(-300)
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: olderRunID,
+        serverPid: process.processID,
+        serverStartedAt: olderStartedAt,
+        phases: [("scope", "completed", "ses_scope")]
+    )
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: activeRunID,
+        serverPid: process.processID,
+        serverStartedAt: activeStartedAt,
+        phases: [("implementer", "running", "ses_impl")]
+    )
+    let runDirectoryURLs = try FileManager.default.contentsOfDirectory(
+        at: runsDirectoryURL,
+        includingPropertiesForKeys: nil
+    )
+    let unaffectedMetadataURL = try runDirectoryURLs
+        .first { $0.lastPathComponent == olderRunID }
+        .unwrap(or: "unaffected run directory missing")
+        .appendingPathComponent("metadata.json")
+    let dirtyMetadataURL = try runDirectoryURLs
+        .first { $0.lastPathComponent == activeRunID }
+        .unwrap(or: "dirty run directory missing")
+        .appendingPathComponent("metadata.json")
+    let counter = ConvoyMetadataParseCounter()
+    let watcher = ConvoyRunsWatcher(
+        runsDirectoryURL: runsDirectoryURL,
+        repository: StateRepository(directoryURL: stateDirectoryURL),
+        metadataParseObserver: { counter.record($0) }
+    )
+
+    _ = try watcher.observe(detected: [process], isHeartbeat: false)
+    try expect(counter.count(for: unaffectedMetadataURL), equals: 1, "initial unaffected parse")
+    try expect(counter.count(for: dirtyMetadataURL), equals: 1, "initial active parse")
+
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: activeRunID,
+        serverPid: process.processID,
+        serverStartedAt: activeStartedAt,
+        phases: [("implementer", "completed", "ses_impl")]
+    )
+    try FileManager.default.setAttributes(
+        [.modificationDate: Date().addingTimeInterval(60)],
+        ofItemAtPath: dirtyMetadataURL.path
+    )
+    _ = try watcher.observe(detected: [process], isHeartbeat: false)
+
+    try expect(counter.count(for: dirtyMetadataURL), equals: 2, "dirty run reparsed")
+    try expect(
+        counter.count(for: unaffectedMetadataURL),
+        equals: 1,
+        "mtime validation preserves unaffected cached run"
+    )
+
+    let stableAttributes = try FileManager.default.attributesOfItem(atPath: dirtyMetadataURL.path)
+    let stableModificationDate = try (stableAttributes[.modificationDate] as? Date)
+        .unwrap(or: "dirty metadata mtime missing")
+    let stableSize = try (stableAttributes[.size] as? NSNumber)
+        .unwrap(or: "dirty metadata size missing")
+    let stableInode = try (stableAttributes[.systemFileNumber] as? NSNumber)
+        .unwrap(or: "dirty metadata inode missing")
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: activeRunID,
+        serverPid: process.processID,
+        serverStartedAt: activeStartedAt,
+        phases: [("implementer", "cancelled", "ses_impl")]
+    )
+    try FileManager.default.setAttributes(
+        [.modificationDate: stableModificationDate],
+        ofItemAtPath: dirtyMetadataURL.path
+    )
+    let invalidatedAttributes = try FileManager.default.attributesOfItem(atPath: dirtyMetadataURL.path)
+    let invalidatedSize = try (invalidatedAttributes[.size] as? NSNumber)
+        .unwrap(or: "invalidated metadata size missing")
+    let invalidatedModificationDate = try (invalidatedAttributes[.modificationDate] as? Date)
+        .unwrap(or: "invalidated metadata mtime missing")
+    let invalidatedInode = try (invalidatedAttributes[.systemFileNumber] as? NSNumber)
+        .unwrap(or: "invalidated metadata inode missing")
+    try expect(invalidatedSize, equals: stableSize, "targeted rewrite keeps the cached fingerprint")
+    try expect(
+        invalidatedModificationDate,
+        equals: stableModificationDate,
+        "targeted rewrite restores the cached mtime"
+    )
+    try expect(invalidatedInode, equals: stableInode, "targeted rewrite preserves the cached inode")
+
+    _ = try watcher.observe(
+        detected: [process],
+        isHeartbeat: false,
+        invalidatedMetadataURLs: [dirtyMetadataURL]
+    )
+    try expect(counter.count(for: dirtyMetadataURL), equals: 3, "explicitly dirty run reparsed")
+    try expect(
+        counter.count(for: unaffectedMetadataURL),
+        equals: 1,
+        "targeted invalidation preserves unaffected cached run"
+    )
 }
 
 func testConvoyWatcherFlagsWaitingHumanGate() throws {
@@ -2676,7 +4537,13 @@ func testConvoyFinalTransitionSurvivesImmediateProcessExitOnce() throws {
         serverStartedAt: startedAt, phases: [("implementer", "completed", "ses_impl")],
         includeServer: false
     )
-    let final = try watcher.observe(detected: [], isHeartbeat: false, forceRefresh: true)
+    let final = try watcher.observe(
+        detected: [],
+        isHeartbeat: false,
+        invalidatedMetadataURLs: [runsDirectoryURL
+            .appendingPathComponent(runID, isDirectory: true)
+            .appendingPathComponent("metadata.json")]
+    )
     _ = try ReaperService(repository: repository).reap(
         detected: [], preservingSessionIDs: final.preservingSessionIDs
     )
@@ -2694,6 +4561,240 @@ func testConvoyFinalTransitionSurvivesImmediateProcessExitOnce() throws {
     )
     let secondHeartbeat = try watcher.observe(detected: [], isHeartbeat: true)
     try expect(secondHeartbeat.preservingSessionIDs.isEmpty, equals: true, "grace expires")
+}
+
+func testConvoyMetadataObservationDoesNotExtendHeartbeatGrace() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    let runID = "20260722-183000-liveness"
+    let process = detectedConvoyProcess()
+    let startedAt = Date().addingTimeInterval(-60)
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: runID,
+        serverPid: process.processID,
+        serverStartedAt: startedAt,
+        phases: [("implementer", "running", "ses_impl")]
+    )
+    let watcher = ConvoyRunsWatcher(runsDirectoryURL: runsDirectoryURL, repository: repository)
+    let initial = try watcher.observe(detected: [process], isHeartbeat: false)
+    try expect(initial.preservingSessionIDs, equals: ["convoy-\(runID)"], "initial run tracked")
+
+    let missedHeartbeat = try watcher.observe(detected: [], isHeartbeat: true)
+    try expect(
+        missedHeartbeat.preservingSessionIDs,
+        equals: ["convoy-\(runID)"],
+        "first missed heartbeat retains final-state grace"
+    )
+
+    let metadataURL = try missedHeartbeat.runDirectoryURLs.first
+        .unwrap(or: "tracked run directory missing")
+        .appendingPathComponent("metadata.json")
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: runID,
+        serverPid: process.processID,
+        serverStartedAt: startedAt,
+        phases: [("implementer", "completed", "ses_impl")]
+    )
+    var snapshot = try repository.loadSnapshot()
+    let metadataOnly = try watcher.observe(
+        detected: [process],
+        isHeartbeat: false,
+        invalidatedMetadataURLs: [metadataURL],
+        updatesLiveness: false,
+        snapshot: &snapshot
+    )
+    try expect(
+        metadataOnly.preservingSessionIDs,
+        equals: ["convoy-\(runID)"],
+        "metadata event retains the existing grace count"
+    )
+
+    let nextHeartbeat = try watcher.observe(detected: [], isHeartbeat: true)
+    try expect(
+        nextHeartbeat.preservingSessionIDs.isEmpty,
+        equals: true,
+        "metadata event does not reset missed-heartbeat liveness"
+    )
+}
+
+func testConvoyWatcherRetiresSupersededRunForSameProcessGeneration() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    let watcher = ConvoyRunsWatcher(runsDirectoryURL: runsDirectoryURL, repository: repository)
+    let processID: Int32 = 765_432
+    let processIdentity = ProcessIdentity(
+        processID: processID,
+        kernelStartTimeMicroseconds: 123_456_789
+    )
+    let process = DetectedAgentProcess(
+        tool: .convoy,
+        processID: processID,
+        processIdentity: processIdentity,
+        cwd: "/tmp/convoy-target",
+        terminal: TerminalContext(termProgram: "ghostty"),
+        elapsedSeconds: 120
+    )
+    let firstRunID = "20260722-101010-first"
+    let secondRunID = "20260722-101110-second"
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: firstRunID,
+        serverPid: processID,
+        serverStartedAt: Date().addingTimeInterval(-60),
+        phases: [("implementer", "running", "ses_first")]
+    )
+
+    let first = try watcher.observe(detected: [process], isHeartbeat: false)
+    try expect(first.preservingSessionIDs, equals: ["convoy-\(firstRunID)"], "first run preserved")
+    try expect(
+        Set(first.runDirectoryURLs.map(\.lastPathComponent)),
+        equals: [firstRunID],
+        "first run directory watched"
+    )
+
+    let secondStartedAt = Date().addingTimeInterval(-30)
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: secondRunID,
+        serverPid: processID,
+        serverStartedAt: secondStartedAt,
+        phases: [("implementer", "running", "ses_second")]
+    )
+
+    let replacement = try watcher.observe(
+        detected: [process],
+        isHeartbeat: false
+    )
+    try expect(
+        replacement.preservingSessionIDs,
+        equals: ["convoy-\(secondRunID)"],
+        "superseded run is immediately unpreserved"
+    )
+    try expect(
+        Set(replacement.runDirectoryURLs.map(\.lastPathComponent)),
+        equals: [secondRunID],
+        "only the current run directory remains watched"
+    )
+    try expect(
+        Set(try repository.loadSessions().map(\.sessionID)),
+        equals: [secondRunID],
+        "replacement is persisted while the superseded run is removed"
+    )
+
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: secondRunID,
+        serverPid: processID,
+        serverStartedAt: secondStartedAt,
+        phases: [("implementer", "completed", "ses_second")],
+        includeServer: false
+    )
+    let final = try watcher.observe(
+        detected: [],
+        isHeartbeat: false,
+        invalidatedMetadataURLs: [runsDirectoryURL
+            .appendingPathComponent(secondRunID, isDirectory: true)
+            .appendingPathComponent("metadata.json")]
+    )
+    try expect(
+        final.preservingSessionIDs,
+        equals: ["convoy-\(secondRunID)"],
+        "current run remains associated after process exit"
+    )
+    try expect(
+        Set(final.runDirectoryURLs.map(\.lastPathComponent)),
+        equals: [secondRunID],
+        "current final run remains watched"
+    )
+    let finalSession = try repository.loadSessions().first { $0.sessionID == secondRunID }
+        .unwrap(or: "current run final state was not published")
+    try expect(finalSession.status, equals: .idle, "current run final state")
+
+    let firstHeartbeat = try watcher.observe(detected: [], isHeartbeat: true)
+    try expect(
+        firstHeartbeat.preservingSessionIDs,
+        equals: ["convoy-\(secondRunID)"],
+        "current run receives one-heartbeat final grace"
+    )
+    let secondHeartbeat = try watcher.observe(detected: [], isHeartbeat: true)
+    try expect(secondHeartbeat.preservingSessionIDs.isEmpty, equals: true, "current run grace expires")
+    try expect(secondHeartbeat.runDirectoryURLs.isEmpty, equals: true, "final run watcher is retired")
+}
+
+func testConvoyWatcherPreservesSupersededRunWhenReplacementCannotPersist() throws {
+    let (stateDirectoryURL, runsDirectoryURL) = try makeConvoyTestDirectories()
+    defer { try? FileManager.default.removeItem(at: stateDirectoryURL.deletingLastPathComponent()) }
+    let repository = StateRepository(directoryURL: stateDirectoryURL)
+    let watcher = ConvoyRunsWatcher(runsDirectoryURL: runsDirectoryURL, repository: repository)
+    let processID: Int32 = 765_433
+    let processIdentity = ProcessIdentity(
+        processID: processID,
+        kernelStartTimeMicroseconds: 123_456_790
+    )
+    let process = DetectedAgentProcess(
+        tool: .convoy,
+        processID: processID,
+        processIdentity: processIdentity,
+        cwd: "/tmp/convoy-target",
+        terminal: TerminalContext(termProgram: "ghostty"),
+        elapsedSeconds: 120
+    )
+    let firstRunID = "20260722-102010-persisted"
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: firstRunID,
+        serverPid: processID,
+        serverStartedAt: Date().addingTimeInterval(-60),
+        phases: [("implementer", "running", "ses_first")]
+    )
+    let initial = try watcher.observe(detected: [process], isHeartbeat: false)
+    try expect(initial.preservingSessionIDs, equals: ["convoy-\(firstRunID)"], "first run tracked")
+
+    let rejectedRunID = String(repeating: "b", count: 129)
+    try writeConvoyRunFixture(
+        at: runsDirectoryURL,
+        runID: rejectedRunID,
+        serverPid: processID,
+        serverStartedAt: Date().addingTimeInterval(-30),
+        phases: [("implementer", "running", "ses_rejected")]
+    )
+    do {
+        _ = try watcher.observe(detected: [process], isHeartbeat: false)
+        throw TestFailure.expectation("oversized replacement run ID was persisted")
+    } catch StateRepositoryError.sessionIdentifierTooLong {
+        // Expected: replacement validation must fail without mutating the active run.
+    }
+
+    try expect(
+        Set(try repository.loadSessions().map(\.sessionID)),
+        equals: [firstRunID],
+        "failed replacement leaves the previous run persisted"
+    )
+    try expect(
+        try repository.loadSessions().first?.processIdentity,
+        equals: processIdentity,
+        "failed replacement preserves the verified process generation"
+    )
+    let retained = try watcher.observe(detected: [], isHeartbeat: false)
+    try expect(
+        retained.preservingSessionIDs,
+        equals: ["convoy-\(firstRunID)"],
+        "failed replacement leaves the previous run tracked and preserved"
+    )
+    try expect(
+        Set(retained.runDirectoryURLs.map(\.lastPathComponent)),
+        equals: [firstRunID],
+        "failed replacement leaves the previous run metadata watched"
+    )
+    try expect(
+        (try repository.loadSessions()).contains { $0.sessionID == rejectedRunID },
+        equals: false,
+        "failed replacement is not installed"
+    )
 }
 
 func testConvoyWatcherKeepsFinalReadsInDiscoveredMetadataFile() throws {
@@ -2732,7 +4833,11 @@ func testConvoyWatcherKeepsFinalReadsInDiscoveredMetadataFile() throws {
     let process = detectedConvoyProcess(elapsedSeconds: 120)
 
     _ = try watcher.observe(detected: [process], isHeartbeat: false)
-    _ = try watcher.observe(detected: [], isHeartbeat: false, forceRefresh: true)
+    _ = try watcher.observe(
+        detected: [],
+        isHeartbeat: false,
+        invalidatedMetadataURLs: [metadataURL]
+    )
 
     let sessions = try repository.loadSessions()
     try expect(
@@ -3185,36 +5290,100 @@ func testGhosttyTerminalQueryCacheAvoidsRedundantQueries() throws {
     }
     let counter = QueryCounter()
     let terminals = [GhosttyTerminal(id: "1", name: "tab", cwd: "/tmp/project")]
-    let cache = GhosttyTerminalQueryCache(timeToLive: 30) {
+    let cache = GhosttyTerminalQueryCache(timeToLive: 30, failureTimeToLive: 10) {
         counter.increment()
         return terminals
     }
     let start = Date(timeIntervalSince1970: 1_000_000)
 
     try expect(
-        cache.terminals(hostingProcessIDs: [100], now: start),
+        cache.terminals(
+            hostingProcessIDs: [100],
+            processGenerationKeys: ["100:1"],
+            now: start
+        ),
         equals: terminals,
         "first query returns terminals"
     )
     try expect(
-        cache.terminals(hostingProcessIDs: [100], now: start.addingTimeInterval(5)),
+        cache.terminals(
+            hostingProcessIDs: [100],
+            processGenerationKeys: ["100:1"],
+            now: start.addingTimeInterval(5)
+        ),
         equals: terminals,
         "fresh cache returns terminals"
     )
     try expect(counter.count, equals: 1, "fresh same-topology call is served from cache")
-    _ = cache.terminals(hostingProcessIDs: [100, 200], now: start.addingTimeInterval(6))
-    try expect(counter.count, equals: 2, "a topology change refreshes immediately")
-    _ = cache.terminals(hostingProcessIDs: [100, 200], now: start.addingTimeInterval(60))
+    _ = cache.terminals(
+        hostingProcessIDs: [100],
+        processGenerationKeys: ["100:2"],
+        now: start.addingTimeInterval(6)
+    )
+    try expect(counter.count, equals: 2, "a process generation change refreshes immediately")
+    _ = cache.terminals(
+        hostingProcessIDs: [100],
+        processGenerationKeys: ["100:2"],
+        now: start.addingTimeInterval(60)
+    )
     try expect(counter.count, equals: 3, "an expired cache refreshes")
 
     let failureCounter = QueryCounter()
-    let failingCache = GhosttyTerminalQueryCache(timeToLive: 30) {
+    let failingCache = GhosttyTerminalQueryCache(timeToLive: 30, failureTimeToLive: 10) {
         failureCounter.increment()
+        return failureCounter.count == 1 ? nil : terminals
+    }
+    try expect(
+        failingCache.terminals(hostingProcessIDs: [100], now: start),
+        equals: nil,
+        "first failed query returns no terminal data"
+    )
+    try expect(
+        failingCache.terminals(hostingProcessIDs: [100], now: start.addingTimeInterval(9)),
+        equals: nil,
+        "failed query is negatively cached during cooldown"
+    )
+    try expect(failureCounter.count, equals: 1, "negative cache suppresses repeated query")
+    try expect(
+        failingCache.terminals(hostingProcessIDs: [100], now: start.addingTimeInterval(10)),
+        equals: terminals,
+        "query retries after failure cooldown"
+    )
+    try expect(failureCounter.count, equals: 2, "cooldown expiry retries once")
+    _ = failingCache.terminals(hostingProcessIDs: [100], now: start.addingTimeInterval(39))
+    try expect(failureCounter.count, equals: 2, "successful retry uses the positive TTL")
+    _ = failingCache.terminals(hostingProcessIDs: [100], now: start.addingTimeInterval(40))
+    try expect(failureCounter.count, equals: 3, "successful retry expires on the positive TTL")
+
+    let generationCounter = QueryCounter()
+    let generationCache = GhosttyTerminalQueryCache(timeToLive: 30, failureTimeToLive: 10) {
+        generationCounter.increment()
         return nil
     }
-    _ = failingCache.terminals(hostingProcessIDs: [100], now: start)
-    _ = failingCache.terminals(hostingProcessIDs: [100], now: start.addingTimeInterval(1))
-    try expect(failureCounter.count, equals: 2, "failed queries are never cached")
+    _ = generationCache.terminals(
+        hostingProcessIDs: [100],
+        processGenerationKeys: ["100:1"],
+        now: start
+    )
+    _ = generationCache.terminals(
+        hostingProcessIDs: [100],
+        processGenerationKeys: ["100:2"],
+        now: start.addingTimeInterval(1)
+    )
+    try expect(generationCounter.count, equals: 2, "new process generation bypasses negative cache")
+
+    let emptyCounter = QueryCounter()
+    let emptyCache = GhosttyTerminalQueryCache(timeToLive: 30, failureTimeToLive: 10) {
+        emptyCounter.increment()
+        return []
+    }
+    try expect(
+        emptyCache.terminals(hostingProcessIDs: [100], now: start),
+        equals: [],
+        "successful empty result remains distinct from failure"
+    )
+    _ = emptyCache.terminals(hostingProcessIDs: [100], now: start.addingTimeInterval(5))
+    try expect(emptyCounter.count, equals: 1, "successful empty result uses positive TTL")
 }
 
 func testProcessScannerDetectsSpawnedAgentProcessWithinBudget() throws {
@@ -4115,8 +6284,11 @@ let tests: [(String, () throws -> Void)] = [
     ("saving session publishes canonical state file", testSavingSessionPublishesCanonicalStateFile),
     ("state files are private and session names do not collide", testStateFilesArePrivateAndSessionNamesDoNotCollide),
     ("state repository ignores symbolic links", testStateRepositoryIgnoresSymbolicLinks),
+    ("state repository rejects FIFO without blocking", testStateRepositoryRejectsFIFOWithoutBlocking),
+    ("state repository rejects oversized identity document", testStateRepositoryDoesNotPreserveIdentityFromOversizedDocument),
     ("Claude session start creates idle state", testClaudeSessionStartCreatesIdleState),
     ("Claude session start preserves existing status", testClaudeSessionStartPreservesExistingStatus),
+    ("Claude lifecycle update preserves only matching process identity", testClaudeLifecycleUpdatePreservesOnlyMatchingProcessIdentity),
     ("session duration formatter renders compact durations", testSessionDurationFormatterRendersCompactDurations),
     ("Claude permission notification requests attention", testClaudePermissionNotificationRequestsAttention),
     ("Claude lifecycle events produce expected states", testClaudeLifecycleEventsProduceExpectedStates),
@@ -4130,12 +6302,24 @@ let tests: [(String, () throws -> Void)] = [
     ("reaper reaps against provided scan", testReaperReapsAgainstProvidedScan),
     ("reaper rebinds daemon-hosted session to visible process", testReaperRebindsDaemonHostedSessionToVisibleProcess),
     ("reaper adopts scanned Ghostty terminal for native session", testReaperAdoptsScannedGhosttyTerminalForNativeSession),
+    ("terminal enrichment preserves concurrent lifecycle write", testTerminalEnrichmentPreservesConcurrentLifecycleWrite),
+    ("terminal enrichment does not replace lifecycle write after reload", testTerminalEnrichmentDoesNotReplaceLifecycleWriteAfterReload),
+    ("terminal enrichment rejects concurrent process generation change", testTerminalEnrichmentRejectsConcurrentProcessGenerationChange),
+    ("state repository validates and prunes enrichment overlays", testStateRepositoryValidatesAndPrunesEnrichmentOverlays),
+    ("terminal enrichment preserves live fallback when Ghostty omits process", testTerminalEnrichmentPreservesLiveFallbackWhenGhosttyOmitsProcess),
     ("reaper prunes superseded sessions for same process", testReaperPrunesSupersededSessionsForSameProcess),
     ("reaper prefers native session over newer fallback", testReaperPrefersNativeSessionOverNewerFallback),
     ("observation scheduler tick persists fallback state", testObservationSchedulerTickPersistsFallbackState),
+    ("Codex recovery does not authorize historical rollout for replacement process", testCodexRecoveryDoesNotAuthorizeHistoricalRolloutForReplacementProcess),
     ("observation scheduler publishes convoy run on tick", testObservationSchedulerPublishesConvoyRunOnTick),
+    ("observation scheduler materializes state once per tick", testObservationSchedulerMaterializesStateOncePerTick),
+    ("observation scheduler queues initial reconciliation before recurring work", testObservationSchedulerQueuesInitialReconciliationBeforeRecurringWork),
+    ("startup reconciliation completion refreshes store without polling", testStartupReconciliationCompletionRefreshesStoreWithoutPolling),
+    ("stopping scheduler suppresses late startup completion", testStoppingSchedulerSuppressesLateStartupCompletion),
     ("observation scheduler reaps immediately when process exits", testObservationSchedulerReapsImmediatelyWhenProcessExits),
     ("observation scheduler coalesces tick bursts", testObservationSchedulerCoalescesTickBursts),
+    ("convoy metadata tick reuses last verified process scan", testConvoyMetadataTickReusesLastVerifiedProcessScan),
+    ("convoy metadata tick removes superseded run immediately", testConvoyMetadataTickRemovesSupersededRunImmediately),
     ("native state replaces reaper fallback for same process", testNativeStateReplacesReaperFallbackForSameProcess),
     ("debug renderer shows tool counts and session state", testDebugRendererShowsToolCountsAndSessionState),
     ("CLI parses debug command", testCLIParsesDebugCommand),
@@ -4144,6 +6328,7 @@ let tests: [(String, () throws -> Void)] = [
     ("capture context emits terminal JSON", testCaptureContextEmitsTerminalJSON),
     ("Claude hook wrapper forwards payload and event", testClaudeHookWrapperForwardsPayloadAndEvent),
     ("state store reload filters ended sessions without writing", testStateStoreReloadFiltersEndedSessionsWithoutWriting),
+    ("state store arms notifications before startup baseline mutation", testStateStoreArmsNotificationsBeforeStartupBaselineMutation),
     ("state store polling observes new state files", testStateStorePollingObservesNewStateFiles),
     ("state store file events observe new state files without polling", testStateStoreFileEventsObserveNewStateFilesWithoutPolling),
     ("state store Darwin notification observes new state files", testStateStoreDarwinNotificationObservesNewStateFiles),
@@ -4152,6 +6337,7 @@ let tests: [(String, () throws -> Void)] = [
     ("session status summary visible entries omit zero counts", testSessionStatusSummaryVisibleEntriesOmitsZeroCounts),
     ("session status summary silences acknowledged blocked sessions", testSessionStatusSummarySilencesAcknowledgedBlockedSessions),
     ("pointer movement gate stays locked until pointer moves", testPointerMovementGateStaysLockedUntilPointerMoves),
+    ("pointer samples publish only containment transitions", testPointerSamplesPublishOnlyContainmentTransitions),
     ("hover interaction ignores synthetic exit while pointer remains inside", testHoverInteractionIgnoresSyntheticExitWhilePointerRemainsInside),
     ("hover interaction keeps compact target on visible bar", testHoverInteractionKeepsCompactTargetOnTheVisibleBar),
     ("hover interaction opens whole expanded surface to clicks", testHoverInteractionOpensTheWholeExpandedSurfaceToClicks),
@@ -4161,9 +6347,18 @@ let tests: [(String, () throws -> Void)] = [
     ("single instance lock rejects non-regular lock paths", testSingleInstanceLockRejectsNonRegularLockPaths),
     ("notch layout status wing width hides zero count indicators", testNotchLayoutStatusWingWidthHidesZeroCountIndicators),
     ("screen selection follows pointer and falls back to focused display", testScreenSelectionFollowsThePointerAndFallsBackToFocusedDisplay),
+    ("focused window frame wins over pointer and default display", testFocusedWindowFrameWinsOverPointerAndDefaultDisplay),
+    ("focused window frame uses greatest intersection and stable tie break", testFocusedWindowFrameUsesGreatestIntersectionAndStableTieBreak),
+    ("focused window unavailable follows privacy-conscious fallback", testFocusedWindowUnavailableFallsBackWithoutChangingPrivacyPermissions),
     ("screen selection returns every display when configured for all displays", testScreenSelectionReturnsEveryDisplayWhenConfiguredForAllDisplays),
+    ("panel synchronization avoids idle polling outside focused mode", testPanelSynchronizationSchedulesNoIdlePollingOutsideFocusedWindowMode),
+    ("focused window synchronization uses documented slow fallback", testFocusedWindowSynchronizationUsesOnlyDocumentedSlowFallback),
+    ("panel synchronization mode transitions change resources once", testPanelSynchronizationModeTransitionsChangeResourcesExactlyOnce),
     ("attention acknowledgments silence visited sessions", testAttentionAcknowledgmentsSilenceVisitedSessionsUntilNewActivity),
     ("git workspace inspector resolves branch names", testGitWorkspaceInspectorResolvesBranchNames),
+    ("Git branch coordinator coalesces and caches working directory", testGitBranchResolutionCoordinatorCoalescesAndCachesWorkingDirectory),
+    ("Git branch coordinator bounds concurrent probes", testGitBranchResolutionCoordinatorBoundsConcurrentProbes),
+    ("Git branch coordinator evicts least-recent cache entry", testGitBranchResolutionCoordinatorEvictsLeastRecentlyUsedEntry),
     ("notch layout extends from left side of hardware notch", testNotchLayoutExtendsFromLeftSideOfHardwareNotch),
     ("notch layout keeps expanded content close to the side edges", testNotchLayoutKeepsExpandedContentCloseToTheSideEdges),
     ("notch layout pins compact bar to physical notch when panel is clamped", testNotchLayoutPinsCompactBarToPhysicalNotchWhenExpandedPanelIsClamped),
@@ -4188,10 +6383,15 @@ let tests: [(String, () throws -> Void)] = [
     ("Codex sessions watcher resaves when process appears later", testCodexSessionsWatcherResavesWhenProcessAppearsLater),
     ("Codex sessions watcher skips date directories outside window", testCodexSessionsWatcherSkipsDateDirectoriesOutsideWindow),
     ("convoy watcher publishes running pipeline step", testConvoyWatcherPublishesRunningPipelineStep),
+    ("convoy watcher does not republish unchanged observation", testConvoyWatcherDoesNotRepublishUnchangedObservation),
+    ("convoy metadata invalidation reparses only dirty run", testConvoyMetadataInvalidationReparsesOnlyDirtyRun),
     ("convoy watcher flags waiting human gate", testConvoyWatcherFlagsWaitingHumanGate),
     ("convoy watcher maps terminal pipeline states", testConvoyWatcherMapsTerminalPipelineStates),
     ("convoy watcher maps thinking and uses project name", testConvoyWatcherMapsThinkingAndUsesProjectName),
     ("convoy final transition survives immediate process exit once", testConvoyFinalTransitionSurvivesImmediateProcessExitOnce),
+    ("convoy metadata observation does not extend heartbeat grace", testConvoyMetadataObservationDoesNotExtendHeartbeatGrace),
+    ("convoy watcher retires superseded run for same process generation", testConvoyWatcherRetiresSupersededRunForSameProcessGeneration),
+    ("convoy watcher preserves superseded run when replacement cannot persist", testConvoyWatcherPreservesSupersededRunWhenReplacementCannotPersist),
     ("convoy watcher keeps final reads in discovered metadata file", testConvoyWatcherKeepsFinalReadsInDiscoveredMetadataFile),
     ("convoy watcher rejects unsafe metadata file types and sizes", testConvoyWatcherRejectsUnsafeMetadataFileTypesAndSizes),
     ("convoy watcher ignores runs not owned by live process", testConvoyWatcherIgnoresRunsNotOwnedByLiveProcess),
@@ -4235,12 +6435,24 @@ let tests: [(String, () throws -> Void)] = [
     ("state store raises turn completion only from working to idle", testStateStoreRaisesTurnCompletionOnlyFromWorkingToIdle),
 ]
 
-do {
-    for (name, test) in tests {
-        try test()
-        print("PASS: \(name)")
+if CommandLine.arguments.count == 3,
+   CommandLine.arguments[1] == "--load-state-directory" {
+    do {
+        _ = try StateRepository(
+            directoryURL: URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
+        ).loadSessions()
+        exit(0)
+    } catch {
+        exit(1)
     }
-} catch {
-    FileHandle.standardError.write(Data("FAIL: \(error)\n".utf8))
-    exit(1)
+} else {
+    do {
+        for (name, test) in tests {
+            try test()
+            print("PASS: \(name)")
+        }
+    } catch {
+        FileHandle.standardError.write(Data("FAIL: \(error)\n".utf8))
+        exit(1)
+    }
 }

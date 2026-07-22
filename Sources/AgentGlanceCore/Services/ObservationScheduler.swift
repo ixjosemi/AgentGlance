@@ -2,9 +2,9 @@ import Darwin
 import Foundation
 
 /// Drives all background observation from a single serial queue: one process
-/// scan per tick feeds both the reaper and the Codex sessions watcher, so no
-/// consumer ever triggers its own rescan. Ticks are requested by a heartbeat
-/// timer, by Codex sessions directory events, or explicitly by callers.
+/// scan per liveness tick feeds both the reaper and the Codex sessions watcher,
+/// while Convoy-only metadata ticks reuse that verified snapshot. No consumer
+/// ever triggers its own process-table scan.
 ///
 /// `start()` and `stop()` must be called on the main thread; every scan and
 /// state write runs on the internal serial queue, which also confines the
@@ -23,16 +23,21 @@ public final class ObservationScheduler {
     )
     private var heartbeatTimer: DispatchSourceTimer?
 
+    // Only touched by the documented main-thread lifecycle APIs and by
+    // reconciliation completions delivered on main.
+    private var lifecycleGeneration = 0
+
     // Only touched on workQueue.
     private var codexWatcher: CodexSessionsWatcher?
     private var convoyWatcher: ConvoyRunsWatcher?
-    private var codexProcessMap: [String: Int32] = [:]
     private var codexDirectorySource: DispatchSourceFileSystemObject?
     private var convoyRunsDirectorySource: DispatchSourceFileSystemObject?
     private var convoyRunDirectorySources: [URL: DispatchSourceFileSystemObject] = [:]
     private var exitWatchers: [String: DispatchSourceProcess] = [:]
     private var tickScheduled = false
     private var pendingReasons: TickReasons = []
+    private var pendingConvoyMetadataURLs: Set<URL> = []
+    private var lastVerifiedProcesses: [DetectedAgentProcess]?
     private var generation = 0
 
     private struct TickReasons: OptionSet {
@@ -67,29 +72,53 @@ public final class ObservationScheduler {
 
     public func start() {
         stop()
+        lifecycleGeneration += 1
         requestTick()
         workQueue.async { [weak self] in
+            self?.startObservationSources()
+        }
+    }
+
+    /// Establishes event capture immediately, then reconciles persisted state
+    /// before any normal startup or event tick can run on the serial queue.
+    public func startWithInitialReconciliation(
+        completion: (@MainActor @Sendable () -> Void)? = nil
+    ) {
+        stop()
+        lifecycleGeneration += 1
+        let startupGeneration = lifecycleGeneration
+        workQueue.async { [weak self] in
             guard let self else { return }
-            self.startCodexDirectorySource()
-            self.startConvoyRunsDirectorySource()
-            let timer = DispatchSource.makeTimerSource(queue: self.workQueue)
-            timer.schedule(
-                deadline: .now() + self.heartbeatInterval,
-                repeating: self.heartbeatInterval,
-                leeway: .milliseconds(Int(self.heartbeatInterval * 200))
-            )
-            timer.setEventHandler { [weak self] in self?.scheduleCoalescedTick(reason: .heartbeat) }
-            self.heartbeatTimer = timer
-            timer.resume()
+            self.startObservationSources()
+            do {
+                _ = try self.reaper.reap(
+                    detected: self.processScanner.basicActiveProcesses()
+                )
+            } catch {
+                NSLog(
+                    "AgentGlance initial process reconciliation failed: %@",
+                    String(describing: error)
+                )
+            }
+            if let completion {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          self.lifecycleGeneration == startupGeneration else { return }
+                    completion()
+                }
+            }
+            self.scheduleCoalescedTick(reason: .explicit)
         }
     }
 
     public func stop() {
-        workQueue.async { [weak self] in
-            guard let self else { return }
+        lifecycleGeneration += 1
+        workQueue.async { [self] in
             self.generation += 1
             self.tickScheduled = false
             self.pendingReasons = []
+            self.pendingConvoyMetadataURLs = []
+            self.lastVerifiedProcesses = nil
             self.codexDirectorySource?.cancel()
             self.codexDirectorySource = nil
             self.heartbeatTimer?.cancel()
@@ -107,17 +136,45 @@ public final class ObservationScheduler {
         workQueue.async { [weak self] in self?.scheduleCoalescedTick(reason: .explicit) }
     }
 
-    /// Removes stale persisted state before StateStore establishes the UI's
-    /// baseline. This basic pass never invokes Ghostty or Apple Events.
-    public func performInitialReconciliation() throws {
-        _ = try reaper.reap(detected: processScanner.basicActiveProcesses())
+    package func requestConvoyMetadataTick() {
+        workQueue.async { [weak self] in self?.scheduleCoalescedTick(reason: .convoyMetadata) }
+    }
+
+    package func requestHeartbeatTick() {
+        workQueue.async { [weak self] in self?.scheduleCoalescedTick(reason: .heartbeat) }
+    }
+
+    package func waitUntilIdle() {
+        workQueue.sync {}
+    }
+
+    private func startObservationSources() {
+        dispatchPrecondition(condition: .onQueue(workQueue))
+        startCodexDirectorySource()
+        startConvoyRunsDirectorySource()
+        guard heartbeatTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: workQueue)
+        timer.schedule(
+            deadline: .now() + heartbeatInterval,
+            repeating: heartbeatInterval,
+            leeway: .milliseconds(Int(heartbeatInterval * 200))
+        )
+        timer.setEventHandler { [weak self] in self?.scheduleCoalescedTick(reason: .heartbeat) }
+        heartbeatTimer = timer
+        timer.resume()
     }
 
     /// Coalesces bursts of tick requests (Codex rollout files receive a write
-    /// event per token flush) into one scan per debounce window.
-    private func scheduleCoalescedTick(reason: TickReasons) {
+    /// event per token flush) into one observation per debounce window.
+    private func scheduleCoalescedTick(
+        reason: TickReasons,
+        invalidatedConvoyMetadataURL: URL? = nil
+    ) {
         dispatchPrecondition(condition: .onQueue(workQueue))
         pendingReasons.formUnion(reason)
+        if let invalidatedConvoyMetadataURL {
+            pendingConvoyMetadataURLs.insert(invalidatedConvoyMetadataURL)
+        }
         guard !tickScheduled else { return }
         tickScheduled = true
         let scheduledGeneration = generation
@@ -125,13 +182,28 @@ public final class ObservationScheduler {
             guard let self, self.generation == scheduledGeneration else { return }
             self.tickScheduled = false
             let reasons = self.pendingReasons
+            let invalidatedConvoyMetadataURLs = self.pendingConvoyMetadataURLs
             self.pendingReasons = []
-            self.tick(reasons: reasons)
+            self.pendingConvoyMetadataURLs = []
+            self.tick(
+                reasons: reasons,
+                invalidatedConvoyMetadataURLs: invalidatedConvoyMetadataURLs
+            )
         }
     }
 
-    private func tick(reasons: TickReasons) {
+    private func tick(
+        reasons: TickReasons,
+        invalidatedConvoyMetadataURLs: Set<URL>
+    ) {
         dispatchPrecondition(condition: .onQueue(workQueue))
+        if reasons == .convoyMetadata, let detected = lastVerifiedProcesses {
+            tickConvoyMetadata(
+                detected: detected,
+                invalidatedMetadataURLs: invalidatedConvoyMetadataURLs
+            )
+            return
+        }
         let detected: [DetectedAgentProcess]
         do {
             detected = try processScanner.basicActiveProcesses()
@@ -139,32 +211,85 @@ public final class ObservationScheduler {
             NSLog("AgentGlance process scan failed: %@", String(describing: error))
             return
         }
+        lastVerifiedProcesses = detected
+        var snapshot: StateSnapshot
+        do {
+            snapshot = try repository.loadSnapshot()
+        } catch {
+            NSLog("AgentGlance state snapshot failed: %@", String(describing: error))
+            return
+        }
         let convoyResult = scanConvoyRuns(
             detected: detected,
             isHeartbeat: reasons.contains(.heartbeat),
-            forceRefresh: reasons.contains(.convoyMetadata)
+            invalidatedMetadataURLs: invalidatedConvoyMetadataURLs,
+            updatesLiveness: true,
+            snapshot: &snapshot
         )
         do {
             _ = try reaper.reap(
                 detected: detected,
-                preservingSessionIDs: convoyResult?.preservingSessionIDs ?? []
+                preservingSessionIDs: convoyResult?.preservingSessionIDs ?? [],
+                snapshot: &snapshot
             )
         } catch {
             NSLog("AgentGlance reaper failed: %@", String(describing: error))
         }
         let enriched = processScanner.enrichTerminalContexts(in: detected)
         do {
-            try reaper.applyTerminalEnrichment(basic: detected, enriched: enriched)
+            try reaper.applyTerminalEnrichment(
+                basic: detected,
+                enriched: enriched,
+                snapshot: &snapshot
+            )
         } catch {
             NSLog("AgentGlance terminal enrichment failed: %@", String(describing: error))
         }
-        refreshCodexWatcher(detected: enriched)
+        refreshCodexWatcher(detected: enriched, snapshot: &snapshot)
         if let convoyResult {
-            do { try convoyWatcher?.suppressOpenCodeSessions(for: convoyResult) }
-            catch { NSLog("AgentGlance convoy suppression failed: %@", String(describing: error)) }
+            do {
+                try convoyWatcher?.suppressOpenCodeSessions(
+                    for: convoyResult,
+                    snapshot: &snapshot
+                )
+            } catch {
+                NSLog("AgentGlance convoy suppression failed: %@", String(describing: error))
+            }
             refreshConvoyRunDirectorySources(convoyResult.runDirectoryURLs)
         }
         refreshExitWatchers(detected: detected)
+    }
+
+    /// A Convoy vnode event carries metadata, not liveness evidence. Reuse the
+    /// most recent generation-aware process scan to map the run, but leave
+    /// reaping and heartbeat grace to ticks that perform a fresh scan.
+    private func tickConvoyMetadata(
+        detected: [DetectedAgentProcess],
+        invalidatedMetadataURLs: Set<URL>
+    ) {
+        var snapshot: StateSnapshot
+        do {
+            snapshot = try repository.loadSnapshot()
+        } catch {
+            NSLog("AgentGlance state snapshot failed: %@", String(describing: error))
+            return
+        }
+        guard let convoyResult = scanConvoyRuns(
+            detected: detected,
+            isHeartbeat: false,
+            invalidatedMetadataURLs: invalidatedMetadataURLs,
+            updatesLiveness: false,
+            snapshot: &snapshot
+        ) else { return }
+        do {
+            try convoyWatcher?.suppressOpenCodeSessions(
+                for: convoyResult,
+                snapshot: &snapshot
+            )
+        } catch {
+            NSLog("AgentGlance convoy suppression failed: %@", String(describing: error))
+        }
+        refreshConvoyRunDirectorySources(convoyResult.runDirectoryURLs)
     }
 
     /// Convoy metadata events are primary; the heartbeat remains a backstop
@@ -172,7 +297,9 @@ public final class ObservationScheduler {
     private func scanConvoyRuns(
         detected: [DetectedAgentProcess],
         isHeartbeat: Bool,
-        forceRefresh: Bool
+        invalidatedMetadataURLs: Set<URL>,
+        updatesLiveness: Bool,
+        snapshot: inout StateSnapshot
     ) -> ConvoyRunsWatcher.ScanResult? {
         let watcher = convoyWatcher ?? ConvoyRunsWatcher(
             runsDirectoryURL: convoyRunsDirectoryURL,
@@ -183,7 +310,9 @@ public final class ObservationScheduler {
             return try watcher.observe(
                 detected: detected,
                 isHeartbeat: isHeartbeat,
-                forceRefresh: forceRefresh
+                invalidatedMetadataURLs: invalidatedMetadataURLs,
+                updatesLiveness: updatesLiveness,
+                snapshot: &snapshot
             )
         } catch {
             NSLog("AgentGlance convoy watcher failed: %@", String(describing: error))
@@ -223,35 +352,35 @@ public final class ObservationScheduler {
         return String(process.processID)
     }
 
-    /// Keeps one long-lived Codex watcher and retargets its PID resolver
+    /// Keeps one long-lived Codex watcher and retargets its process resolver
     /// whenever the set of visible Codex processes changes, then lets it
     /// ingest new rollout lines. Retargeting in place preserves the read
     /// offsets, so a process-table change never re-ingests already-consumed
     /// rollout bytes.
-    private func refreshCodexWatcher(detected: [DetectedAgentProcess]) {
-        var currentMap: [String: Int32] = [:]
-        for process in detected where process.tool == .codex {
-            if currentMap[process.cwd] == nil {
-                currentMap[process.cwd] = process.processID
-            }
+    private func refreshCodexWatcher(
+        detected: [DetectedAgentProcess],
+        snapshot: inout StateSnapshot
+    ) {
+        let processesByCWD = Dictionary(grouping: detected.filter { $0.tool == .codex }, by: \.cwd)
+        let currentProcesses = processesByCWD.compactMapValues {
+            $0.count == 1 ? $0[0] : nil
         }
-        let capturedMap = currentMap
-        let resolver: @Sendable (AgentSession) -> Int32? = { capturedMap[$0.cwd] }
+        let capturedProcesses = currentProcesses
+        let resolver: @Sendable (AgentSession) -> DetectedAgentProcess? = {
+            capturedProcesses[$0.cwd]
+        }
         if let codexWatcher {
-            if currentMap != codexProcessMap {
-                codexWatcher.processIDResolver = resolver
-            }
+            codexWatcher.processResolver = resolver
         } else {
             codexWatcher = CodexSessionsWatcher(
                 sessionsDirectoryURL: codexSessionsDirectoryURL,
                 repository: repository,
                 ingestionWindow: 3600,
-                processIDResolver: resolver
+                processResolver: resolver
             )
         }
-        codexProcessMap = currentMap
         do {
-            try codexWatcher?.scan()
+            try codexWatcher?.scan(snapshot: &snapshot)
         } catch {
             NSLog("AgentGlance Codex watcher failed: %@", String(describing: error))
         }
@@ -259,7 +388,8 @@ public final class ObservationScheduler {
 
     private func startCodexDirectorySource() {
         dispatchPrecondition(condition: .onQueue(workQueue))
-        guard FileManager.default.fileExists(atPath: codexSessionsDirectoryURL.path) else {
+        guard codexDirectorySource == nil,
+              FileManager.default.fileExists(atPath: codexSessionsDirectoryURL.path) else {
             return
         }
         let descriptor = Darwin.open(codexSessionsDirectoryURL.path, O_EVTONLY)
@@ -318,7 +448,10 @@ public final class ObservationScheduler {
                     source.cancel()
                     self.convoyRunDirectorySources[url] = nil
                 }
-                self.scheduleCoalescedTick(reason: .convoyMetadata)
+                self.scheduleCoalescedTick(
+                    reason: .convoyMetadata,
+                    invalidatedConvoyMetadataURL: url.appendingPathComponent("metadata.json")
+                )
             }
             source.setCancelHandler { Darwin.close(descriptor) }
             convoyRunDirectorySources[url] = source

@@ -49,6 +49,30 @@ public struct DisplaySnapshot: Equatable, Sendable {
 }
 
 public enum ScreenSelection {
+    /// Maps a window to the display containing the greatest portion of it.
+    /// Display IDs break exact area ties so the result does not depend on the
+    /// order in which the platform reports displays.
+    public static func displayID(
+        containingMostOf windowFrame: DisplayFrame,
+        displays: [DisplaySnapshot]
+    ) -> UInt32? {
+        var bestMatch: (id: UInt32, area: CGFloat)?
+
+        for display in displays {
+            let area = intersectionArea(windowFrame, display.frame)
+            guard area > 0 else { continue }
+            if let bestMatch {
+                guard area > bestMatch.area
+                    || (area == bestMatch.area && display.id < bestMatch.id) else {
+                    continue
+                }
+            }
+            bestMatch = (display.id, area)
+        }
+
+        return bestMatch?.id
+    }
+
     /// Resolves every display that should host a notch. Pointer and focused
     /// modes return one display; all-displays mode retains every connected
     /// display in the AppKit-provided order.
@@ -75,6 +99,27 @@ public enum ScreenSelection {
     public static func selectDisplayID(
         mode: ScreenSelectionMode,
         pointerLocation: DisplayPoint?,
+        focusedWindowFrame: DisplayFrame?,
+        lastSelectedDisplayID: UInt32?,
+        displays: [DisplaySnapshot]
+    ) -> UInt32? {
+        // A missing/restricted/offscreen observation deliberately enters the
+        // normal focused-mode fallback: pointer, previous display, then the
+        // first connected display. Resolving geometry never requests access.
+        selectDisplayID(
+            mode: mode,
+            pointerLocation: pointerLocation,
+            focusedDisplayID: focusedWindowFrame.flatMap {
+                displayID(containingMostOf: $0, displays: displays)
+            },
+            lastSelectedDisplayID: lastSelectedDisplayID,
+            displays: displays
+        )
+    }
+
+    public static func selectDisplayID(
+        mode: ScreenSelectionMode,
+        pointerLocation: DisplayPoint?,
         focusedDisplayID: UInt32?,
         lastSelectedDisplayID: UInt32?,
         displays: [DisplaySnapshot]
@@ -95,5 +140,27 @@ public enum ScreenSelection {
         case .allDisplays:
             return displays.first?.id
         }
+    }
+
+    private static func intersectionArea(_ first: DisplayFrame, _ second: DisplayFrame) -> CGFloat {
+        guard isValid(first), isValid(second) else { return 0 }
+        let width = min(first.minX + first.width, second.minX + second.width)
+            - max(first.minX, second.minX)
+        let height = min(first.minY + first.height, second.minY + second.height)
+            - max(first.minY, second.minY)
+        guard width > 0, height > 0 else { return 0 }
+        let area = width * height
+        return area.isFinite ? area : 0
+    }
+
+    private static func isValid(_ frame: DisplayFrame) -> Bool {
+        frame.minX.isFinite
+            && frame.minY.isFinite
+            && frame.width.isFinite
+            && frame.height.isFinite
+            && frame.width > 0
+            && frame.height > 0
+            && (frame.minX + frame.width).isFinite
+            && (frame.minY + frame.height).isFinite
     }
 }

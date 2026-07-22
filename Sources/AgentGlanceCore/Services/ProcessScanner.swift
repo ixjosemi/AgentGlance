@@ -46,18 +46,21 @@ public struct SystemProcessScanner: ProcessScanning {
     private let assignmentMemory = GhosttyAssignmentMemory()
 
     public init() {
-        // 30 s keeps tab titles reasonably fresh while cutting the osascript
-        // spawn from every 5 s tick to twice a minute; a changed process set
-        // still refreshes immediately.
-        self.init(terminalQueryCache: GhosttyTerminalQueryCache(timeToLive: 30) {
+        // The 10 s failure cooldown skips at least one 5 s heartbeat after a
+        // timeout while allowing a prompt retry; topology changes still refresh.
+        self.init(terminalQueryCache: GhosttyTerminalQueryCache(
+            timeToLive: 30,
+            failureTimeToLive: 10
+        ) {
             try? SystemProcessScanner.queryGhosttyTerminals()
         })
     }
 
-    /// A zero TTL preserves the injected source's call-per-scan semantics.
+    /// Zero TTLs preserve the injected source's call-per-scan semantics.
     public init(ghosttyTerminalSource: @escaping GhosttyTerminalSource) {
         self.init(terminalQueryCache: GhosttyTerminalQueryCache(
             timeToLive: 0,
+            failureTimeToLive: 0,
             query: ghosttyTerminalSource
         ))
     }
@@ -380,8 +383,8 @@ public struct SystemProcessScanner: ProcessScanning {
             arguments: ["-l", "JavaScript", "-e", script],
             timeout: 2
         )
-        guard result.status == 0, let data = result.output.data(using: .utf8) else { return [] }
-        return try JSONDecoder().decode([GhosttyTerminal].self, from: data)
+        guard result.status == 0 else { throw POSIXError(.EIO) }
+        return try JSONDecoder().decode([GhosttyTerminal].self, from: Data(result.output.utf8))
     }
 
     private static func run(

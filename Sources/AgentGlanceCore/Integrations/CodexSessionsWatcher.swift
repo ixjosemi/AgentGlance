@@ -6,13 +6,13 @@ import Foundation
 public final class CodexSessionsWatcher {
     private static let readChunkSize = 65_536
     private static let maximumLineSize = 1_048_576
+    private static let futureTimestampTolerance: TimeInterval = 5
     private let sessionsDirectoryURL: URL
     private let repository: StateRepository
-    /// Maps a parsed session to the visible process that owns it. Settable
-    /// so a caller tracking the process table can retarget the watcher in
-    /// place — recreating it would drop the offsets and re-ingest every
-    /// rollout file.
-    public var processIDResolver: @Sendable (AgentSession) -> Int32?
+    /// Offers the sole visible process that may own a parsed session. The
+    /// watcher still verifies that rollout activity occurred during that
+    /// process generation before granting the session its kernel identity.
+    public var processResolver: @Sendable (AgentSession) -> DetectedAgentProcess?
     private let ingestionWindow: TimeInterval?
     private var offsets: [URL: UInt64] = [:]
     private var buffers: [URL: Data] = [:]
@@ -27,7 +27,18 @@ public final class CodexSessionsWatcher {
     ) {
         self.sessionsDirectoryURL = sessionsDirectoryURL
         self.repository = repository
-        processIDResolver = { _ in processID }
+        processResolver = { session in
+            guard let identity = SystemProcessScanner.processIdentity(of: processID) else {
+                return nil
+            }
+            return DetectedAgentProcess(
+                tool: .codex,
+                processID: processID,
+                processIdentity: identity,
+                cwd: session.cwd,
+                terminal: TerminalContext()
+            )
+        }
         self.ingestionWindow = ingestionWindow
     }
 
@@ -35,21 +46,29 @@ public final class CodexSessionsWatcher {
         sessionsDirectoryURL: URL,
         repository: StateRepository,
         ingestionWindow: TimeInterval? = nil,
-        processIDResolver: @escaping @Sendable (AgentSession) -> Int32?
+        processResolver: @escaping @Sendable (AgentSession) -> DetectedAgentProcess?
     ) {
         self.sessionsDirectoryURL = sessionsDirectoryURL
         self.repository = repository
-        self.processIDResolver = processIDResolver
+        self.processResolver = processResolver
         self.ingestionWindow = ingestionWindow
     }
 
     public func scan() throws {
+        try scan { try repository.save($0) }
+    }
+
+    package func scan(snapshot: inout StateSnapshot) throws {
+        try scan { try repository.save($0, updating: &snapshot) }
+    }
+
+    private func scan(saveSession: (AgentSession) throws -> Void) throws {
         let cutoff = ingestionWindow.map { Date().addingTimeInterval(-$0) }
         let fileURLs = try rolloutFileURLs(cutoff: cutoff)
         for fileURL in fileURLs {
-            try consumeNewData(from: fileURL)
+            try consumeNewData(from: fileURL, saveSession: saveSession)
         }
-        try publishPendingSessions()
+        try publishPendingSessions(saveSession: saveSession)
         pruneFileState(keeping: Set(fileURLs))
     }
 
@@ -67,12 +86,43 @@ public final class CodexSessionsWatcher {
     /// Sessions parsed while their process was not yet visible are retried
     /// on every scan: the resolver may have been retargeted since, and the
     /// rollout bytes that described them were already consumed.
-    private func publishPendingSessions() throws {
+    private func publishPendingSessions(
+        saveSession: (AgentSession) throws -> Void
+    ) throws {
         for (fileURL, session) in pendingSessions {
-            guard let processID = processIDResolver(session) else { continue }
-            try repository.save(session.replacingProcessID(processID))
+            guard let process = verifiedProcess(for: session, rolloutURL: fileURL) else { continue }
+            try saveSession(session.replacingProcess(process))
             pendingSessions[fileURL] = nil
         }
+    }
+
+    /// A rollout path and its contents are untrusted. CWD narrows candidates,
+    /// but only activity written during the scanned kernel generation is
+    /// enough to bind a session and make it actionable.
+    private func verifiedProcess(
+        for session: AgentSession,
+        rolloutURL: URL
+    ) -> DetectedAgentProcess? {
+        guard let process = processResolver(session),
+              process.tool == .codex,
+              process.cwd == session.cwd,
+              process.processID > 0,
+              let identity = process.processIdentity,
+              identity.processID == process.processID,
+              let modificationDate = try? rolloutURL.resourceValues(
+                  forKeys: [.contentModificationDateKey]
+              ).contentModificationDate else {
+            return nil
+        }
+        let processStartedAt = Date(
+            timeIntervalSince1970: TimeInterval(identity.kernelStartTimeMicroseconds) / 1_000_000
+        )
+        guard session.updatedAt >= processStartedAt,
+              session.updatedAt <= Date().addingTimeInterval(Self.futureTimestampTolerance),
+              modificationDate >= processStartedAt else {
+            return nil
+        }
+        return process
     }
 
     private func rolloutFileURLs(cutoff: Date?) throws -> [URL] {
@@ -153,7 +203,10 @@ public final class CodexSessionsWatcher {
         return periodEnd < cutoff
     }
 
-    private func consumeNewData(from fileURL: URL) throws {
+    private func consumeNewData(
+        from fileURL: URL,
+        saveSession: (AgentSession) throws -> Void
+    ) throws {
         let handle = try FileHandle(forReadingFrom: fileURL)
         defer { try? handle.close() }
         let size = try handle.seekToEnd()
@@ -166,14 +219,17 @@ public final class CodexSessionsWatcher {
         while let data = try handle.read(upToCount: Self.readChunkSize), !data.isEmpty {
             offsets[fileURL, default: offset] += UInt64(data.count)
             buffers[fileURL, default: Data()].append(data)
-            try consumeCompleteLines(for: fileURL)
+            try consumeCompleteLines(for: fileURL, saveSession: saveSession)
             if buffers[fileURL, default: Data()].count > Self.maximumLineSize {
                 buffers[fileURL] = Data()
             }
         }
     }
 
-    private func consumeCompleteLines(for fileURL: URL) throws {
+    private func consumeCompleteLines(
+        for fileURL: URL,
+        saveSession: (AgentSession) throws -> Void
+    ) throws {
         var buffer = buffers[fileURL, default: Data()]
         var parser = parsers[fileURL] ?? CodexRolloutParser(processID: 0)
         while let newlineIndex = buffer.firstIndex(of: 0x0A) {
@@ -181,8 +237,8 @@ public final class CodexSessionsWatcher {
             buffer.removeSubrange(...newlineIndex)
             if line.count <= Self.maximumLineSize,
                let session = parser.consume(line: Data(line)) {
-                if let processID = processIDResolver(session) {
-                    try repository.save(session.replacingProcessID(processID))
+                if let process = verifiedProcess(for: session, rolloutURL: fileURL) {
+                    try saveSession(session.replacingProcess(process))
                     pendingSessions[fileURL] = nil
                 } else {
                     pendingSessions[fileURL] = session

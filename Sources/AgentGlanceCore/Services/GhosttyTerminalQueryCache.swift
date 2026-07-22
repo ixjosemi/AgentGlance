@@ -36,21 +36,26 @@ public final class GhosttyAssignmentMemory: @unchecked Sendable {
 /// tick. The cache refreshes immediately when the set of Ghostty-hosted
 /// agent processes changes — a new session needs its terminal right away —
 /// and otherwise ages out on a TTL that keeps tab titles reasonably fresh.
-/// Failed queries are never cached: a scan without terminal data should be
-/// retried on the next tick, exactly as before the cache existed.
+/// Failed queries use a shorter TTL so a stalled osascript cannot consume the
+/// observation queue on every tick.
 public final class GhosttyTerminalQueryCache: @unchecked Sendable {
     private let timeToLive: TimeInterval
+    private let failureTimeToLive: TimeInterval
     private let query: @Sendable () -> [GhosttyTerminal]?
     private let lock = NSLock()
     private var cachedTerminals: [GhosttyTerminal]?
     private var cachedProcessKeys: Set<String> = []
     private var refreshedAt: Date = .distantPast
+    private var failedProcessKeys: Set<String>?
+    private var failedAt: Date = .distantPast
 
     public init(
         timeToLive: TimeInterval,
+        failureTimeToLive: TimeInterval,
         query: @escaping @Sendable () -> [GhosttyTerminal]?
     ) {
         self.timeToLive = timeToLive
+        self.failureTimeToLive = failureTimeToLive
         self.query = query
     }
 
@@ -69,12 +74,25 @@ public final class GhosttyTerminalQueryCache: @unchecked Sendable {
             lock.unlock()
             return cachedTerminals
         }
+        if let failedProcessKeys,
+           processKeys == failedProcessKeys,
+           now.timeIntervalSince(failedAt) < failureTimeToLive {
+            lock.unlock()
+            return nil
+        }
         lock.unlock()
-        guard let refreshed = query() else { return nil }
+        guard let refreshed = query() else {
+            lock.lock()
+            failedProcessKeys = processKeys
+            failedAt = now
+            lock.unlock()
+            return nil
+        }
         lock.lock()
         cachedTerminals = refreshed
         cachedProcessKeys = processKeys
         refreshedAt = now
+        failedProcessKeys = nil
         lock.unlock()
         return refreshed
     }

@@ -12,10 +12,11 @@ public final class ConvoyRunsWatcher {
 
     private let runsDirectoryURL: URL
     private let repository: StateRepository
-    /// Parse results keyed by metadata file, invalidated by modification
-    /// time: only the active run's metadata changes between scans, so
-    /// historical runs are parsed at most once per process lifetime.
-    private var parsedRunsByFileURL: [URL: (modifiedAt: Date, run: ConvoyRun?)] = [:]
+    private let metadataParseObserver: ((URL) -> Void)?
+    /// Parse results keyed by metadata file and its securely read identity.
+    /// Only the active run changes between scans, so historical runs are
+    /// parsed at most once per process lifetime.
+    private var parsedRunsByFileURL: [URL: (fingerprint: MetadataFingerprint, run: ConvoyRun?)] = [:]
     private var trackedRuns: [String: TrackedRun] = [:]
 
     public struct ScanResult {
@@ -39,14 +40,57 @@ public final class ConvoyRunsWatcher {
         let run: ConvoyRun
     }
 
+    private struct MetadataFingerprint: Equatable {
+        let device: dev_t
+        let inode: ino_t
+        let size: off_t
+        let modifiedSeconds: time_t
+        let modifiedNanoseconds: Int
+
+        init(_ metadata: stat) {
+            device = metadata.st_dev
+            inode = metadata.st_ino
+            size = metadata.st_size
+            modifiedSeconds = metadata.st_mtimespec.tv_sec
+            modifiedNanoseconds = metadata.st_mtimespec.tv_nsec
+        }
+
+        var modifiedAt: Date {
+            Date(
+                timeIntervalSince1970: TimeInterval(modifiedSeconds)
+                    + TimeInterval(modifiedNanoseconds) / 1_000_000_000
+            )
+        }
+    }
+
+    private struct ParsedMetadata {
+        let run: ConvoyRun?
+    }
+
     public init(runsDirectoryURL: URL, repository: StateRepository) {
         self.runsDirectoryURL = runsDirectoryURL
         self.repository = repository
+        metadataParseObserver = nil
+    }
+
+    package init(
+        runsDirectoryURL: URL,
+        repository: StateRepository,
+        metadataParseObserver: @escaping (URL) -> Void
+    ) {
+        self.runsDirectoryURL = runsDirectoryURL
+        self.repository = repository
+        self.metadataParseObserver = metadataParseObserver
     }
 
     public func scan(detected: [DetectedAgentProcess]) throws {
-        let result = try observe(detected: detected, isHeartbeat: false)
-        try suppressPipelineOwnedOpenCodeSessions(of: result.runs)
+        var snapshot = try repository.loadSnapshot()
+        let result = try observe(
+            detected: detected,
+            isHeartbeat: false,
+            snapshot: &snapshot
+        )
+        try suppressPipelineOwnedOpenCodeSessions(of: result.runs, snapshot: &snapshot)
     }
 
     /// Publishes metadata before the reaper runs and retains only associations
@@ -56,9 +100,27 @@ public final class ConvoyRunsWatcher {
     public func observe(
         detected: [DetectedAgentProcess],
         isHeartbeat: Bool,
-        forceRefresh: Bool = false
+        invalidatedMetadataURLs: Set<URL> = []
     ) throws -> ScanResult {
-        if forceRefresh { parsedRunsByFileURL.removeAll() }
+        var snapshot = try repository.loadSnapshot()
+        return try observe(
+            detected: detected,
+            isHeartbeat: isHeartbeat,
+            invalidatedMetadataURLs: invalidatedMetadataURLs,
+            snapshot: &snapshot
+        )
+    }
+
+    package func observe(
+        detected: [DetectedAgentProcess],
+        isHeartbeat: Bool,
+        invalidatedMetadataURLs: Set<URL> = [],
+        updatesLiveness: Bool = true,
+        snapshot: inout StateSnapshot
+    ) throws -> ScanResult {
+        for metadataURL in invalidatedMetadataURLs {
+            parsedRunsByFileURL[metadataURL] = nil
+        }
         let convoyProcesses = detected.filter { $0.tool == .convoy }
         let discoveredRuns = convoyProcesses.isEmpty
             ? []
@@ -69,12 +131,21 @@ public final class ConvoyRunsWatcher {
             guard let discoveredRun = run(ownedBy: process, in: discoveredRuns) else { continue }
             let run = discoveredRun.run
             let startedAt = run.serverStartedAt ?? Date(timeIntervalSinceNow: -process.elapsedSeconds)
-            try repository.save(session(for: run, process: process, startedAt: startedAt))
+            let selectedSession = session(for: run, process: process, startedAt: startedAt)
+            try repository.save(selectedSession, updating: &snapshot)
+            try retireSupersededRuns(
+                selectedRunID: run.runID,
+                for: process,
+                snapshot: &snapshot
+            )
+            let missedHeartbeats = updatesLiveness
+                ? 0
+                : trackedRuns[run.runID]?.missedHeartbeats ?? 0
             trackedRuns[run.runID] = TrackedRun(
                 metadataURL: discoveredRun.metadataURL,
                 process: process,
                 startedAt: startedAt,
-                missedHeartbeats: 0
+                missedHeartbeats: missedHeartbeats
             )
             liveRuns.append(run)
             publishedRunIDs.insert(run.runID)
@@ -82,23 +153,27 @@ public final class ConvoyRunsWatcher {
         for runID in trackedRuns.keys.sorted() where !publishedRunIDs.contains(runID) {
             guard var tracked = trackedRuns[runID] else { continue }
             let processIsPresent = convoyProcesses.contains { processMatches($0, tracked.process) }
-            if processIsPresent {
-                tracked.missedHeartbeats = 0
-            } else if isHeartbeat {
-                tracked.missedHeartbeats += 1
+            if updatesLiveness {
+                if processIsPresent {
+                    tracked.missedHeartbeats = 0
+                } else if isHeartbeat {
+                    tracked.missedHeartbeats += 1
+                }
             }
             guard tracked.missedHeartbeats <= 1 else {
                 trackedRuns[runID] = nil
                 continue
             }
             trackedRuns[runID] = tracked
-            if forceRefresh { parsedRunsByFileURL[tracked.metadataURL] = nil }
             if let run = parsedRunAtCurrentModificationDate(tracked.metadataURL) {
-                try repository.save(session(
-                    for: run,
-                    process: tracked.process,
-                    startedAt: tracked.startedAt
-                ))
+                try repository.save(
+                    session(
+                        for: run,
+                        process: tracked.process,
+                        startedAt: tracked.startedAt
+                    ),
+                    updating: &snapshot
+                )
                 liveRuns.append(run)
             }
         }
@@ -110,7 +185,15 @@ public final class ConvoyRunsWatcher {
     }
 
     public func suppressOpenCodeSessions(for result: ScanResult) throws {
-        try suppressPipelineOwnedOpenCodeSessions(of: result.runs)
+        var snapshot = try repository.loadSnapshot()
+        try suppressOpenCodeSessions(for: result, snapshot: &snapshot)
+    }
+
+    package func suppressOpenCodeSessions(
+        for result: ScanResult,
+        snapshot: inout StateSnapshot
+    ) throws {
+        try suppressPipelineOwnedOpenCodeSessions(of: result.runs, snapshot: &snapshot)
     }
 
     /// Convoy phases run as OpenCode sessions on convoy's embedded server;
@@ -126,15 +209,19 @@ public final class ConvoyRunsWatcher {
     /// "reaper-<pid>" fallback for it that sessionID matching would never
     /// catch. Matching by directory as well as by session ID suppresses
     /// that fallback too.
-    private func suppressPipelineOwnedOpenCodeSessions(of runs: [ConvoyRun]) throws {
+    private func suppressPipelineOwnedOpenCodeSessions(
+        of runs: [ConvoyRun],
+        snapshot: inout StateSnapshot
+    ) throws {
         let pipelineSessionIDs = Set(runs.flatMap { $0.phases.compactMap(\.sessionID) })
         let pipelineTargetDirs = Set(runs.map(\.targetDir))
         guard !pipelineSessionIDs.isEmpty || !pipelineTargetDirs.isEmpty else { return }
-        for session in try repository.loadSessions()
+        let sessions = snapshot.sessions
+        for session in sessions
         where session.tool == .opencode
             && (pipelineSessionIDs.contains(session.sessionID)
                 || (session.source == .reaper && pipelineTargetDirs.contains(session.cwd))) {
-            try repository.remove(session)
+            try repository.remove(session, updating: &snapshot)
         }
     }
 
@@ -158,14 +245,9 @@ public final class ConvoyRunsWatcher {
         var runs: [DiscoveredRun] = []
         for runDirectoryURL in runDirectoryURLs {
             let metadataURL = runDirectoryURL.appendingPathComponent("metadata.json")
-            guard let modifiedAt = try? metadataURL
-                .resourceValues(forKeys: [.contentModificationDateKey])
-                .contentModificationDate,
-                modifiedAt >= cutoff else {
-                continue
-            }
+            guard let parsed = parsedMetadata(at: metadataURL, modifiedAfter: cutoff) else { continue }
             currentMetadataURLs.insert(metadataURL)
-            if let run = parsedRun(at: metadataURL, modifiedAt: modifiedAt) {
+            if let run = parsed.run {
                 runs.append(DiscoveredRun(metadataURL: metadataURL, run: run))
             }
         }
@@ -177,31 +259,39 @@ public final class ConvoyRunsWatcher {
         return runs
     }
 
-    private func parsedRun(at metadataURL: URL, modifiedAt: Date) -> ConvoyRun? {
-        if let cached = parsedRunsByFileURL[metadataURL], cached.modifiedAt == modifiedAt {
-            return cached.run
-        }
-        let run = secureMetadata(at: metadataURL).flatMap(ConvoyRun.decode)
-        parsedRunsByFileURL[metadataURL] = (modifiedAt, run)
-        return run
-    }
-
-    private func secureMetadata(at url: URL) -> Data? {
+    private func parsedMetadata(
+        at url: URL,
+        modifiedAfter cutoff: Date
+    ) -> ParsedMetadata? {
         let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW)
         guard descriptor >= 0 else { return nil }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         var metadata = stat()
         guard Darwin.fstat(descriptor, &metadata) == 0,
-              metadata.st_mode & S_IFMT == S_IFREG,
-              metadata.st_uid == getuid() else { return nil }
-        return try? BoundedInput.read(from: handle)
+               metadata.st_mode & S_IFMT == S_IFREG,
+               metadata.st_uid == getuid() else { return nil }
+        let fingerprint = MetadataFingerprint(metadata)
+        guard fingerprint.modifiedAt >= cutoff else { return nil }
+        if let cached = parsedRunsByFileURL[url], cached.fingerprint == fingerprint {
+            return ParsedMetadata(run: cached.run)
+        }
+        metadataParseObserver?(url)
+        guard let data = try? BoundedInput.read(from: handle) else {
+            parsedRunsByFileURL[url] = (fingerprint, nil)
+            return ParsedMetadata(run: nil)
+        }
+        var metadataAfterRead = stat()
+        guard Darwin.fstat(descriptor, &metadataAfterRead) == 0,
+              MetadataFingerprint(metadataAfterRead) == fingerprint else {
+            return ParsedMetadata(run: nil)
+        }
+        let run = ConvoyRun.decode(data)
+        parsedRunsByFileURL[url] = (fingerprint, run)
+        return ParsedMetadata(run: run)
     }
 
     private func parsedRunAtCurrentModificationDate(_ metadataURL: URL) -> ConvoyRun? {
-        guard let modifiedAt = try? metadataURL
-            .resourceValues(forKeys: [.contentModificationDateKey])
-            .contentModificationDate else { return nil }
-        return parsedRun(at: metadataURL, modifiedAt: modifiedAt)
+        parsedMetadata(at: metadataURL, modifiedAfter: .distantPast)?.run
     }
 
     /// The run a process owns records that process as its server; convoy's
@@ -260,6 +350,29 @@ public final class ConvoyRunsWatcher {
         guard lhs.processID == rhs.processID else { return false }
         guard let left = lhs.processIdentity, let right = rhs.processIdentity else { return true }
         return left == right
+    }
+
+    private func retireSupersededRuns(
+        selectedRunID: String,
+        for process: DetectedAgentProcess,
+        snapshot: inout StateSnapshot
+    ) throws {
+        guard let processIdentity = process.processIdentity else { return }
+        let supersededRunIDs = trackedRuns.compactMap { runID, tracked in
+            runID != selectedRunID && tracked.process.processIdentity == processIdentity
+                ? runID
+                : nil
+        }
+        for runID in supersededRunIDs {
+            if let session = snapshot.sessions.first(where: {
+                $0.tool == .convoy
+                    && $0.sessionID == runID
+                    && $0.processIdentity == processIdentity
+            }) {
+                try repository.remove(session, updating: &snapshot)
+            }
+            trackedRuns[runID] = nil
+        }
     }
 }
 
