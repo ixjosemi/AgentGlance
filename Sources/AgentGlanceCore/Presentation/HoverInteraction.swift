@@ -42,9 +42,11 @@ public enum HoverInteraction {
         let height = hasExpandedMeasurement
             ? min(measuredContentHeight, maximumHeight)
             : maximumHeight
+        // The expanded card starts wherever the compact bar's top sits — a
+        // pill floating below the screen edge keeps its gap while expanded.
         return DisplayFrame(
             minX: 0,
-            minY: 0,
+            minY: compactFrame.minY,
             width: max(0, expandedPanelWidth),
             height: max(0, height)
         )
@@ -76,7 +78,7 @@ public enum HoverInteraction {
             : maximumHeight
         return DisplayFrame(
             minX: 0,
-            minY: 0,
+            minY: compactFrame.minY,
             width: max(0, expandedPanelWidth),
             height: min(max(compactFrame.height, measuredHeight), maximumHeight)
         )
@@ -91,6 +93,7 @@ public enum HoverInteraction {
         panelOriginX: CGFloat,
         panelTopY: CGFloat,
         isExpanded: Bool,
+        cornerStyle: HangingNotchCornerStyle = .hangingNotch,
         topShoulderRadius: CGFloat = 0,
         bottomCornerRadius: CGFloat = 0
     ) -> Bool {
@@ -100,6 +103,7 @@ public enum HoverInteraction {
             localTopLeadingFrame: compactFrame,
             panelOriginX: panelOriginX,
             panelTopY: panelTopY,
+            cornerStyle: cornerStyle,
             topShoulderRadius: topShoulderRadius,
             bottomCornerRadius: bottomCornerRadius
         )
@@ -110,6 +114,7 @@ public enum HoverInteraction {
         localTopLeadingFrame: DisplayFrame,
         panelOriginX: CGFloat,
         panelTopY: CGFloat,
+        cornerStyle: HangingNotchCornerStyle = .hangingNotch,
         topShoulderRadius: CGFloat,
         bottomCornerRadius: CGFloat
     ) -> Bool {
@@ -119,6 +124,7 @@ public enum HoverInteraction {
             DisplayPoint(x: localX, y: localY),
             width: localTopLeadingFrame.width,
             height: localTopLeadingFrame.height,
+            style: cornerStyle,
             topShoulderRadius: topShoulderRadius,
             bottomCornerRadius: bottomCornerRadius
         )

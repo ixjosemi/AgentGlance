@@ -41,6 +41,8 @@ final class NotchPointerTracker: ObservableObject {
 struct NotchWidgetView: View {
     @Bindable var store: StateStore
     @AppStorage("hideWhenEmpty") private var hideWhenEmpty = false
+    @AppStorage("glassFrostRadius") private var glassFrostRadius = NotchGlassStyle.defaultFrostRadius
+    @AppStorage("glassTintOpacity") private var glassTintOpacity = NotchGlassStyle.defaultTintOpacity
     @Environment(\.openSettings) private var openSettings
     let layout: NotchLayout
     @ObservedObject var pointerTracker: NotchPointerTracker
@@ -93,7 +95,7 @@ struct NotchWidgetView: View {
         let headerWings = layout.expandedHeaderWingWidths()
         let compactInteractiveFrame = DisplayFrame(
             minX: barLeadingOffset,
-            minY: 0,
+            minY: layout.topGap,
             width: barWidth,
             height: layout.height
         )
@@ -165,13 +167,21 @@ struct NotchWidgetView: View {
                     }
                 }
                 .frame(width: isExpanded ? menuWidth : barWidth, alignment: .topLeading)
+                // The pill's expanded bubble has no camera band above the
+                // header, so it gains breathing room between its rounded top
+                // edge and the title; collapsed keeps the tight capsule.
+                .padding(.top, isExpanded ? layout.expandedHeaderTopPadding : 0)
                 .background(
                     // The band beside the camera stays explicit pure black so
                     // the drop reads as part of the screen edge; below it the
-                    // scrim fades into behind-window glass.
+                    // scrim fades into behind-window glass. Pill mode has no
+                    // camera to hide and keeps a flat tint over the glass.
                     NotchGlassBackground(
                         silhouette: silhouette,
-                        barBandHeight: layout.height
+                        barBandHeight: layout.height,
+                        presentation: layout.presentation,
+                        frostRadius: glassFrostRadius,
+                        tintOpacity: glassTintOpacity
                     )
                 )
                 // Do not clip the compact counters to the curved silhouette:
@@ -220,8 +230,10 @@ struct NotchWidgetView: View {
                 // hover tracking. Applying offset first leaves those later
                 // modifiers at the unshifted 720-point panel origin: pill
                 // hover then misses entirely and notch hover lands in empty
-                // space to the left of the visible bar.
-                .offset(x: isExpanded ? 0 : barLeadingOffset)
+                // space to the left of the visible bar. The vertical offset
+                // floats the pill below the screen edge; the notch keeps
+                // zero gap and stays fused to it.
+                .offset(x: isExpanded ? 0 : barLeadingOffset, y: layout.topGap)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -387,12 +399,14 @@ struct NotchWidgetView: View {
         .lineLimit(1)
     }
 
-    /// Bar and menu share one hanging-drop silhouette: the top shoulders
-    /// curve inward from the screen edge while the lower corners remain
-    /// circular. Compact and expanded use identical radii; expansion only
-    /// adds the straight vertical side between those fixed curves.
+    /// Bar and menu share one silhouette. On a notched display the top
+    /// shoulders curve inward from the screen edge while the lower corners
+    /// remain circular; the detached pill instead rounds every corner — a
+    /// capsule collapsed, a bubble expanded. Compact and expanded use
+    /// identical radii; expansion only adds the straight sides between them.
     private var silhouette: HangingNotchShape {
         HangingNotchShape(
+            style: layout.cornerStyle,
             topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
             bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
         )
@@ -435,6 +449,7 @@ struct NotchWidgetView: View {
         )
         let region = HangingNotchInteractionRegion(
             frame: frame,
+            cornerStyle: layout.cornerStyle,
             topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
             bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
         )
@@ -501,6 +516,7 @@ struct NotchWidgetView: View {
             panelOriginX: layout.originX,
             panelTopY: layout.originY + layout.height,
             isExpanded: isExpanded,
+            cornerStyle: layout.cornerStyle,
             topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
             bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
         ) else { return }
@@ -535,6 +551,7 @@ struct NotchWidgetView: View {
 }
 
 struct HangingNotchShape: Shape {
+    var style: HangingNotchCornerStyle = .hangingNotch
     var topShoulderRadius: CGFloat
     var bottomCornerRadius: CGFloat
 
@@ -549,6 +566,7 @@ struct HangingNotchShape: Shape {
     func path(in rect: CGRect) -> Path {
         Path(HangingNotchGeometry.path(
             in: rect,
+            style: style,
             topShoulderRadius: topShoulderRadius,
             bottomCornerRadius: bottomCornerRadius
         ))

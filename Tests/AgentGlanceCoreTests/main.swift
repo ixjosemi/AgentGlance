@@ -2823,10 +2823,10 @@ func testNotchLayoutStatusWingWidthHidesZeroCountIndicators() throws {
     )
     try expect(
         NotchLayout.statusWingWidth(visibleIndicatorCount: 0, showsIdleMark: true),
-        equals: 64,
+        equals: 56,
         "the quiet idle drop retains the same relaxed horizontal padding"
     )
-    try expect(NotchLayout.statusWingEdgePadding, equals: 18, "compact drops leave generous horizontal breathing room")
+    try expect(NotchLayout.statusWingEdgePadding, equals: 14, "compact drops keep moderate horizontal breathing room")
     let one = NotchLayout.statusWingWidth(visibleIndicatorCount: 1, showsIdleMark: false)
     let two = NotchLayout.statusWingWidth(visibleIndicatorCount: 2, showsIdleMark: false)
     try expect(
@@ -3512,7 +3512,7 @@ func testNotchLayoutAddsOnlyAMinimalFixedRightWing() throws {
         rightNotchEdgeX: nil,
         menuBarHeight: 24
     )
-    try expect(pill.statusWingEdgePadding, equals: 18, "virtual pill keeps its roomier horizontal padding")
+    try expect(pill.statusWingEdgePadding, equals: 14, "virtual pill keeps a moderate horizontal padding")
     let unbalanced = pill.balancedStatusWingWidths(leftWidth: 54, rightWidth: 0)
     try expect(unbalanced.left, equals: 54, "notchless drop preserves its real left content")
     try expect(unbalanced.right, equals: 0, "notchless drop adds no phantom status wing")
@@ -3548,8 +3548,8 @@ func testNotchLayoutReservesRightOuterCurveClearanceForBlockedCount() throws {
 
 func testNotchLayoutUsesPillStyleOnNotchlessScreen() throws {
     // A Studio Display: no safe area, no camera housing, a real 24 pt menu
-    // bar. The compact surface hangs from the top like a notch instead of
-    // floating as a detached capsule.
+    // bar. The compact surface floats as a detached capsule slightly below
+    // the top edge instead of fusing with it like a notch.
     let layout = NotchLayout(
         screenMinX: 0,
         screenWidth: 2_560,
@@ -3561,13 +3561,16 @@ func testNotchLayoutUsesPillStyleOnNotchlessScreen() throws {
     )
 
     try expect(layout.presentation, equals: .pill, "notchless screen gets the pill")
+    try expect(layout.cornerStyle, equals: .bubble, "detached pill rounds every corner instead of faking a notch")
     try expect(layout.notchWidth, equals: 0, "no phantom camera gap")
-    try expect(layout.height, equals: 24, "pill stays within the real menu bar instead of overlapping app content")
-    try expect(layout.originY, equals: 1_416, "pill attaches to the screen top without hanging into app content")
-    try expect(layout.originY + layout.height, equals: 1_440, "pill and notch share the top edge")
+    try expect(layout.topGap, equals: 2, "pill floats slightly below the top edge")
+    try expect(layout.height, equals: 20, "gap, pill, and bottom inset stay within the real menu bar")
+    try expect(layout.originY, equals: 1_420, "panel keeps its top on the screen edge; the gap lives inside it")
+    try expect(layout.originY + layout.height, equals: 1_440, "pill and notch panels share the top edge")
     try expect(layout.width, equals: 800, "panel wide enough for session details and side curves")
     try expect(layout.originX, equals: 880, "centered on screen")
-    try expect(layout.expandedHeight, equals: 340, "menu hangs below the pill")
+    try expect(layout.expandedHeaderTopPadding, equals: 6, "expanded bubble grows breathing room above its header")
+    try expect(layout.expandedHeight, equals: 344, "gap and header padding grow the shell to fit the tallest card")
 }
 
 func testNotchLayoutPillFallsBackToStandardMenuBarHeight() throws {
@@ -3581,7 +3584,23 @@ func testNotchLayoutPillFallsBackToStandardMenuBarHeight() throws {
         menuBarHeight: 0
     )
 
-    try expect(layout.height, equals: 24, "standard menu bar bounds the virtual pill height")
+    try expect(layout.height, equals: 20, "standard menu bar minus the top gap bounds the virtual pill height")
+}
+
+func testNotchLayoutNotchKeepsScreenEdgeAttachment() throws {
+    let layout = NotchLayout(
+        screenMinX: 0,
+        screenWidth: 1_512,
+        screenMaxY: 982,
+        safeAreaTop: 38,
+        leftNotchEdgeX: 666,
+        rightNotchEdgeX: 846
+    )
+
+    try expect(layout.cornerStyle, equals: .hangingNotch, "hardware notch keeps its concave shoulders")
+    try expect(layout.topGap, equals: 0, "hardware notch stays fused to the screen edge")
+    try expect(layout.expandedHeaderTopPadding, equals: 0, "notch header sits beside the camera and needs no extra room")
+    try expect(layout.expandedHeight, equals: 354, "no gap or header padding contribution on a notched display")
 }
 
 func testHangingNotchGeometryCreatesConcaveShouldersAndRoundedBase() throws {
@@ -3686,6 +3705,86 @@ func testHangingNotchGeometryKeepsExpandedSidesStraightWithCircularCorners() thr
         ),
         equals: true,
         "the lower corner retains the visible interior of its circular arc"
+    )
+}
+
+func testBubbleGeometryRoundsEveryCornerAndCapsulesWhenShort() throws {
+    // Collapsed pill: 102×20 with the 20 pt profile radius clamps to the
+    // half-height, a true capsule.
+    try expect(
+        HangingNotchGeometry.contains(
+            DisplayPoint(x: 1, y: 1),
+            width: 102,
+            height: 20,
+            style: .bubble,
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
+        ),
+        equals: false,
+        "capsule rounds away the upper-left corner instead of flaring into it"
+    )
+    try expect(
+        HangingNotchGeometry.contains(
+            DisplayPoint(x: 1, y: 10),
+            width: 102,
+            height: 20,
+            style: .bubble,
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
+        ),
+        equals: true,
+        "capsule keeps its rounded tip at mid-height"
+    )
+    try expect(
+        HangingNotchGeometry.contains(
+            DisplayPoint(x: 101, y: 19),
+            width: 102,
+            height: 20,
+            style: .bubble,
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
+        ),
+        equals: false,
+        "capsule rounds away the lower-right corner symmetrically"
+    )
+
+    // Expanded bubble: the sides span the full width — no shoulder inset —
+    // and the top corners are convex arcs of the profile radius.
+    try expect(
+        HangingNotchGeometry.contains(
+            DisplayPoint(x: 13, y: 150),
+            width: 800,
+            height: 300,
+            style: .bubble,
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
+        ),
+        equals: true,
+        "bubble sides reach the full panel width instead of the notch body inset"
+    )
+    try expect(
+        HangingNotchGeometry.contains(
+            DisplayPoint(x: 3, y: 3),
+            width: 800,
+            height: 300,
+            style: .bubble,
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
+        ),
+        equals: false,
+        "bubble top corner is a convex arc, not a concave shoulder flare"
+    )
+    try expect(
+        HangingNotchGeometry.contains(
+            DisplayPoint(x: 400, y: 1),
+            width: 800,
+            height: 300,
+            style: .bubble,
+            topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+            bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
+        ),
+        equals: true,
+        "bubble keeps a straight top edge between its corner arcs"
     )
 }
 
@@ -3828,6 +3927,68 @@ func testHangingNotchInteractionRegionPassesTransparentCornersThrough() throws {
         region.contains(DisplayPoint(x: 360, y: 25)),
         equals: false,
         "AppKit gate passes space below the compact drop through"
+    )
+}
+
+func testBubbleInteractionRegionFloatsBelowTheTopEdge() throws {
+    // A detached pill: the region starts 4 pt below the panel top and hit
+    // tests as a capsule, so both the gap strip and the rounded corner
+    // pockets pass through to whatever sits behind the panel.
+    let region = HangingNotchInteractionRegion(
+        frame: DisplayFrame(minX: 309, minY: 4, width: 102, height: 20),
+        cornerStyle: .bubble,
+        topShoulderRadius: HangingNotchMetrics.topShoulderRadius,
+        bottomCornerRadius: HangingNotchMetrics.bottomCornerRadius
+    )
+
+    try expect(
+        region.contains(DisplayPoint(x: 360, y: 2)),
+        equals: false,
+        "the top gap strip passes through to the menu bar behind the panel"
+    )
+    try expect(
+        region.contains(DisplayPoint(x: 310, y: 5)),
+        equals: false,
+        "the capsule's rounded corner pocket passes through"
+    )
+    try expect(
+        region.contains(DisplayPoint(x: 360, y: 14)),
+        equals: true,
+        "the capsule body accepts events"
+    )
+    try expect(
+        region.contains(DisplayPoint(x: 310, y: 14)),
+        equals: true,
+        "the capsule tip accepts events at mid-height"
+    )
+}
+
+func testHoverInteractionPreservesTheTopGapWhileExpanded() throws {
+    let compactFrame = DisplayFrame(minX: 309, minY: 4, width: 102, height: 20)
+
+    try expect(
+        HoverInteraction.interactiveFrame(
+            compactFrame: compactFrame,
+            expandedPanelWidth: 800,
+            expandedMaximumHeight: 340,
+            measuredContentHeight: 210,
+            isExpanded: true,
+            isHidden: false
+        ),
+        equals: DisplayFrame(minX: 0, minY: 4, width: 800, height: 210),
+        "the expanded click gate keeps the floating pill's gap above the card"
+    )
+    try expect(
+        HoverInteraction.visibleHoverFrame(
+            compactFrame: compactFrame,
+            expandedPanelWidth: 800,
+            expandedMaximumHeight: 340,
+            measuredContentHeight: 120,
+            isExpanded: true,
+            isHidden: false
+        ),
+        equals: DisplayFrame(minX: 0, minY: 4, width: 800, height: 120),
+        "the hover surface keeps the same gap so the strip above never holds hover"
     )
 }
 
@@ -7220,8 +7381,12 @@ let tests: [(String, () throws -> Void)] = [
     ("notch layout reserves right outer curve clearance for blocked count", testNotchLayoutReservesRightOuterCurveClearanceForBlockedCount),
     ("notch layout uses pill style on notchless screen", testNotchLayoutUsesPillStyleOnNotchlessScreen),
     ("notch layout pill falls back to standard menu bar height", testNotchLayoutPillFallsBackToStandardMenuBarHeight),
+    ("notch layout notch keeps screen edge attachment", testNotchLayoutNotchKeepsScreenEdgeAttachment),
     ("hanging notch geometry creates concave shoulders and rounded base", testHangingNotchGeometryCreatesConcaveShouldersAndRoundedBase),
     ("hanging notch geometry keeps expanded sides straight with circular corners", testHangingNotchGeometryKeepsExpandedSidesStraightWithCircularCorners),
+    ("bubble geometry rounds every corner and capsules when short", testBubbleGeometryRoundsEveryCornerAndCapsulesWhenShort),
+    ("bubble interaction region floats below the top edge", testBubbleInteractionRegionFloatsBelowTheTopEdge),
+    ("hover interaction preserves the top gap while expanded", testHoverInteractionPreservesTheTopGapWhileExpanded),
     ("hanging notch metrics share one corner profile across modes", testHangingNotchMetricsShareOneCornerProfileAcrossModes),
     ("session menu layout keeps three expanded sessions out of a scroll view", testSessionMenuLayoutKeepsThreeExpandedSessionsOutOfAScrollView),
     ("hover interaction keeps inline row interactions open during delayed exit", testHoverInteractionKeepsInlineRowInteractionsOpenDuringDelayedExit),

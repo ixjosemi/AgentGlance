@@ -17,12 +17,30 @@ public struct NotchLayout: Equatable, Sendable {
     public let presentation: Presentation
     public let width: CGFloat
     public let height: CGFloat
+    /// Distance between the screen's top edge and the visible surface. Zero
+    /// for a hardware notch, which must read as part of the screen edge; the
+    /// virtual pill floats slightly detached instead.
+    public let topGap: CGFloat
     /// Panel height while the session menu hangs below the notch bar.
     public let expandedHeight: CGFloat
     public let originX: CGFloat
     public let originY: CGFloat
     public let notchWidth: CGFloat
     private let notchLeadingX: CGFloat?
+
+    /// Corner treatment matching the presentation: the notch flares into the
+    /// screen edge with concave shoulders, the detached pill rounds every
+    /// corner into a capsule/bubble.
+    public var cornerStyle: HangingNotchCornerStyle {
+        presentation == .pill ? .bubble : .hangingNotch
+    }
+
+    /// Extra space the expanded header band gains over the compact bar. Only
+    /// the pill needs it; the panel shell already accounts for it in
+    /// `expandedHeight`.
+    public var expandedHeaderTopPadding: CGFloat {
+        presentation == .pill ? Self.pillExpandedHeaderTopPadding : 0
+    }
 
     /// The outer expanded shell remains just wider than its content so text
     /// can sit close to the straight sides without entering their corners.
@@ -43,9 +61,18 @@ public struct NotchLayout: Equatable, Sendable {
     /// The panel has room for three expanded rows without creating a nested
     /// scroll surface. Longer lists retain their own bounded scroll view.
     public static let menuMaxHeight = SessionMenuLayout.maximumCardHeight
-    /// An optional amount to remove from the menu-bar contribution to the
-    /// virtual-notch height.
-    public static let pillBottomInset: CGFloat = 0
+    /// Breathing room between the pill and the bottom of the menu-bar strip,
+    /// so the capsule floats inside the strip instead of sitting flush on
+    /// the boundary with app content.
+    public static let pillBottomInset: CGFloat = 2
+    /// The detached pill floats this far below the screen's top edge. The
+    /// visible height shrinks by gap plus bottom inset, so the capsule stays
+    /// inside the menu-bar strip and never overlaps app content.
+    public static let pillTopGap: CGFloat = 2
+    /// Extra room above the expanded header in pill mode: the bubble has no
+    /// camera band, so without it the title and gear hug the rounded top
+    /// edge. The notch keeps zero — its header sits beside the camera.
+    public static let pillExpandedHeaderTopPadding: CGFloat = 6
     /// A screen without a menu bar reports zero height; use the standard.
     public static let fallbackMenuBarHeight: CGFloat = 24
 
@@ -65,6 +92,7 @@ public struct NotchLayout: Equatable, Sendable {
         if safeAreaTop > 0, let leftNotchEdgeX, let rightNotchEdgeX {
             presentation = .notch
             notchLeadingX = leftNotchEdgeX
+            topGap = 0
             height = safeAreaTop
             notchWidth = max(rightNotchEdgeX - leftNotchEdgeX, 168)
             width = expandedWidth
@@ -80,16 +108,22 @@ public struct NotchLayout: Equatable, Sendable {
         } else {
             presentation = .pill
             notchLeadingX = nil
-            // A virtual notch must stay entirely within the menu-bar strip so
-            // it never overlaps the app content below it.
+            // The gap plus the pill must stay entirely within the menu-bar
+            // strip so neither ever overlaps the app content below it.
             let menuBar = menuBarHeight > 0 ? menuBarHeight : Self.fallbackMenuBarHeight
-            height = max(1, menuBar - Self.pillBottomInset)
+            topGap = Self.pillTopGap
+            height = max(1, menuBar - Self.pillTopGap - Self.pillBottomInset)
             notchWidth = 0
             width = expandedWidth
             originX = centerX - width / 2
             originY = screenMaxY - height
         }
-        expandedHeight = height + Self.menuMaxHeight
+        // The panel keeps its top on the screen edge; the gap and the pill's
+        // expanded header padding live inside it, so the expanded shell
+        // grows by both to keep the tallest card fully inside the window.
+        expandedHeight = topGap + height
+            + (presentation == .pill ? Self.pillExpandedHeaderTopPadding : 0)
+            + Self.menuMaxHeight
     }
 
     /// Width one status indicator occupies in the compact bar: glyph, a
@@ -101,7 +135,7 @@ public struct NotchLayout: Equatable, Sendable {
     /// view so both always agree.
     public static let statusIndicatorSpacing: CGFloat = 6
     /// Breathing room at each end of a virtual-pill status wing.
-    public static let statusWingEdgePadding: CGFloat = 18
+    public static let statusWingEdgePadding: CGFloat = 14
     /// The camera-facing edge of a hardware-notch wing reserves enough room
     /// to keep the counter cluster fully clear of the physical camera cutout.
     /// The right wing ends in a wider count glyph rather than the left wing's

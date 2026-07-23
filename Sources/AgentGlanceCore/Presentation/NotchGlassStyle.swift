@@ -26,12 +26,25 @@ public enum NotchGlassStyle {
     /// Residual black over the glass at the bottom: the glass never fully
     /// clears — a subtle smoked tint that keeps white content readable.
     public static let bottomScrimOpacity: Double = 0.25
+    /// User-tunable tint over the glass — the black wash's opacity. On the
+    /// pill it covers the whole silhouette flat; on a notched display it is
+    /// the floor the camera band's black dissolves down to, so the band
+    /// itself always stays pure black. Exposed in Settings as "Tint"; this
+    /// default is the hand-picked baseline.
+    public static let defaultTintOpacity: Double = 0.22
+    public static let tintOpacityRange: ClosedRange<Double> = 0...0.7
+    /// User-tunable frost — the glass filter's blur radius. Zero is clear
+    /// lensing with no diffusion; the stock system clear style ships 10.
+    /// Exposed in Settings as "Frosted"; this default is the hand-picked
+    /// whisper of frost.
+    public static let defaultFrostRadius: Double = 1
+    public static let frostRadiusRange: ClosedRange<Double> = 0...30
     /// Absolute values forced onto the private glassBackground filter's
-    /// inputs, applied over the recovered system baseline: a whisper of
-    /// frost, no face wash, and lensing boosted past the stock clear style
-    /// (-60 over 20pt). Hand-tuned live on hardware.
+    /// inputs, applied over the recovered system baseline: no face wash and
+    /// lensing boosted past the stock clear style (-60 over 20pt). The blur
+    /// radius rides separately on the user's frost setting. Hand-tuned live
+    /// on hardware.
     public static let glassFilterOverrides: [String: Double] = [
-        "inputBlurRadius": 1,
         "inputFaceOpacity": 0,
         "inputInnerRefractionAmount": -80,
         "inputInnerRefractionHeight": 26,

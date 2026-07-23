@@ -8,12 +8,22 @@ public enum HangingNotchMetrics {
     public static let bottomCornerRadius: CGFloat = 20
 }
 
+/// How the silhouette meets the top of its rectangle. A hardware notch reads
+/// as part of the screen edge, so its top corners flare outward into concave
+/// shoulders; a notchless display carries a detached floating surface whose
+/// top corners round inward like any other bubble.
+public enum HangingNotchCornerStyle: Equatable, Sendable {
+    case hangingNotch
+    case bubble
+}
+
 /// Shared path geometry for the top-attached notch/drop silhouette. The top
 /// edge flares into the screen edge before curving inward to the body, which
 /// creates the concave shoulders that a rounded rectangle cannot express.
 public enum HangingNotchGeometry {
     public static func path(
         in rect: CGRect,
+        style: HangingNotchCornerStyle = .hangingNotch,
         topShoulderRadius requestedTopRadius: CGFloat,
         bottomCornerRadius requestedBottomRadius: CGFloat
     ) -> CGPath {
@@ -22,6 +32,26 @@ public enum HangingNotchGeometry {
               rect.height.isFinite,
               rect.width > 0,
               rect.height > 0 else {
+            return path
+        }
+
+        if style == .bubble {
+            // The bubble rounds every corner with the notch profile's lower
+            // radius; the shoulder radius plays no part because nothing
+            // attaches to a screen edge. Short rectangles clamp the radius to
+            // the half-height, so the collapsed bar comes out a true capsule
+            // and grows into the rounded card through the expand spring.
+            let radius = min(
+                sanitizedRadius(requestedBottomRadius),
+                rect.width / 2,
+                rect.height / 2
+            )
+            path.addPath(CGPath(
+                roundedRect: rect,
+                cornerWidth: radius,
+                cornerHeight: radius,
+                transform: nil
+            ))
             return path
         }
 
@@ -83,12 +113,14 @@ public enum HangingNotchGeometry {
         _ point: DisplayPoint,
         width: CGFloat,
         height: CGFloat,
+        style: HangingNotchCornerStyle = .hangingNotch,
         topShoulderRadius: CGFloat,
         bottomCornerRadius: CGFloat
     ) -> Bool {
         guard point.x.isFinite, point.y.isFinite else { return false }
         return path(
             in: CGRect(x: 0, y: 0, width: width, height: height),
+            style: style,
             topShoulderRadius: topShoulderRadius,
             bottomCornerRadius: bottomCornerRadius
         ).contains(CGPoint(x: point.x, y: point.y))
@@ -110,15 +142,18 @@ public struct HangingNotchInteractionRegion: Equatable, Sendable {
     )
 
     public let frame: DisplayFrame
+    public let cornerStyle: HangingNotchCornerStyle
     public let topShoulderRadius: CGFloat
     public let bottomCornerRadius: CGFloat
 
     public init(
         frame: DisplayFrame,
+        cornerStyle: HangingNotchCornerStyle = .hangingNotch,
         topShoulderRadius: CGFloat,
         bottomCornerRadius: CGFloat
     ) {
         self.frame = frame
+        self.cornerStyle = cornerStyle
         self.topShoulderRadius = topShoulderRadius
         self.bottomCornerRadius = bottomCornerRadius
     }
@@ -131,6 +166,7 @@ public struct HangingNotchInteractionRegion: Equatable, Sendable {
             ),
             width: frame.width,
             height: frame.height,
+            style: cornerStyle,
             topShoulderRadius: topShoulderRadius,
             bottomCornerRadius: bottomCornerRadius
         )
