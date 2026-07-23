@@ -3,17 +3,20 @@ import Foundation
 /// Shared expanded-menu spacing. Keeping these values outside the SwiftUI
 /// tree makes the compact horizontal layout explicit and testable.
 public enum SessionMenuLayout {
-    public static let contentHorizontalInset: CGFloat = 8
+    public static let contentHorizontalInset: CGFloat = 4
     /// Gap between the notch bar — whose wings now hold the header — and the
     /// first session row.
     public static let listTopPadding: CGFloat = 6
+    /// Leading inset for the session rows' own content, shared with the
+    /// header math below so both columns stay aligned.
+    public static let sessionRowLeadingInset: CGFloat = 12
     /// Outer insets for header content living in the expanded bar wings,
     /// chosen so the header columns line up with the session rows below:
-    /// leading matches the row's agent icon (8pt centering gutter + 8pt card
-    /// inset + 16pt row leading), trailing matches the row's chevron button
-    /// (8 + 8 + 12pt chevron trailing).
-    public static let expandedHeaderLeadingInset: CGFloat = 32
-    public static let expandedHeaderTrailingInset: CGFloat = 28
+    /// leading matches the row's agent icon (8pt centering gutter + 4pt card
+    /// inset + 12pt row leading), trailing matches the row's chevron button
+    /// (8 + 4 + 12pt chevron trailing).
+    public static let expandedHeaderLeadingInset: CGFloat = 24
+    public static let expandedHeaderTrailingInset: CGFloat = 24
     public static let cardStackSpacing: CGFloat = 2
     public static let cardBottomPadding: CGFloat = 6
     public static let sessionListBottomPadding: CGFloat = 4

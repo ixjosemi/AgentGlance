@@ -2823,10 +2823,10 @@ func testNotchLayoutStatusWingWidthHidesZeroCountIndicators() throws {
     )
     try expect(
         NotchLayout.statusWingWidth(visibleIndicatorCount: 0, showsIdleMark: true),
-        equals: 56,
-        "the quiet idle drop retains the same relaxed horizontal padding"
+        equals: 46,
+        "the quiet idle drop bottoms out at the minimum capsule width"
     )
-    try expect(NotchLayout.statusWingEdgePadding, equals: 14, "compact drops keep moderate horizontal breathing room")
+    try expect(NotchLayout.statusWingEdgePadding, equals: 6, "compact pill hugs its counters instead of padding them out")
     let one = NotchLayout.statusWingWidth(visibleIndicatorCount: 1, showsIdleMark: false)
     let two = NotchLayout.statusWingWidth(visibleIndicatorCount: 2, showsIdleMark: false)
     try expect(
@@ -3496,7 +3496,7 @@ func testNotchLayoutAddsOnlyAMinimalFixedRightWing() throws {
     try expect(notched.leftStatusWingLeadingPadding, equals: 8, "left wing has a small outer margin")
     try expect(notched.leftStatusWingTrailingPadding, equals: 12, "left wing leaves a small camera-facing gap")
     try expect(notched.rightStatusWingLeadingPadding, equals: 12, "right wing mirrors the small camera gap")
-    try expect(notched.rightStatusWingTrailingPadding, equals: 14, "right count clears the curved outer shoulder")
+    try expect(notched.rightStatusWingTrailingPadding, equals: 8, "right count hugs the curve exactly like the left dot")
     try expect(activeNotchWing, equals: 50, "hardware-notch counter leaves a 12-point camera gap")
     let balanced = notched.balancedStatusWingWidths(leftWidth: activeNotchWing, rightWidth: 0)
 
@@ -3512,7 +3512,7 @@ func testNotchLayoutAddsOnlyAMinimalFixedRightWing() throws {
         rightNotchEdgeX: nil,
         menuBarHeight: 24
     )
-    try expect(pill.statusWingEdgePadding, equals: 14, "virtual pill keeps a moderate horizontal padding")
+    try expect(pill.statusWingEdgePadding, equals: 6, "virtual pill keeps a slim horizontal padding")
     let unbalanced = pill.balancedStatusWingWidths(leftWidth: 54, rightWidth: 0)
     try expect(unbalanced.left, equals: 54, "notchless drop preserves its real left content")
     try expect(unbalanced.right, equals: 0, "notchless drop adds no phantom status wing")
@@ -3530,8 +3530,8 @@ func testNotchLayoutReservesRightOuterCurveClearanceForBlockedCount() throws {
 
     try expect(
         layout.rightStatusWingTrailingPadding,
-        equals: HangingNotchMetrics.topShoulderRadius,
-        "the outer blocked count stays inside the curved right shoulder"
+        equals: layout.leftStatusWingLeadingPadding,
+        "both outer insets match so a bar with wings on each side reads symmetric"
     )
     try expect(
         layout.statusWingWidth(
@@ -3563,14 +3563,17 @@ func testNotchLayoutUsesPillStyleOnNotchlessScreen() throws {
     try expect(layout.presentation, equals: .pill, "notchless screen gets the pill")
     try expect(layout.cornerStyle, equals: .bubble, "detached pill rounds every corner instead of faking a notch")
     try expect(layout.notchWidth, equals: 0, "no phantom camera gap")
-    try expect(layout.topGap, equals: 2, "pill floats slightly below the top edge")
-    try expect(layout.height, equals: 20, "gap, pill, and bottom inset stay within the real menu bar")
-    try expect(layout.originY, equals: 1_420, "panel keeps its top on the screen edge; the gap lives inside it")
+    try expect(layout.topGap, equals: 4, "pill floats below the top edge")
+    try expect(layout.height, equals: 16, "gap, pill, and bottom inset stay within the real menu bar")
+    try expect(layout.originY, equals: 1_424, "panel keeps its top on the screen edge; the gap lives inside it")
     try expect(layout.originY + layout.height, equals: 1_440, "pill and notch panels share the top edge")
     try expect(layout.width, equals: 800, "panel wide enough for session details and side curves")
     try expect(layout.originX, equals: 880, "centered on screen")
-    try expect(layout.expandedHeaderTopPadding, equals: 6, "expanded bubble grows breathing room above its header")
-    try expect(layout.expandedHeight, equals: 344, "gap and header padding grow the shell to fit the tallest card")
+    try expect(layout.expandedTopGap, equals: 8, "open bubble detaches further from the screen edge")
+    try expect(layout.expandedContentSideInset, equals: 0, "bubble sides are the panel edges, no extra content inset")
+    try expect(layout.expandedHeaderTopPadding, equals: 14, "expanded bubble grows breathing room above its header")
+    try expect(layout.expandedBottomPadding, equals: 8, "last row clears the bubble's rounded bottom corners")
+    try expect(layout.expandedHeight, equals: 362, "expanded gap plus both paddings grow the shell to fit the tallest card")
 }
 
 func testNotchLayoutPillFallsBackToStandardMenuBarHeight() throws {
@@ -3584,7 +3587,7 @@ func testNotchLayoutPillFallsBackToStandardMenuBarHeight() throws {
         menuBarHeight: 0
     )
 
-    try expect(layout.height, equals: 20, "standard menu bar minus the top gap bounds the virtual pill height")
+    try expect(layout.height, equals: 16, "standard menu bar minus both margins bounds the virtual pill height")
 }
 
 func testNotchLayoutNotchKeepsScreenEdgeAttachment() throws {
@@ -3599,8 +3602,15 @@ func testNotchLayoutNotchKeepsScreenEdgeAttachment() throws {
 
     try expect(layout.cornerStyle, equals: .hangingNotch, "hardware notch keeps its concave shoulders")
     try expect(layout.topGap, equals: 0, "hardware notch stays fused to the screen edge")
+    try expect(layout.expandedTopGap, equals: 0, "notch stays fused to the edge while open too")
+    try expect(
+        layout.expandedContentSideInset,
+        equals: HangingNotchMetrics.topShoulderRadius,
+        "notch content absorbs the shoulder radius that pulls its sides inward"
+    )
     try expect(layout.expandedHeaderTopPadding, equals: 0, "notch header sits beside the camera and needs no extra room")
-    try expect(layout.expandedHeight, equals: 354, "no gap or header padding contribution on a notched display")
+    try expect(layout.expandedBottomPadding, equals: 0, "notch card keeps its own compact bottom inset")
+    try expect(layout.expandedHeight, equals: 354, "no gap or padding contribution on a notched display")
 }
 
 func testHangingNotchGeometryCreatesConcaveShouldersAndRoundedBase() throws {
@@ -3806,8 +3816,15 @@ func testHangingNotchMetricsShareOneCornerProfileAcrossModes() throws {
     )
     try expect(
         SessionMenuLayout.contentHorizontalInset,
-        equals: 8,
-        "expanded content uses a compact side inset like the bottom inset"
+        equals: 4,
+        "expanded content hugs the bubble sides with a slim inset"
+    )
+    try expect(
+        SessionMenuLayout.expandedHeaderLeadingInset,
+        equals: SessionMenuLayout.contentHorizontalInset
+            + SessionMenuLayout.sessionRowLeadingInset
+            + NotchLayout.expandedCurveGutter,
+        "the header title stays column-aligned with the row icons below"
     )
     try expect(
         SessionMenuLayout.sessionRowHeight,
@@ -3976,7 +3993,20 @@ func testHoverInteractionPreservesTheTopGapWhileExpanded() throws {
             isHidden: false
         ),
         equals: DisplayFrame(minX: 0, minY: 4, width: 800, height: 210),
-        "the expanded click gate keeps the floating pill's gap above the card"
+        "without its own inset the expanded gate inherits the compact bar's gap"
+    )
+    try expect(
+        HoverInteraction.interactiveFrame(
+            compactFrame: compactFrame,
+            expandedPanelWidth: 800,
+            expandedMaximumHeight: 340,
+            measuredContentHeight: 210,
+            isExpanded: true,
+            isHidden: false,
+            expandedTopInset: 8
+        ),
+        equals: DisplayFrame(minX: 0, minY: 8, width: 800, height: 210),
+        "the open bubble's own larger gap moves the click gate down with it"
     )
     try expect(
         HoverInteraction.visibleHoverFrame(
@@ -3985,10 +4015,11 @@ func testHoverInteractionPreservesTheTopGapWhileExpanded() throws {
             expandedMaximumHeight: 340,
             measuredContentHeight: 120,
             isExpanded: true,
-            isHidden: false
+            isHidden: false,
+            expandedTopInset: 8
         ),
-        equals: DisplayFrame(minX: 0, minY: 4, width: 800, height: 120),
-        "the hover surface keeps the same gap so the strip above never holds hover"
+        equals: DisplayFrame(minX: 0, minY: 8, width: 800, height: 120),
+        "the hover surface follows the bubble's gap so the strip above never holds hover"
     )
 }
 

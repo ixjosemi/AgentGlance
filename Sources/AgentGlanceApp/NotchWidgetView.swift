@@ -41,8 +41,10 @@ final class NotchPointerTracker: ObservableObject {
 struct NotchWidgetView: View {
     @Bindable var store: StateStore
     @AppStorage("hideWhenEmpty") private var hideWhenEmpty = false
-    @AppStorage("glassFrostRadius") private var glassFrostRadius = NotchGlassStyle.defaultFrostRadius
-    @AppStorage("glassTintOpacity") private var glassTintOpacity = NotchGlassStyle.defaultTintOpacity
+    @AppStorage("glassFrostRadiusNotch") private var notchFrostRadius = NotchGlassStyle.defaultFrostRadius
+    @AppStorage("glassTintOpacityNotch") private var notchTintOpacity = NotchGlassStyle.defaultTintOpacity
+    @AppStorage("glassFrostRadiusPill") private var pillFrostRadius = NotchGlassStyle.defaultFrostRadius
+    @AppStorage("glassTintOpacityPill") private var pillTintOpacity = NotchGlassStyle.defaultTintOpacity
     @Environment(\.openSettings) private var openSettings
     let layout: NotchLayout
     @ObservedObject var pointerTracker: NotchPointerTracker
@@ -91,7 +93,11 @@ struct NotchWidgetView: View {
             rightWidth: rightWidth
         )
         let menuWidth = layout.width
+        // The notch's straight sides sit a shoulder radius inside the panel,
+        // so its card content narrows by the same amount per side to keep
+        // the visual margin the bubble gets from its own edges.
         let menuContentWidth = NotchLayout.contentWidth(forExpandedPanelWidth: menuWidth)
+            - 2 * layout.expandedContentSideInset
         let headerWings = layout.expandedHeaderWingWidths()
         let compactInteractiveFrame = DisplayFrame(
             minX: barLeadingOffset,
@@ -169,8 +175,10 @@ struct NotchWidgetView: View {
                 .frame(width: isExpanded ? menuWidth : barWidth, alignment: .topLeading)
                 // The pill's expanded bubble has no camera band above the
                 // header, so it gains breathing room between its rounded top
-                // edge and the title; collapsed keeps the tight capsule.
+                // edge and the title, plus matching room under the last row;
+                // collapsed keeps the tight capsule.
                 .padding(.top, isExpanded ? layout.expandedHeaderTopPadding : 0)
+                .padding(.bottom, isExpanded ? layout.expandedBottomPadding : 0)
                 .background(
                     // The band beside the camera stays explicit pure black so
                     // the drop reads as part of the screen edge; below it the
@@ -180,8 +188,10 @@ struct NotchWidgetView: View {
                         silhouette: silhouette,
                         barBandHeight: layout.height,
                         presentation: layout.presentation,
-                        frostRadius: glassFrostRadius,
-                        tintOpacity: glassTintOpacity
+                        frostRadius: layout.presentation == .pill
+                            ? pillFrostRadius : notchFrostRadius,
+                        tintOpacity: layout.presentation == .pill
+                            ? pillTintOpacity : notchTintOpacity
                     )
                 )
                 // Do not clip the compact counters to the curved silhouette:
@@ -231,9 +241,12 @@ struct NotchWidgetView: View {
                 // modifiers at the unshifted 720-point panel origin: pill
                 // hover then misses entirely and notch hover lands in empty
                 // space to the left of the visible bar. The vertical offset
-                // floats the pill below the screen edge; the notch keeps
-                // zero gap and stays fused to it.
-                .offset(x: isExpanded ? 0 : barLeadingOffset, y: layout.topGap)
+                // floats the pill below the screen edge — further while the
+                // bubble is open; the notch keeps zero gap in both states.
+                .offset(
+                    x: isExpanded ? 0 : barLeadingOffset,
+                    y: isExpanded ? layout.expandedTopGap : layout.topGap
+                )
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -374,7 +387,10 @@ struct NotchWidgetView: View {
                     .foregroundStyle(.white.opacity(0.55))
                 Spacer(minLength: 0)
             }
-            .padding(.leading, SessionMenuLayout.expandedHeaderLeadingInset)
+            .padding(
+                .leading,
+                SessionMenuLayout.expandedHeaderLeadingInset + layout.expandedContentSideInset
+            )
             .frame(width: wings.left, height: layout.height, alignment: .leading)
             Color.clear
                 .frame(width: layout.notchWidth, height: layout.height)
@@ -393,7 +409,10 @@ struct NotchWidgetView: View {
                     collapseMenu()
                 }
             }
-            .padding(.trailing, SessionMenuLayout.expandedHeaderTrailingInset)
+            .padding(
+                .trailing,
+                SessionMenuLayout.expandedHeaderTrailingInset + layout.expandedContentSideInset
+            )
             .frame(width: wings.right, height: layout.height, alignment: .trailing)
         }
         .lineLimit(1)
@@ -445,7 +464,8 @@ struct NotchWidgetView: View {
             expandedMaximumHeight: layout.expandedHeight,
             measuredContentHeight: measuredContentHeight,
             isExpanded: isExpanded,
-            isHidden: isHidden
+            isHidden: isHidden,
+            expandedTopInset: layout.expandedTopGap
         )
         let region = HangingNotchInteractionRegion(
             frame: frame,
@@ -980,7 +1000,7 @@ private struct SessionRow: View {
                     .foregroundStyle(.white.opacity(0.45))
             }
         }
-        .padding(.leading, 16)
+        .padding(.leading, SessionMenuLayout.sessionRowLeadingInset)
         .padding(.trailing, 10)
         .frame(height: SessionMenuLayout.sessionRowHeight)
     }

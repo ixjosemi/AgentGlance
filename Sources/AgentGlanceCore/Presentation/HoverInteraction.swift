@@ -29,7 +29,8 @@ public enum HoverInteraction {
         expandedMaximumHeight: CGFloat,
         measuredContentHeight: CGFloat,
         isExpanded: Bool,
-        isHidden: Bool
+        isHidden: Bool,
+        expandedTopInset: CGFloat? = nil
     ) -> DisplayFrame {
         guard !isHidden else {
             return DisplayFrame(minX: 0, minY: 0, width: 0, height: 0)
@@ -42,11 +43,11 @@ public enum HoverInteraction {
         let height = hasExpandedMeasurement
             ? min(measuredContentHeight, maximumHeight)
             : maximumHeight
-        // The expanded card starts wherever the compact bar's top sits — a
-        // pill floating below the screen edge keeps its gap while expanded.
+        // The open bubble may float lower than the compact bar (the pill's
+        // expanded gap); without its own inset it inherits the bar's top.
         return DisplayFrame(
             minX: 0,
-            minY: compactFrame.minY,
+            minY: expandedTopInset ?? compactFrame.minY,
             width: max(0, expandedPanelWidth),
             height: max(0, height)
         )
@@ -63,7 +64,8 @@ public enum HoverInteraction {
         expandedMaximumHeight: CGFloat,
         measuredContentHeight: CGFloat,
         isExpanded: Bool,
-        isHidden: Bool
+        isHidden: Bool,
+        expandedTopInset: CGFloat? = nil
     ) -> DisplayFrame {
         guard !isHidden else {
             return DisplayFrame(minX: 0, minY: 0, width: 0, height: 0)
@@ -78,7 +80,7 @@ public enum HoverInteraction {
             : maximumHeight
         return DisplayFrame(
             minX: 0,
-            minY: compactFrame.minY,
+            minY: expandedTopInset ?? compactFrame.minY,
             width: max(0, expandedPanelWidth),
             height: min(max(compactFrame.height, measuredHeight), maximumHeight)
         )
