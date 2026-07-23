@@ -49,10 +49,8 @@ public struct NotchLayout: Equatable, Sendable {
     }
 
     /// Extra space between the last session row and the expanded surface's
-    /// bottom edge. Only the pill's bubble needs it.
-    public var expandedBottomPadding: CGFloat {
-        presentation == .pill ? Self.pillExpandedBottomPadding : 0
-    }
+    /// bottom edge, shared by the notch drop and the pill bubble.
+    public var expandedBottomPadding: CGFloat { Self.expandedBottomPadding }
 
     /// Extra horizontal inset for expanded content. The hanging notch's
     /// concave shoulders pull its straight sides `topShoulderRadius` inside
@@ -98,9 +96,10 @@ public struct NotchLayout: Equatable, Sendable {
     /// camera band, so without it the title and gear hug the rounded top
     /// edge. The notch keeps zero — its header sits beside the camera.
     public static let pillExpandedHeaderTopPadding: CGFloat = 14
-    /// Matching room under the last session row, so the list clears the
-    /// bubble's rounded bottom corners instead of sitting on them.
-    public static let pillExpandedBottomPadding: CGFloat = 8
+    /// Room under the last session row on every presentation: the expanded
+    /// card's lateral margins measure ~18pt from the visible edge, and the
+    /// card's own bottom insets alone left barely half that below the list.
+    public static let expandedBottomPadding: CGFloat = 8
     /// A screen without a menu bar reports zero height; use the standard.
     public static let fallbackMenuBarHeight: CGFloat = 24
 
@@ -146,15 +145,14 @@ public struct NotchLayout: Equatable, Sendable {
             originX = centerX - width / 2
             originY = screenMaxY - height
         }
-        // The panel keeps its top on the screen edge; the expanded gap and
-        // the pill's header and bottom paddings live inside it, so the
-        // expanded shell grows by all three to keep the tallest card fully
-        // inside the window.
+        // The panel keeps its top on the screen edge; the bottom padding,
+        // the expanded gap, and the pill's header padding all live inside
+        // it, so the expanded shell grows by each to keep the tallest card
+        // fully inside the window.
         expandedHeight = height + Self.menuMaxHeight
+            + Self.expandedBottomPadding
             + (presentation == .pill
-                ? Self.pillExpandedTopGap
-                    + Self.pillExpandedHeaderTopPadding
-                    + Self.pillExpandedBottomPadding
+                ? Self.pillExpandedTopGap + Self.pillExpandedHeaderTopPadding
                 : 0)
     }
 

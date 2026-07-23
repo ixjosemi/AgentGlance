@@ -3373,7 +3373,7 @@ func testNotchLayoutExtendsFromLeftSideOfHardwareNotch() throws {
     try expect(layout.presentation, equals: .notch, "a screen with a camera housing keeps the notch")
     try expect(layout.width, equals: 800, "wide expanded panel leaves room for smooth side curves")
     try expect(layout.height, equals: 38, "collapsed panel height")
-    try expect(layout.expandedHeight, equals: 354, "expanded panel height")
+    try expect(layout.expandedHeight, equals: 362, "expanded panel height includes the shared bottom padding")
     try expect(layout.originX, equals: 356, "expanded panel x")
     try expect(layout.originY, equals: 944, "panel y")
     try expect(layout.notchWidth, equals: 180, "hardware notch width")
@@ -3609,8 +3609,8 @@ func testNotchLayoutNotchKeepsScreenEdgeAttachment() throws {
         "notch content absorbs the shoulder radius that pulls its sides inward"
     )
     try expect(layout.expandedHeaderTopPadding, equals: 0, "notch header sits beside the camera and needs no extra room")
-    try expect(layout.expandedBottomPadding, equals: 0, "notch card keeps its own compact bottom inset")
-    try expect(layout.expandedHeight, equals: 354, "no gap or padding contribution on a notched display")
+    try expect(layout.expandedBottomPadding, equals: 8, "notch card matches its lateral margins below the list")
+    try expect(layout.expandedHeight, equals: 362, "the shared bottom padding grows the notch shell too")
 }
 
 func testHangingNotchGeometryCreatesConcaveShouldersAndRoundedBase() throws {
