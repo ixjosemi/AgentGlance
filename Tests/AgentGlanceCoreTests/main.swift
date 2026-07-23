@@ -7056,6 +7056,64 @@ func testStateStoreDisplayNamePrefersOverrideThenTabTitle() throws {
     try expect(store.displayName(for: untitled), equals: "project", "no hint falls back to directory")
 }
 
+func testNotchGlassScrimKeepsCollapsedBarSolidAndFadesExpanded() throws {
+    // Collapsed bar (32pt) sits entirely inside the 38pt solid band: every
+    // stop stays fully opaque, so the compact notch renders flat black.
+    let collapsed = NotchGlassStyle.scrimStops(height: 32, solidBandHeight: 38)
+    try expect(collapsed.allSatisfy { $0.opacity == 1 }, equals: true, "collapsed bar stays solid black")
+    try expect(collapsed.first?.location, equals: 0, "collapsed gradient starts at top")
+    try expect(collapsed.last?.location, equals: 1, "collapsed gradient reaches bottom")
+
+    // Fully expanded: pure black through the band, then a smootherstep
+    // dissolve down to the smoked floor at the bottom edge.
+    let expanded = NotchGlassStyle.scrimStops(
+        height: 354,
+        solidBandHeight: 38,
+        bottomOpacity: 0.15,
+        fadeStartFraction: 0
+    )
+    try expect(expanded.first, equals: NotchGlassStyle.Stop(location: 0, opacity: 1), "expanded starts solid")
+    try expect(expanded[1], equals: NotchGlassStyle.Stop(location: 38.0 / 354.0, opacity: 1), "solid band ends at 38pt")
+    try expect(expanded.last, equals: NotchGlassStyle.Stop(location: 1, opacity: 0.15), "expanded holds the smoked floor")
+    // With the symmetric curve (bias 1), the dissolve crosses exactly half
+    // the fade range at the middle of the run.
+    let midRun = expanded[expanded.count / 2]
+    try expect(
+        abs(midRun.opacity - (1 - 0.85 * 0.5)) < 0.000001,
+        equals: true,
+        "symmetric dissolve crosses half the range at mid-run"
+    )
+
+    // Mid-spring height: same smooth run compressed into the shorter drop,
+    // still ending at the smoked floor.
+    let midSpring = NotchGlassStyle.scrimStops(
+        height: 60,
+        solidBandHeight: 38,
+        bottomOpacity: 0.15,
+        fadeStartFraction: 0
+    )
+    try expect(midSpring.first, equals: NotchGlassStyle.Stop(location: 0, opacity: 1), "mid-spring starts solid")
+    try expect(midSpring.last, equals: NotchGlassStyle.Stop(location: 1, opacity: 0.15), "mid-spring keeps the smoked floor")
+
+    // Locations must be non-decreasing and opacities non-increasing at every
+    // height or the gradient renders undefined or non-monotonic.
+    for height: CGFloat in [1, 32, 38, 60, 98, 150, 158, 354, 720] {
+        let stops = NotchGlassStyle.scrimStops(height: height, solidBandHeight: 38)
+        let locations = stops.map(\.location)
+        try expect(
+            locations,
+            equals: locations.sorted(),
+            "stop locations monotonic at height \(height)"
+        )
+        let opacities = stops.map(\.opacity)
+        try expect(
+            opacities,
+            equals: opacities.sorted(by: >),
+            "stop opacities non-increasing at height \(height)"
+        )
+    }
+}
+
 extension Data {
     func writeAtomically(to url: URL) throws {
         try FileManager.default.createDirectory(
@@ -7067,6 +7125,7 @@ extension Data {
 }
 
 let tests: [(String, () throws -> Void)] = [
+    ("notch glass scrim keeps collapsed bar solid and fades expanded", testNotchGlassScrimKeepsCollapsedBarSolidAndFadesExpanded),
     ("version 1 state document reconstructs session", testVersionOneStateDocumentReconstructsSession),
     ("convoy session decodes current step", testConvoySessionDecodesCurrentStep),
     ("unsupported schema version is rejected", testUnsupportedSchemaVersionIsRejected),

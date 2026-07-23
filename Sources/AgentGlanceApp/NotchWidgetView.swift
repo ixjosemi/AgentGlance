@@ -166,11 +166,13 @@ struct NotchWidgetView: View {
                 }
                 .frame(width: isExpanded ? menuWidth : barWidth, alignment: .topLeading)
                 .background(
-                    silhouette
-                        // Explicit pure black: the notchless drop should read
-                        // as part of the screen edge, and any gray breaks that
-                        // continuous silhouette.
-                        .fill(Color(white: 0))
+                    // The band beside the camera stays explicit pure black so
+                    // the drop reads as part of the screen edge; below it the
+                    // scrim fades into behind-window glass.
+                    NotchGlassBackground(
+                        silhouette: silhouette,
+                        barBandHeight: layout.height
+                    )
                 )
                 // Do not clip the compact counters to the curved silhouette:
                 // the physical camera already owns the central cutout, while
@@ -355,9 +357,6 @@ struct NotchWidgetView: View {
     ) -> some View {
         HStack(spacing: 0) {
             HStack(spacing: 6) {
-                Image(systemName: "rectangle.stack.fill")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.55))
                 Text("Active sessions")
                     .font(.system(size: 12.5, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.55))
@@ -535,7 +534,7 @@ struct NotchWidgetView: View {
 
 }
 
-private struct HangingNotchShape: Shape {
+struct HangingNotchShape: Shape {
     var topShoulderRadius: CGFloat
     var bottomCornerRadius: CGFloat
 
@@ -873,8 +872,24 @@ private struct SessionRow: View {
             }
         }
         .background(
+            // Hover reads on both extremes of the background — near-solid
+            // black at the top, translucent glass below — via a hairline
+            // border plus a whisper of light fill; a heavy wash in either
+            // direction fails on one of the two. The opened state gets the
+            // dark smoke instead, where the grown row needs separation.
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(.white.opacity(isActionsExpanded ? 0.06 : (isHovered ? 0.08 : 0)))
+                .fill(
+                    isActionsExpanded
+                        ? Color.black.opacity(0.55)
+                        : Color.white.opacity(isHovered ? 0.05 : 0)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(
+                            .white.opacity(isHovered || isActionsExpanded ? 0.12 : 0),
+                            lineWidth: 0.5
+                        )
+                )
                 .padding(.horizontal, 6)
         )
         .onHover { isHovered = $0 }
