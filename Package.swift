@@ -22,7 +22,12 @@ let package = Package(
         ),
         .executableTarget(
             name: "AgentGlanceApp",
-            dependencies: ["AgentGlanceCore"]
+            dependencies: ["AgentGlanceCore"],
+            // swift build does not compile Metal sources, so the shader ships
+            // as a prebuilt default.metallib; regenerate it from Ripple.metal
+            // with scripts/compile-shaders.sh after editing the source.
+            exclude: ["Ripple.metal"],
+            resources: [.copy("Resources/default.metallib")]
         ),
         .executableTarget(
             name: "AgentGlanceTests",

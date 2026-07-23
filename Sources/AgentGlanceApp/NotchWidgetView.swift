@@ -53,7 +53,9 @@ struct NotchWidgetView: View {
     let onKeyboardFocusChange: (Bool) -> Void
     let onMenuVisibilityChange: (Bool) -> Void
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded = false
+    @State private var rippleTrigger = 0
     @State private var collapseWorkItem: DispatchWorkItem?
     @State private var hoverExpandWorkItem: DispatchWorkItem?
     @State private var isHoveringPanel = false
@@ -184,14 +186,26 @@ struct NotchWidgetView: View {
                     // the drop reads as part of the screen edge; below it the
                     // scrim fades into behind-window glass. Pill mode has no
                     // camera to hide and keeps a flat tint over the glass.
-                    NotchGlassBackground(
+                    //
+                    // The ripple warps only the scrim: it is pure vector, so
+                    // it always rasterizes. The content above holds AppKit-
+                    // backed views (the session list's scroll view) that a
+                    // layer effect would render blank, and the glass below is
+                    // window-server fed and must stay out of any effect.
+                    NotchGlassScrim(
                         silhouette: silhouette,
                         barBandHeight: layout.height,
                         presentation: layout.presentation,
-                        frostRadius: layout.presentation == .pill
-                            ? pillFrostRadius : notchFrostRadius,
                         tintOpacity: layout.presentation == .pill
                             ? pillTintOpacity : notchTintOpacity
+                    )
+                    .modifier(ExpansionRippleEffect(trigger: rippleTrigger))
+                )
+                .background(
+                    NotchGlassBackdrop(
+                        presentation: layout.presentation,
+                        frostRadius: layout.presentation == .pill
+                            ? pillFrostRadius : notchFrostRadius
                     )
                 )
                 // Do not clip the compact counters to the curved silhouette:
@@ -277,6 +291,9 @@ struct NotchWidgetView: View {
             )
         }
         .onChange(of: isExpanded) { _, isVisible in
+            if isVisible, !reduceMotion {
+                rippleTrigger += 1
+            }
             publishInteractiveRegion(
                 compactFrame: compactInteractiveFrame,
                 measuredContentHeight: latestMeasuredContentHeight,

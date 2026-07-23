@@ -7188,16 +7188,26 @@ func testTerminationServiceRefusesUnverifiedProcess() throws {
 
 func testSessionTitleFormatterCleansTabTitles() throws {
     // Agent status decorations — emoji dots, spinners, separators — and
-    // ellipses are stripped; whitespace collapses; 20 characters maximum.
+    // ellipses are stripped; whitespace collapses. Width-aware truncation
+    // belongs to the row's single-line Text; the formatter only caps
+    // pathological lengths.
     try expect(
         SessionTitleFormatter.rowTitle(tabTitle: "🟢 | Ideas de naming... · main", fallback: "repo"),
-        equals: "Ideas de naming · m…",
-        "opencode-style tab title"
+        equals: "Ideas de naming · main",
+        "opencode-style tab title keeps everything the row can fit"
     )
     try expect(
         SessionTitleFormatter.rowTitle(tabTitle: "✳ AgentGlance — claude", fallback: "repo"),
         equals: "AgentGlance — claude",
-        "claude-style tab title at exactly the limit"
+        "claude-style tab title"
+    )
+    try expect(
+        SessionTitleFormatter.rowTitle(
+            tabTitle: String(repeating: "long title ", count: 30),
+            fallback: "repo"
+        ).count,
+        equals: SessionTitleFormatter.maximumTitleLength,
+        "a runaway tab string still hits the safety cap"
     )
     try expect(
         SessionTitleFormatter.rowTitle(tabTitle: "convoy", fallback: "repo"),

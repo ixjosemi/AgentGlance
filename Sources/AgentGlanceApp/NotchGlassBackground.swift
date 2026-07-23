@@ -8,7 +8,10 @@ import AgentGlanceCore
 /// so the camera cutout never shows — and fades toward translucent glass
 /// going down, like the Siri orb. On a display without a camera housing the
 /// pill has no cutout to hide, so the scrim collapses to a flat smoked tint
-/// and the whole silhouette reads as tinted glass in both states.
+/// and the whole silhouette reads as tinted glass in both states. The two
+/// layers are separate views (`NotchGlassBackdrop`, `NotchGlassScrim`) so
+/// the scrim can ride through SwiftUI layer effects the window-server-fed
+/// backdrop must stay out of.
 ///
 /// The backdrop is a self-owned `CABackdropLayer` running the same private
 /// `glassBackground` filter `NSGlassEffectView` uses internally. The official
@@ -17,14 +20,38 @@ import AgentGlanceCore
 /// continuously re-commits its filter values, clobbering any tuning. Owning
 /// the layer and filter outright is the only arrangement where our blur,
 /// transparency, and refraction values actually hold.
-struct NotchGlassBackground: View {
+/// The live glass half of the background. It must stay outside any SwiftUI
+/// layer effect: the backdrop is composited by the window server, so a
+/// shader (or transition) that rasterizes its layer renders it blank.
+struct NotchGlassBackdrop: View {
+    let presentation: NotchLayout.Presentation
+    /// User-tuned glass blur radius (Settings → Appearance → Frosted).
+    var frostRadius: Double = NotchGlassStyle.defaultFrostRadius
+
+    var body: some View {
+        Group {
+            if NotchCustomGlassView.isSupported {
+                NotchCustomGlassBackdrop(cornerStyle: cornerStyle, frostRadius: frostRadius)
+            } else {
+                NotchVisualEffectBackdrop(cornerStyle: cornerStyle)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    private var cornerStyle: HangingNotchCornerStyle {
+        presentation == .pill ? .bubble : .hangingNotch
+    }
+}
+
+/// The SwiftUI-drawn half: the black scrim over the glass. Pure vector
+/// content, so it can ride through layer effects like the expansion ripple.
+struct NotchGlassScrim: View {
     let silhouette: HangingNotchShape
     /// Height of the strip that must stay pure black (`layout.height`).
     let barBandHeight: CGFloat
     /// Pill presentation swaps the camera scrim for the flat tint.
     let presentation: NotchLayout.Presentation
-    /// User-tuned glass blur radius (Settings → Appearance → Frosted).
-    var frostRadius: Double = NotchGlassStyle.defaultFrostRadius
     /// User-tuned black wash opacity (Settings → Appearance → Tint). The
     /// notch's camera band stays pure black regardless — the tint only sets
     /// the floor its scrim dissolves down to.
@@ -32,10 +59,7 @@ struct NotchGlassBackground: View {
 
     var body: some View {
         GeometryReader { proxy in
-            ZStack {
-                backdrop
-                scrim(height: max(proxy.size.height, 1))
-            }
+            scrim(height: max(proxy.size.height, 1))
         }
         .allowsHitTesting(false)
     }
@@ -46,18 +70,6 @@ struct NotchGlassBackground: View {
             silhouette.fill(scrimGradient(height: height))
         case .pill:
             silhouette.fill(Color.black.opacity(tintOpacity))
-        }
-    }
-
-    private var cornerStyle: HangingNotchCornerStyle {
-        presentation == .pill ? .bubble : .hangingNotch
-    }
-
-    @ViewBuilder private var backdrop: some View {
-        if NotchCustomGlassView.isSupported {
-            NotchCustomGlassBackdrop(cornerStyle: cornerStyle, frostRadius: frostRadius)
-        } else {
-            NotchVisualEffectBackdrop(cornerStyle: cornerStyle)
         }
     }
 
