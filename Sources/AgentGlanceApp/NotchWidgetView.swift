@@ -360,7 +360,11 @@ struct NotchWidgetView: View {
                         Spacer(minLength: layout.leftStatusWingLeadingPadding)
                         HStack(spacing: NotchLayout.statusIndicatorSpacing) {
                             ForEach(leftEntries) { entry in
-                                StatusSummaryIndicator(kind: entry.kind, count: entry.count)
+                                StatusSummaryIndicator(
+                                    kind: entry.kind,
+                                    count: entry.count,
+                                    indicatorLayout: .forWing(.left)
+                                )
                             }
                         }
                         Spacer(minLength: layout.leftStatusWingTrailingPadding)
@@ -377,7 +381,11 @@ struct NotchWidgetView: View {
                         Spacer(minLength: layout.rightStatusWingLeadingPadding)
                         HStack(spacing: NotchLayout.statusIndicatorSpacing) {
                             ForEach(rightEntries) { entry in
-                                StatusSummaryIndicator(kind: entry.kind, count: entry.count)
+                                StatusSummaryIndicator(
+                                    kind: entry.kind,
+                                    count: entry.count,
+                                    indicatorLayout: .forWing(.right)
+                                )
                             }
                         }
                         Spacer(minLength: layout.rightStatusWingTrailingPadding)
@@ -651,20 +659,20 @@ private extension SessionStatus {
 private struct StatusSummaryIndicator: View {
     let kind: SessionStatusSummary.StatusEntry.Kind
     let count: Int
+    /// Which edge the dot rides. The right wing mirrors the pair so the round
+    /// dot — not the flat numeral — meets the notch shoulder, matching the
+    /// left wing and reading as symmetric bookends.
+    var indicatorLayout: StatusIndicatorLayout = .forWing(.left)
 
     var body: some View {
         HStack(spacing: 3) {
-            switch kind.indicatorStyle {
-            case .spinner:
-                WorkingPixelSpinner()
-            case .greenDot, .redDot, .mutedDot:
-                Circle()
-                    .fill(indicatorColor(for: kind.indicatorStyle))
-                    .frame(width: 8, height: 8)
+            if indicatorLayout.dotEdge == .leading {
+                glyph
+                countText
+            } else {
+                countText
+                glyph
             }
-            Text(count, format: .number)
-                .font(.system(size: 12, weight: .medium, design: .rounded))
-                .monospacedDigit()
         }
         .foregroundStyle(.white.opacity(0.94))
         // Fixed slot: the wing-width formula in NotchLayout adds up to
@@ -672,6 +680,24 @@ private struct StatusSummaryIndicator: View {
         .frame(width: NotchLayout.statusIndicatorSlotWidth)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(count) \(kind.accessibilityName) sessions")
+    }
+
+    @ViewBuilder
+    private var glyph: some View {
+        switch kind.indicatorStyle {
+        case .spinner:
+            WorkingPixelSpinner()
+        case .greenDot, .redDot, .mutedDot:
+            Circle()
+                .fill(indicatorColor(for: kind.indicatorStyle))
+                .frame(width: 8, height: 8)
+        }
+    }
+
+    private var countText: some View {
+        Text(count, format: .number)
+            .font(.system(size: 12, weight: .medium, design: .rounded))
+            .monospacedDigit()
     }
 }
 

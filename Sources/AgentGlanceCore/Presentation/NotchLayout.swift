@@ -168,11 +168,24 @@ public struct NotchLayout: Equatable, Sendable {
     /// centering already leaves ~4-5pt of slack beside the outermost glyph,
     /// so the explicit inset stays slim to keep the capsule snug.
     public static let statusWingEdgePadding: CGFloat = 6
-    /// Outer inset of a hardware-notch wing, identical on both ends: the
-    /// compact drop lets its outermost glyph ride the curved shoulder the
-    /// same way on the left (status dot) and on the right (blocked count),
-    /// so a bar with wings on both sides reads symmetric.
-    public static let hardwareNotchOuterWingPadding: CGFloat = 8
+    /// Breathing room the outermost glyph keeps *past* the shoulder radius, so
+    /// it clears the curve's tangent instead of hugging the exact point where
+    /// the flare begins. Landing flush on the straight side reads covered but
+    /// cramped; a few points more lets the glyph sit clearly inside the black.
+    public static let hardwareNotchOuterWingBreathingRoom: CGFloat = 4
+    /// Outer inset of a hardware-notch wing, identical on both ends. The
+    /// concave shoulder is a quarter-circle of radius
+    /// `HangingNotchMetrics.topShoulderRadius`, so below that band the black
+    /// silhouette's straight side sits exactly one shoulder radius inside the
+    /// bar's outer edge. Any glyph closer to the edge than that lands where
+    /// the curve has already peeled away and gets bisected onto the wallpaper
+    /// — the "cramped red dot" bug. Pinning the outer inset to the shoulder
+    /// radius plus a little breathing room keeps the outermost glyph clearly
+    /// inside the straight side, and keeps the clearance in lockstep with the
+    /// curve if the radius changes. Applied symmetrically so both wings read
+    /// balanced.
+    public static let hardwareNotchOuterWingPadding: CGFloat =
+        HangingNotchMetrics.topShoulderRadius + hardwareNotchOuterWingBreathingRoom
     public static let hardwareNotchRightOuterWingPadding = hardwareNotchOuterWingPadding
     /// The camera-facing edge of a hardware-notch wing reserves enough room
     /// to keep the counter cluster fully clear of the physical camera cutout.

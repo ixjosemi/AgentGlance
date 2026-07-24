@@ -3535,15 +3535,31 @@ func testNotchLayoutAddsOnlyAMinimalFixedRightWing() throws {
         visibleIndicatorCount: 1,
         showsIdleMark: false
     )
-    try expect(notched.statusWingEdgePadding, equals: 8, "hardware-notch outer edge uses a small visual margin")
-    try expect(notched.leftStatusWingLeadingPadding, equals: 8, "left wing has a small outer margin")
+    try expect(
+        notched.statusWingEdgePadding,
+        equals: NotchLayout.hardwareNotchOuterWingPadding,
+        "hardware-notch outer edge clears the concave shoulder with breathing room"
+    )
+    try expect(
+        notched.leftStatusWingLeadingPadding,
+        equals: NotchLayout.hardwareNotchOuterWingPadding,
+        "left wing outer glyph clears the black's straight side, not hugging the curve"
+    )
     try expect(notched.leftStatusWingTrailingPadding, equals: 12, "left wing leaves a small camera-facing gap")
     try expect(notched.rightStatusWingLeadingPadding, equals: 12, "right wing mirrors the small camera gap")
-    try expect(notched.rightStatusWingTrailingPadding, equals: 8, "right count hugs the curve exactly like the left dot")
-    try expect(activeNotchWing, equals: 50, "hardware-notch counter leaves a 12-point camera gap")
+    try expect(
+        notched.rightStatusWingTrailingPadding,
+        equals: NotchLayout.hardwareNotchOuterWingPadding,
+        "right count clears the curve exactly like the left dot"
+    )
+    try expect(
+        activeNotchWing,
+        equals: NotchLayout.statusIndicatorSlotWidth + 12 + NotchLayout.hardwareNotchOuterWingPadding,
+        "hardware-notch wing = slot + camera gap + outer shoulder clearance"
+    )
     let balanced = notched.balancedStatusWingWidths(leftWidth: activeNotchWing, rightWidth: 0)
 
-    try expect(balanced.left, equals: 50, "visible left wing keeps its real content width")
+    try expect(balanced.left, equals: activeNotchWing, "visible left wing keeps its real content width")
     try expect(balanced.right, equals: 28, "empty right wing is only a minimal fixed visual extension")
 
     let pill = NotchLayout(
@@ -3575,6 +3591,20 @@ func testNotchLayoutReservesRightOuterCurveClearanceForBlockedCount() throws {
         layout.rightStatusWingTrailingPadding,
         equals: layout.leftStatusWingLeadingPadding,
         "both outer insets match so a bar with wings on each side reads symmetric"
+    )
+    // The core invariant behind the bisected-dot fix: neither outer inset may
+    // be smaller than the shoulder radius, or the outermost glyph enters the
+    // concave band the black has curved away from and spills onto the
+    // wallpaper. Guarding both wings keeps the fix from silently regressing.
+    try expect(
+        layout.leftStatusWingLeadingPadding >= HangingNotchMetrics.topShoulderRadius,
+        equals: true,
+        "left outer inset covers the concave shoulder"
+    )
+    try expect(
+        layout.rightStatusWingTrailingPadding >= HangingNotchMetrics.topShoulderRadius,
+        equals: true,
+        "right outer inset covers the concave shoulder"
     )
     try expect(
         layout.statusWingWidth(
@@ -3929,8 +3959,8 @@ func testNotchLayoutUsesNormalizedCameraClearance() throws {
 
     try expect(
         layout.leftStatusWingLeadingPadding,
-        equals: 8,
-        "the running spinner has a small left margin"
+        equals: NotchLayout.hardwareNotchOuterWingPadding,
+        "the running spinner clears the concave shoulder instead of riding it"
     )
     try expect(
         layout.leftStatusWingTrailingPadding,
@@ -7359,6 +7389,34 @@ func testNotchGlassScrimKeepsCollapsedBarSolidAndFadesExpanded() throws {
     }
 }
 
+func testCompactStatusDotRidesEachWingsOuterScreenEdge() throws {
+    // The concave notch shoulder (and the pill's capsule end) meets each
+    // wing's outer screen-edge: leading on the left, trailing on the right.
+    try expect(
+        NotchLayout.StatusWingSide.left.outerEdge,
+        equals: .leading,
+        "left wing outer edge"
+    )
+    try expect(
+        NotchLayout.StatusWingSide.right.outerEdge,
+        equals: .trailing,
+        "right wing outer edge"
+    )
+    // The round dot always takes that outer slot so both wings present a
+    // round glyph to the shoulder; a flat numeral there looked cramped on
+    // the blocked (right) wing.
+    try expect(
+        StatusIndicatorLayout.forWing(.left).dotEdge,
+        equals: .leading,
+        "left wing dot rides the leading/outer edge"
+    )
+    try expect(
+        StatusIndicatorLayout.forWing(.right).dotEdge,
+        equals: .trailing,
+        "right wing dot rides the trailing/outer edge"
+    )
+}
+
 extension Data {
     func writeAtomically(to url: URL) throws {
         try FileManager.default.createDirectory(
@@ -7371,6 +7429,7 @@ extension Data {
 
 let tests: [(String, () throws -> Void)] = [
     ("notch glass scrim keeps collapsed bar solid and fades expanded", testNotchGlassScrimKeepsCollapsedBarSolidAndFadesExpanded),
+    ("compact status dot rides each wing's outer screen edge", testCompactStatusDotRidesEachWingsOuterScreenEdge),
     ("version 1 state document reconstructs session", testVersionOneStateDocumentReconstructsSession),
     ("convoy session decodes current step", testConvoySessionDecodesCurrentStep),
     ("unsupported schema version is rejected", testUnsupportedSchemaVersionIsRejected),
