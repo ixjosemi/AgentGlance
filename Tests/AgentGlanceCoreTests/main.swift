@@ -7369,6 +7369,34 @@ extension Data {
     }
 }
 
+func testBrailleSpinnerAdvancesOneFramePerStepAndWraps() throws {
+    // Every visible spinner reads the same absolute clock, so the frame math
+    // must advance exactly one frame per step interval and cycle cleanly.
+    // Sampled mid-frame (+0.5 step) to stay clear of floating-point boundaries.
+    let base = Date(timeIntervalSinceReferenceDate: 0)
+    for step in 0..<25 {
+        let midFrame = base.addingTimeInterval((Double(step) + 0.5) * BrailleSpinner.stepInterval)
+        try expect(
+            BrailleSpinner.frameIndex(at: midFrame),
+            equals: step % BrailleSpinner.frames.count,
+            "frame index at step \(step)"
+        )
+    }
+    try expect(BrailleSpinner.frame(at: base), equals: "⠋", "first frame character")
+}
+
+func testBrailleSpinnerFrameIndexStaysInRangeForAnyClock() throws {
+    // A reading before the reference date must not yield a negative index and
+    // crash the row; the floor-style modulo keeps it inside `frames`.
+    let past = Date(timeIntervalSinceReferenceDate: -12_345.678)
+    let index = BrailleSpinner.frameIndex(at: past)
+    try expect(
+        index >= 0 && index < BrailleSpinner.frames.count,
+        equals: true,
+        "frame index in range for a pre-reference-date clock"
+    )
+}
+
 let tests: [(String, () throws -> Void)] = [
     ("notch glass scrim keeps collapsed bar solid and fades expanded", testNotchGlassScrimKeepsCollapsedBarSolidAndFadesExpanded),
     ("version 1 state document reconstructs session", testVersionOneStateDocumentReconstructsSession),
@@ -7545,6 +7573,8 @@ let tests: [(String, () throws -> Void)] = [
     ("termination planner closes only exact containers", testTerminationPlannerClosesOnlyExactContainers),
     ("termination service kills politely and escalates to SIGKILL", testTerminationServiceKillsPolitelyAndEscalatesToSigkill),
     ("termination service refuses unverified process", testTerminationServiceRefusesUnverifiedProcess),
+    ("braille spinner advances one frame per step and wraps", testBrailleSpinnerAdvancesOneFramePerStepAndWraps),
+    ("braille spinner frame index stays in range for any clock", testBrailleSpinnerFrameIndexStaysInRangeForAnyClock),
     ("session title formatter cleans tab titles", testSessionTitleFormatterCleansTabTitles),
     ("state store display name prefers override then tab title", testStateStoreDisplayNamePrefersOverrideThenTabTitle),
     ("state store clears all session names", testStateStoreClearsAllSessionNames),
